@@ -45,26 +45,25 @@ Your capabilities:
 Be helpful, conversational, and adapt to the user's needs.
 For general queries, provide useful information or assistance."""
 
-        system_prompt = self.inject_memory_context(base_system_prompt, state)
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Intent: {intent}\n\nQuery: {user_input}"}
-        ]
-
         try:
-            response = await self.call_groq(
-                messages=messages,
-                temperature=0.7,
-                max_tokens=1024
+            loop_result = await self.execute_reasoning_loop(
+                state=state,
+                base_system_prompt=base_system_prompt,
+                tools={},
+                max_iterations=3,
             )
 
             state["task_result"] = {
                 "agent": self.name,
-                "content": response,
-                "success": True
+                "content": loop_result["final_answer"],
+                "success": True,
+                "tools_used": loop_result["tools_used"],
+                "reasoning_trace": loop_result["trace"],
             }
-            state["agent_reasoning"] = f"Processed profile/general query: {intent}"
+            state["agent_reasoning"] = (
+                f"Processed profile/general query: {intent}. "
+                f"iterations={loop_result['iterations']}, tools={loop_result['tools_used']}"
+            )
             state["current_agent"] = self.name
 
             if state.get("execution_path"):

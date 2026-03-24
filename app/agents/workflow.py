@@ -124,6 +124,12 @@ async def parallel_init_node(state: AgentState) -> AgentState:
         state["memory_context"] = memory_context
         state["memory_prompt"] = memory_prompt
 
+        # Re-run planner with memory-enriched state so routing always includes conversation context.
+        try:
+            planner_state = await planner_agent.execute(state)
+        except Exception as e:
+            print(f"Planner re-run with memory failed: {str(e)}")
+
         # Merge planner results
         if "selected_agent" in planner_state:
             state["selected_agent"] = planner_state["selected_agent"]

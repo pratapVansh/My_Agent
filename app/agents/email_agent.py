@@ -4,6 +4,7 @@ Specializes in email composition, management, and organization.
 """
 from typing import Dict, Any
 from app.agents.base_agent import BaseAgent
+from app.tools.email_draft_tool import email_draft_tool
 
 
 class EmailAgent(BaseAgent):
@@ -45,26 +46,45 @@ Your capabilities:
 Be professional, clear, and actionable in your responses.
 Format emails properly with subject lines, greetings, body, and signatures when drafting."""
 
-        system_prompt = self.inject_memory_context(base_system_prompt, state)
+        user_id = state.get("user_id", "")
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Intent: {intent}\n\nQuery: {user_input}"}
-        ]
+        async def tool_email_draft(tool_input: Dict[str, Any]):
+            query = str(tool_input.get("query") or user_input)
+            tone = str(tool_input.get("tone") or "professional")
+            recipient_name = str(tool_input.get("recipient_name") or "")
+            return await email_draft_tool.draft_email(
+                user_id=user_id,
+                query=query,
+                tone=tone,
+                recipient_name=recipient_name,
+            )
+
+        tools = {
+            "email_draft": {
+                "description": "Generate a structured personalized email draft.",
+                "callable": tool_email_draft,
+            }
+        }
 
         try:
-            response = await self.call_groq(
-                messages=messages,
-                temperature=0.7,
-                max_tokens=1024
+            loop_result = await self.execute_reasoning_loop(
+                state=state,
+                base_system_prompt=base_system_prompt,
+                tools=tools,
+                max_iterations=3,
             )
 
             state["task_result"] = {
                 "agent": self.name,
-                "content": response,
-                "success": True
+                "content": loop_result["final_answer"],
+                "success": True,
+                "tools_used": loop_result["tools_used"],
+                "reasoning_trace": loop_result["trace"],
             }
-            state["agent_reasoning"] = f"Processed email-related query: {intent}"
+            state["agent_reasoning"] = (
+                f"Processed email-related query: {intent}. "
+                f"iterations={loop_result['iterations']}, tools={loop_result['tools_used']}"
+            )
             state["current_agent"] = self.name
 
             if state.get("execution_path"):

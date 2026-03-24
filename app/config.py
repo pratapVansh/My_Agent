@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     cartesia_streaming_enabled: bool = False
 
     # Voice Agent Optimization Feature Flags
-    streaming_stt_enabled: bool = False
+    streaming_stt_enabled: bool = True
     streaming_tts_enabled: bool = False
     parallel_workflow_enabled: bool = False
     binary_audio_enabled: bool = False

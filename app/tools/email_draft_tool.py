@@ -5,10 +5,14 @@ Generates personalized email drafts and never sends them.
 from __future__ import annotations
 
 from typing import Any, Dict, List
+import logging
 
 from app.memory.memory_manager import memory_manager
 from app.services.groq_service import groq_service
 from app.services.langsmith_service import traceable
+
+
+logger = logging.getLogger(__name__)
 
 
 class EmailDraftTool:
@@ -23,6 +27,8 @@ class EmailDraftTool:
         recipient_name: str = "",
     ) -> Dict[str, Any]:
         rag_context = await self._retrieve_rag_context(user_id=user_id, query=query)
+        if not rag_context:
+            rag_context = "No relevant memory context found."
 
         messages = [
             {
@@ -76,13 +82,38 @@ class EmailDraftTool:
             "raw_model_output": raw_output,
         }
 
-    async def _retrieve_rag_context(self, user_id: str, query: str) -> Dict[str, List[Dict[str, Any]]]:
-        long_term = memory_manager.long_term.search_all(
-            user_id=user_id,
-            query=query,
-            limit=5,
-        )
-        return long_term
+    async def _retrieve_rag_context(self, user_id: str, query: str) -> str:
+        """Retrieve and format long-term memory context as plain text for prompting."""
+        try:
+            logger.info("Email RAG retrieval started for user_id=%s", user_id)
+
+            long_term = await memory_manager.long_term.search_all(
+                user_id=user_id,
+                query=query,
+                limit=5,
+            )
+
+            context_text = memory_manager.format_context_for_prompt(
+                {
+                    "chat_history": [],
+                    "preferences": [],
+                    "long_term": long_term,
+                }
+            ).strip()
+
+            if not context_text:
+                logger.info("Email RAG retrieval completed with empty context for user_id=%s", user_id)
+                return ""
+
+            logger.info(
+                "Email RAG retrieval completed for user_id=%s with %s chars",
+                user_id,
+                len(context_text),
+            )
+            return context_text
+        except Exception as e:
+            logger.exception("Email RAG retrieval failed for user_id=%s: %s", user_id, str(e))
+            return ""
 
     def _safe_parse_json(self, text: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
         import json

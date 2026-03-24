@@ -42,7 +42,7 @@ class PlannerAgent(BaseAgent):
         user_input = state["user_input"]
 
         # Build prompt for intent detection
-        system_prompt = self._build_system_prompt()
+        system_prompt = self.inject_memory_context(self._build_system_prompt(), state)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}

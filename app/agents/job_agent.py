@@ -4,6 +4,7 @@ Specializes in job search, applications, and career advice.
 """
 from typing import Dict, Any
 from app.agents.base_agent import BaseAgent
+from app.tools.job_search_tool import job_search_tool
 
 
 class JobAgent(BaseAgent):
@@ -45,27 +46,47 @@ Your capabilities:
 Provide practical, actionable advice tailored to the user's query.
 Be concise but comprehensive."""
 
-        # Inject memory context
-        system_prompt = self.inject_memory_context(base_system_prompt, state)
+        user_id = state.get("user_id", "")
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Intent: {intent}\n\nQuery: {user_input}"}
-        ]
+        async def tool_job_search(tool_input: Dict[str, Any]):
+            query = str(tool_input.get("query") or user_input)
+            location = tool_input.get("location")
+            max_results = int(tool_input.get("max_results", 6))
+            min_score = float(tool_input.get("min_score", 0.2))
+            return await job_search_tool.search_jobs(
+                user_id=user_id,
+                query=query,
+                location=location,
+                max_results=max_results,
+                min_score=min_score,
+            )
+
+        tools = {
+            "job_search": {
+                "description": "Search current job opportunities and rank them.",
+                "callable": tool_job_search,
+            }
+        }
 
         try:
-            response = await self.call_groq(
-                messages=messages,
-                temperature=0.7,
-                max_tokens=1024
+            loop_result = await self.execute_reasoning_loop(
+                state=state,
+                base_system_prompt=base_system_prompt,
+                tools=tools,
+                max_iterations=3,
             )
 
             state["task_result"] = {
                 "agent": self.name,
-                "content": response,
-                "success": True
+                "content": loop_result["final_answer"],
+                "success": True,
+                "tools_used": loop_result["tools_used"],
+                "reasoning_trace": loop_result["trace"],
             }
-            state["agent_reasoning"] = f"Processed job-related query: {intent}"
+            state["agent_reasoning"] = (
+                f"Processed job-related query: {intent}. "
+                f"iterations={loop_result['iterations']}, tools={loop_result['tools_used']}"
+            )
             state["current_agent"] = self.name
 
             if state.get("execution_path"):

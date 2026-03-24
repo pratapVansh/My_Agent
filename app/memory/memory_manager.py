@@ -173,6 +173,12 @@ class MemoryManager:
         """
         parts = []
 
+        # Add recent conversation context first so planner/task agents stay grounded.
+        chat_history = context.get("chat_history", [])
+        history_block = self._format_chat_history_for_prompt(chat_history)
+        if history_block:
+            parts.append(history_block)
+
         # Add user preferences/interests
         preferences = context.get("preferences", [])
         if preferences:
@@ -212,6 +218,51 @@ class MemoryManager:
         if parts:
             return "\n\n".join(parts)
         return ""
+
+    def _format_chat_history_for_prompt(
+        self,
+        chat_history: List[Dict[str, str]],
+        max_messages: int = 10,
+        max_chars: int = 1200,
+        max_message_chars: int = 220,
+    ) -> str:
+        """
+        Format recent chat history for prompt injection.
+
+        Keeps only recent messages and trims content to avoid token overflow.
+        Output format:
+        User: ...
+        Assistant: ...
+        """
+        if not chat_history:
+            return ""
+
+        recent = chat_history[-max_messages:]
+        lines: List[str] = []
+
+        for msg in recent:
+            role = (msg.get("role") or "user").strip().lower()
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+
+            if len(content) > max_message_chars:
+                content = content[: max_message_chars - 3].rstrip() + "..."
+
+            label = "User" if role == "user" else "Assistant"
+            lines.append(f"{label}: {content}")
+
+        if not lines:
+            return ""
+
+        # Enforce a global character budget by dropping oldest lines first.
+        while lines and len("\n".join(lines)) > max_chars:
+            lines.pop(0)
+
+        if not lines:
+            return ""
+
+        return "Recent Conversation:\n" + "\n".join(lines)
 
     # Long-term operations (pass-through)
     async def store_resume(self, user_id: str, resume_text: str, metadata: Optional[Dict] = None) -> str:

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   askWithVoice,
   ChatMessage,
@@ -15,31 +15,57 @@ type ChatShellProps = {
   subtitle: string;
 };
 
-declare global {
-  interface Window {
-    webkitSpeechRecognition?: new () => SpeechRecognition;
-  }
-
-  interface SpeechRecognition extends EventTarget {
-    lang: string;
-    interimResults: boolean;
-    continuous: boolean;
-    maxAlternatives: number;
-    onresult: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => void) | null;
-    onerror: ((this: SpeechRecognition, ev: Event) => void) | null;
-    onstart: (() => void) | null;
-    onend: (() => void) | null;
-    start(): void;
-    stop(): void;
-  }
-
-  interface SpeechRecognitionEvent extends Event {
-    readonly results: SpeechRecognitionResultList;
-  }
-}
-
 function uid() {
   return Math.random().toString(36).slice(2, 10);
+}
+
+const USER_ID_STORAGE_KEY = "my_agent_user_id";
+
+function generateStableId(prefix: "user" | "session") {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}_${crypto.randomUUID()}`;
+  }
+  return `${prefix}_${uid()}_${Date.now()}`;
+}
+
+function getOrCreateUserId() {
+  if (typeof window === "undefined") {
+    return generateStableId("user");
+  }
+
+  const existing = window.localStorage.getItem(USER_ID_STORAGE_KEY);
+  if (existing) {
+    return existing;
+  }
+
+  const generated = generateStableId("user");
+  window.localStorage.setItem(USER_ID_STORAGE_KEY, generated);
+  return generated;
+}
+
+function createConversationSessionId() {
+  return generateStableId("session");
+}
+
+function getVoiceWebSocketUrl() {
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+  const wsBase = apiBase.replace(/^http/i, "ws");
+  return `${wsBase}/api/v1/voice/stream_v2`;
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("Failed to read audio blob"));
+    reader.readAsDataURL(blob);
+  });
+
+  const commaIdx = dataUrl.indexOf(",");
+  if (commaIdx === -1) {
+    return "";
+  }
+  return dataUrl.slice(commaIdx + 1);
 }
 
 function playAudio(base64?: string, mimeType?: string) {
@@ -49,8 +75,8 @@ function playAudio(base64?: string, mimeType?: string) {
 }
 
 export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
-  const userId = useMemo(() => `${mode}_demo_user`, [mode]);
-  const sessionId = useMemo(() => `${mode}_session_${uid()}`, [mode]);
+  const [userId, setUserId] = useState("");
+  const [sessionId, setSessionId] = useState("");
 
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
@@ -63,8 +89,9 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   const [interimTranscript, setInterimTranscript] = useState("");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const websocketRef = useRef<WebSocket | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
 
   const colors = mode === "user"
     ? {
@@ -89,17 +116,29 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   };
 
   useEffect(() => {
+    const stableUserId = getOrCreateUserId();
+    setUserId(stableUserId);
+    setSessionId(createConversationSessionId());
+  }, []);
+
+  useEffect(() => {
     scrollToBottom();
   }, [messages, isSending]);
 
   // Cleanup timers on unmount
   useEffect(() => {
     return () => {
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop();
       }
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
+
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      }
+
+      if (websocketRef.current) {
+        websocketRef.current.close();
       }
     };
   }, []);
@@ -108,118 +147,262 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     setMessages((prev) => [...prev, msg]);
   };
 
-  const handleMic = () => {
-    const SpeechRec =
-      typeof window !== "undefined"
-        ? ((globalThis as any).SpeechRecognition || (globalThis as any).webkitSpeechRecognition)
-        : undefined;
-
-    if (!SpeechRec) {
-      alert("Speech recognition not supported in this browser");
-      return;
+  const ensureIdentity = () => {
+    let resolvedUserId = userId;
+    if (!resolvedUserId) {
+      resolvedUserId = getOrCreateUserId();
+      setUserId(resolvedUserId);
     }
 
-    if (isListening && recognitionRef.current) {
-      // Stop listening
-      recognitionRef.current.stop();
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = null;
-      }
-      return;
+    let resolvedSessionId = sessionId;
+    if (!resolvedSessionId) {
+      resolvedSessionId = createConversationSessionId();
+      setSessionId(resolvedSessionId);
     }
 
-    // Start new recognition session
-    const rec = new SpeechRec();
-    recognitionRef.current = rec;
-    rec.lang = "en-US";
-    rec.interimResults = true; // Enable real-time results
-    rec.continuous = true; // Keep listening
-    rec.maxAlternatives = 1;
+    return { resolvedUserId, resolvedSessionId };
+  };
 
-    let finalTranscript = "";
+  const ensureVoiceSocket = async (resolvedUserId: string, resolvedSessionId: string) => {
+    const current = websocketRef.current;
+    if (current && current.readyState === WebSocket.OPEN) {
+      current.send(JSON.stringify({
+        type: "start",
+        user_id: resolvedUserId,
+        session_id: resolvedSessionId,
+        output_mode: mode
+      }));
+      return current;
+    }
 
-    rec.onstart = () => {
-      setIsListening(true);
-      setInterimTranscript("");
-      finalTranscript = "";
-    };
+    if (current && current.readyState === WebSocket.CONNECTING) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => reject(new Error("WebSocket connect timeout")), 5000);
+        const onOpen = () => {
+          window.clearTimeout(timeout);
+          resolve();
+        };
+        const onError = () => {
+          window.clearTimeout(timeout);
+          reject(new Error("WebSocket connection failed"));
+        };
+        current.addEventListener("open", onOpen, { once: true });
+        current.addEventListener("error", onError, { once: true });
+      });
 
-    rec.onend = () => {
-      setIsListening(false);
-      setInterimTranscript("");
+      current.send(JSON.stringify({
+        type: "start",
+        user_id: resolvedUserId,
+        session_id: resolvedSessionId,
+        output_mode: mode
+      }));
+      return current;
+    }
 
-      // Auto-send if we have a final transcript
-      if (finalTranscript.trim()) {
-        setInput(finalTranscript.trim());
-        // Auto-submit after a short delay
-        setTimeout(() => {
-          const text = finalTranscript.trim();
-          if (text && !isSending) {
-            handleSend();
+    const ws = new WebSocket(getVoiceWebSocketUrl());
+
+    ws.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        const msgType = payload.type;
+
+        if (msgType === "interim_transcript") {
+          const text = String(payload.text ?? "");
+          setInterimTranscript(text);
+          if (text) {
+            setInput(text);
           }
-        }, 300);
-      }
-    };
-
-    rec.onresult = (ev: any) => {
-      let interim = "";
-      let final = "";
-
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const transcript = ev.results[i][0].transcript;
-        if (ev.results[i].isFinal) {
-          final += transcript + " ";
-        } else {
-          interim += transcript;
+          return;
         }
-      }
 
-      if (final) {
-        finalTranscript += final;
-        setInput(finalTranscript.trim() + " " + interim);
-      } else {
-        setInput(finalTranscript.trim() + " " + interim);
-      }
+        if (msgType === "utterance_end") {
+          setIsSending(true);
+          return;
+        }
 
-      setInterimTranscript(interim);
+        if (msgType === "final_response") {
+          const transcript = String(payload.transcript ?? "").trim();
+          const displayText = String(payload.display_text ?? "");
 
-      // Reset silence timer
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-      }
+          setIsSending(false);
+          setInterimTranscript("");
+          setInput("");
 
-      // Auto-stop after 2 seconds of silence if we have content
-      if (finalTranscript.trim()) {
-        silenceTimerRef.current = setTimeout(() => {
-          if (recognitionRef.current) {
-            recognitionRef.current.stop();
+          if (transcript) {
+            addMessage({ id: uid(), role: "user", text: transcript, createdAt: Date.now() });
           }
-        }, 2000);
+
+          addMessage({
+            id: uid(),
+            role: "assistant",
+            text: displayText,
+            audioBase64: payload.audio_base64,
+            mimeType: payload.mime_type,
+            createdAt: Date.now()
+          });
+
+          if (payload.audio_base64 && mode === "user") {
+            handlePlayVoice(payload.audio_base64, payload.mime_type);
+          }
+          return;
+        }
+
+        if (msgType === "error") {
+          setIsListening(false);
+          setIsSending(false);
+          const message = String(payload.message ?? "Voice stream error");
+          addMessage({ id: uid(), role: "assistant", text: `Error: ${message}`, createdAt: Date.now() });
+          return;
+        }
+      } catch (err) {
+        console.error("Failed to parse websocket message", err);
       }
     };
 
-    rec.onerror = (event: any) => {
-      console.error("Speech recognition error:", event.error);
+    ws.onerror = () => {
       setIsListening(false);
-      setInterimTranscript("");
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = null;
-      }
+      setIsSending(false);
+      addMessage({ id: uid(), role: "assistant", text: "Error: Voice socket connection failed", createdAt: Date.now() });
     };
+
+    ws.onclose = () => {
+      websocketRef.current = null;
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => reject(new Error("WebSocket connect timeout")), 7000);
+
+      const onOpen = () => {
+        window.clearTimeout(timeout);
+        ws.removeEventListener("error", onError);
+        resolve();
+      };
+
+      const onError = () => {
+        window.clearTimeout(timeout);
+        ws.removeEventListener("open", onOpen);
+        reject(new Error("WebSocket connection failed"));
+      };
+
+      ws.addEventListener("open", onOpen, { once: true });
+      ws.addEventListener("error", onError, { once: true });
+    });
+
+    websocketRef.current = ws;
+    ws.send(JSON.stringify({
+      type: "start",
+      user_id: resolvedUserId,
+      session_id: resolvedSessionId,
+      output_mode: mode
+    }));
+    return ws;
+  };
+
+  const stopStreamingCapture = () => {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+
+    const ws = websocketRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "end_utterance" }));
+      setIsSending(true);
+    }
+
+    setIsListening(false);
+  };
+
+  const startStreamingCapture = async () => {
+    const { resolvedUserId, resolvedSessionId } = ensureIdentity();
+    const ws = await ensureVoiceSocket(resolvedUserId, resolvedSessionId);
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true
+      }
+    });
+
+    mediaStreamRef.current = stream;
+
+    const preferredMime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "");
+
+    const recorder = preferredMime
+      ? new MediaRecorder(stream, { mimeType: preferredMime })
+      : new MediaRecorder(stream);
+
+    mediaRecorderRef.current = recorder;
+    setInterimTranscript("");
+    setInput("");
+    setIsSending(false);
+    setIsListening(true);
+
+    recorder.ondataavailable = (event) => {
+      const blob = event.data;
+      if (!blob || blob.size === 0) {
+        return;
+      }
+
+      void (async () => {
+        try {
+          const base64 = await blobToBase64(blob);
+          if (!base64) {
+            return;
+          }
+
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "audio_data",
+              data: base64,
+              mime_type: recorder.mimeType || "audio/webm",
+              language: "en"
+            }));
+          }
+        } catch (err) {
+          console.error("Failed to send audio chunk", err);
+        }
+      })();
+    };
+
+    recorder.onerror = () => {
+      setIsListening(false);
+      setIsSending(false);
+      addMessage({ id: uid(), role: "assistant", text: "Error: Failed to capture microphone audio", createdAt: Date.now() });
+    };
+
+    recorder.start(250);
+  };
+
+  const handleMic = async () => {
+    if (isListening) {
+      stopStreamingCapture();
+      return;
+    }
 
     try {
-      rec.start();
+      await startStreamingCapture();
     } catch (error) {
-      console.error("Failed to start recognition:", error);
+      console.error("Failed to start voice stream", error);
       setIsListening(false);
+      setIsSending(false);
+      addMessage({ id: uid(), role: "assistant", text: "Error: Unable to start voice streaming", createdAt: Date.now() });
     }
   };
 
-  const handleSend = async () => {
-    const text = input.trim();
+  const handleSend = async (textOverride?: string) => {
+    const text = (textOverride ?? input).trim();
     if (!text || isSending) return;
+
+    const { resolvedUserId, resolvedSessionId } = ensureIdentity();
 
     setIsSending(true);
     setInput("");
@@ -230,8 +413,8 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     try {
       const response = await askWithVoice({
         query: text,
-        userId,
-        sessionId,
+        userId: resolvedUserId,
+        sessionId: resolvedSessionId,
         mode
       });
 
@@ -247,9 +430,7 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
 
       // Auto-play voice response (USER mode only)
       if (response.audioBase64 && mode === "user") {
-        setTimeout(() => {
-          handlePlayVoice(response.audioBase64, response.mimeType);
-        }, 500);
+        handlePlayVoice(response.audioBase64, response.mimeType);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unexpected error occurred";
@@ -283,6 +464,7 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     setShowClearModal(false);
     setInput("");
     setInterimTranscript("");
+    setSessionId(createConversationSessionId());
     if (currentAudio) {
       currentAudio.pause();
       setIsSpeaking(false);
@@ -469,7 +651,7 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                   </div>
 
                   <button
-                    onClick={handleSend}
+                    onClick={() => void handleSend()}
                     disabled={isSending || !input.trim()}
                     className={`p-3 rounded-xl bg-gradient-to-br ${colors.gradient} hover:shadow-lg hover:scale-105 disabled:opacity-50 disabled:scale-100 disabled:cursor-not-allowed transition-all duration-200 text-white flex-shrink-0 btn-ripple`}
                     type="button"

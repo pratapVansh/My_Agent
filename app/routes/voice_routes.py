@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 import re
 import base64
+import asyncio
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
@@ -228,7 +229,26 @@ async def voice_stream_v2(websocket: WebSocket):
     # Deepgram WebSocket connection
     dg_connection = None
     current_transcript = ""
-    is_processing = False
+    transcript_lock = asyncio.Lock()
+    outbound_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    async def outbound_sender():
+        """Serialize websocket sends so final responses are flushed immediately."""
+        while True:
+            payload = await outbound_queue.get()
+            if payload is None:
+                return
+            await websocket.send_json(payload)
+
+    sender_task = asyncio.create_task(outbound_sender())
+    background_tasks: set[asyncio.Task] = set()
+
+    async def emit(payload: Dict[str, Any]):
+        await outbound_queue.put(payload)
+
+    def emit_threadsafe(payload: Dict[str, Any]):
+        loop.call_soon_threadsafe(outbound_queue.put_nowait, payload)
 
     try:
         # Initialize Deepgram WebSocket if enabled
@@ -245,41 +265,40 @@ async def voice_stream_v2(websocket: WebSocket):
 
                 if result.is_final:
                     current_transcript += sentence + " "
-                    await websocket.send_json({
+                    emit_threadsafe({
                         "type": "interim_transcript",
                         "text": sentence,
                         "is_final": True
                     })
                 else:
                     # Interim result for real-time feedback
-                    await websocket.send_json({
+                    emit_threadsafe({
                         "type": "interim_transcript",
                         "text": sentence,
                         "is_final": False
                     })
 
             async def on_utterance_end(self, utterance_end, **kwargs):
-                nonlocal is_processing, current_transcript
+                nonlocal current_transcript
 
-                if len(current_transcript.strip()) > 0 and not is_processing:
-                    is_processing = True
-                    full_text = current_transcript.strip()
+                # Copy and clear transcript immediately - no delays!
+                full_text = current_transcript.strip()
+                current_transcript = ""
 
+                if len(full_text) > 0:
                     # Notify client that utterance ended
-                    await websocket.send_json({
+                    emit_threadsafe({
                         "type": "utterance_end",
                         "transcript": full_text
                     })
 
-                    # Process through agent workflow
-                    await process_transcript(full_text)
-
-                    # Reset for next utterance
-                    current_transcript = ""
-                    is_processing = False
+                    # Process and send response immediately without blocking receive loop
+                    task = asyncio.create_task(process_transcript(full_text))
+                    background_tasks.add(task)
+                    task.add_done_callback(background_tasks.discard)
 
             async def on_error(self, error, **kwargs):
-                await websocket.send_json({
+                emit_threadsafe({
                     "type": "error",
                     "message": f"Deepgram error: {error}"
                 })
@@ -291,50 +310,57 @@ async def voice_stream_v2(websocket: WebSocket):
 
         async def process_transcript(transcript: str):
             """Process complete transcript through agent workflow"""
-            # Add to conversation history
-            conversation_history.append({"role": "user", "content": transcript})
+            try:
+                async with transcript_lock:
+                    # Add to conversation history
+                    conversation_history.append({"role": "user", "content": transcript})
 
-            # Run workflow
-            workflow_result = await run_workflow(
-                user_input=transcript,
-                user_id=user_id,
-                session_id=session_id,
-                conversation_history=conversation_history,
-                output_mode=output_mode,
-            )
+                    # Run workflow
+                    workflow_result = await run_workflow(
+                        user_input=transcript,
+                        user_id=user_id,
+                        session_id=session_id,
+                        conversation_history=conversation_history,
+                        output_mode=output_mode,
+                    )
 
-            display_text = workflow_result.get("display_text", "")
-            speech_text = workflow_result.get("speech_text", "")
+                    display_text = workflow_result.get("display_text", "")
+                    speech_text = workflow_result.get("speech_text", "")
 
-            # Add response to history
-            conversation_history.append({"role": "assistant", "content": display_text})
+                    # Add response to history
+                    conversation_history.append({"role": "assistant", "content": display_text})
 
-            # Keep last 10 messages
-            if len(conversation_history) > 10:
-                conversation_history[:] = conversation_history[-10:]
+                    # Keep last 10 messages
+                    if len(conversation_history) > 10:
+                        conversation_history[:] = conversation_history[-10:]
 
-            # Generate speech
-            tts_result = await voice_service.synthesize_speech(
-                text=speech_text,
-                voice_id=voice_id,
-            )
+                    # Generate speech
+                    tts_result = await voice_service.synthesize_speech(
+                        text=speech_text,
+                        voice_id=voice_id,
+                    )
 
-            # Send final response
-            await websocket.send_json({
-                "type": "final_response",
-                "success": True,
-                "transcript": transcript,
-                "display_text": display_text,
-                "speech_text": speech_text,
-                "audio_base64": tts_result.get("audio_base64", ""),
-                "mime_type": tts_result.get("mime_type", "audio/wav"),
-                "voice_success": tts_result.get("success", False),
-                "voice_error": tts_result.get("error"),
-                "metadata": {
-                    "selected_agent": workflow_result.get("selected_agent"),
-                    "execution_path": workflow_result.get("execution_path", []),
-                },
-            })
+                    # Send final response immediately after workflow + TTS completes.
+                    await emit({
+                        "type": "final_response",
+                        "success": True,
+                        "transcript": transcript,
+                        "display_text": display_text,
+                        "speech_text": speech_text,
+                        "audio_base64": tts_result.get("audio_base64", ""),
+                        "mime_type": tts_result.get("mime_type", "audio/wav"),
+                        "voice_success": tts_result.get("success", False),
+                        "voice_error": tts_result.get("error"),
+                        "metadata": {
+                            "selected_agent": workflow_result.get("selected_agent"),
+                            "execution_path": workflow_result.get("execution_path", []),
+                        },
+                    })
+            except Exception as e:
+                await emit({
+                    "type": "error",
+                    "message": f"Failed to process transcript: {str(e)}",
+                })
 
         # Main message loop
         while True:
@@ -349,7 +375,7 @@ async def voice_stream_v2(websocket: WebSocket):
                 voice_id = msg.get("voice_id")
                 current_transcript = ""
 
-                await websocket.send_json({
+                await emit({
                     "type": "ready",
                     "success": True,
                     "streaming_enabled": settings.streaming_stt_enabled
@@ -365,7 +391,7 @@ async def voice_stream_v2(websocket: WebSocket):
                         audio_bytes = base64.b64decode(audio_b64)
                         await dg_connection.send(audio_bytes)
                     except Exception as e:
-                        await websocket.send_json({
+                        await emit({
                             "type": "error",
                             "message": f"Failed to send audio to Deepgram: {str(e)}"
                         })
@@ -381,7 +407,7 @@ async def voice_stream_v2(websocket: WebSocket):
                         chunk_text = stt_result.get("transcript", "")
                         if chunk_text:
                             current_transcript += chunk_text + " "
-                            await websocket.send_json({
+                            await emit({
                                 "type": "interim_transcript",
                                 "text": chunk_text,
                                 "is_final": True
@@ -390,16 +416,19 @@ async def voice_stream_v2(websocket: WebSocket):
 
             if msg_type == "end_utterance":
                 # Manual end utterance (backup for when VAD not available)
+                # Copy and clear immediately
                 full_text = current_transcript.strip()
-                if full_text and not is_processing:
-                    is_processing = True
-                    await process_transcript(full_text)
-                    current_transcript = ""
-                    is_processing = False
+                current_transcript = ""
+
+                if full_text:
+                    # Process and send response immediately without waiting on next client message
+                    task = asyncio.create_task(process_transcript(full_text))
+                    background_tasks.add(task)
+                    task.add_done_callback(background_tasks.discard)
                 continue
 
             # Unknown message type
-            await websocket.send_json({
+            await emit({
                 "type": "error",
                 "message": f"Unsupported message type: {msg_type}",
             })
@@ -408,10 +437,18 @@ async def voice_stream_v2(websocket: WebSocket):
         pass
     except Exception as e:
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
+            await emit({"type": "error", "message": str(e)})
         except:
             pass
     finally:
+        for task in list(background_tasks):
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+
+        await outbound_queue.put(None)
+        await asyncio.gather(sender_task, return_exceptions=True)
+
         # Cleanup Deepgram connection
         if dg_connection:
             try:
