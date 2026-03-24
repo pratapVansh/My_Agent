@@ -1,0 +1,59 @@
+services:
+  - type: web
+    name: my-agent-backend
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: "10000"
+      - key: ENVIRONMENT
+        value: production
+      - key: POSTGRES_HOST
+        fromDatabase:
+          name: my-agent-postgres
+          property: host
+      - key: POSTGRES_PORT
+        fromDatabase:
+          name: my-agent-postgres
+          property: port
+      - key: POSTGRES_DB
+        fromDatabase:
+          name: my-agent-postgres
+          property: database
+      - key: POSTGRES_USER
+        fromDatabase:
+          name: my-agent-postgres
+          property: user
+      - key: POSTGRES_PASSWORD
+        fromDatabase:
+          name: my-agent-postgres
+          property: password
+      - key: GROQ_API_KEY
+        sync: false
+      - key: COHERE_API_KEY
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: CARTESIA_API_KEY
+        sync: false
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: LANGSMITH_TRACING_ENABLED
+        value: "true"
+      - key: LANGSMITH_PROJECT
+        value: my-agent
+
+databases:
+  - name: my-agent-postgres
+    plan: starter
