@@ -53,25 +53,58 @@ function getVoiceWebSocketUrl() {
   return `${wsBase}/api/v1/voice/stream_v2`;
 }
 
-async function blobToBase64(blob: Blob): Promise<string> {
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => resolve(String(reader.result ?? ""));
-    reader.onerror = () => reject(new Error("Failed to read audio blob"));
-    reader.readAsDataURL(blob);
-  });
-
-  const commaIdx = dataUrl.indexOf(",");
-  if (commaIdx === -1) {
-    return "";
-  }
-  return dataUrl.slice(commaIdx + 1);
-}
-
 function playAudio(base64?: string, mimeType?: string) {
   if (!base64) return;
   const audio = new Audio(`data:${mimeType ?? "audio/wav"};base64,${base64}`);
   return audio;
+}
+
+function downsampleTo16kHz(input: Float32Array, inputSampleRate: number): Float32Array {
+  if (inputSampleRate === 16000) {
+    return input;
+  }
+
+  const sampleRateRatio = inputSampleRate / 16000;
+  const outputLength = Math.round(input.length / sampleRateRatio);
+  const output = new Float32Array(outputLength);
+
+  let outputOffset = 0;
+  let inputOffset = 0;
+
+  while (outputOffset < output.length) {
+    const nextInputOffset = Math.round((outputOffset + 1) * sampleRateRatio);
+    let accumulator = 0;
+    let count = 0;
+
+    for (let i = inputOffset; i < nextInputOffset && i < input.length; i += 1) {
+      accumulator += input[i];
+      count += 1;
+    }
+
+    output[outputOffset] = count > 0 ? accumulator / count : 0;
+    outputOffset += 1;
+    inputOffset = nextInputOffset;
+  }
+
+  return output;
+}
+
+function float32ToPcm16(input: Float32Array): Int16Array {
+  const pcm16 = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return pcm16;
+}
+
+function pcm16ToBase64(pcm16: Int16Array): string {
+  const bytes = new Uint8Array(pcm16.buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }
 
 export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
@@ -90,8 +123,10 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const websocketRef = useRef<WebSocket | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
 
   const colors = mode === "user"
     ? {
@@ -128,9 +163,19 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   // Cleanup timers on unmount
   useEffect(() => {
     return () => {
-      const recorder = mediaRecorderRef.current;
-      if (recorder && recorder.state !== "inactive") {
-        recorder.stop();
+      const processor = processorNodeRef.current;
+      if (processor) {
+        processor.disconnect();
+      }
+
+      const source = sourceNodeRef.current;
+      if (source) {
+        source.disconnect();
+      }
+
+      const context = audioContextRef.current;
+      if (context && context.state !== "closed") {
+        void context.close();
       }
 
       if (mediaStreamRef.current) {
@@ -299,9 +344,22 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   };
 
   const stopStreamingCapture = () => {
-    const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== "inactive") {
-      recorder.stop();
+    const processor = processorNodeRef.current;
+    if (processor) {
+      processor.disconnect();
+      processorNodeRef.current = null;
+    }
+
+    const source = sourceNodeRef.current;
+    if (source) {
+      source.disconnect();
+      sourceNodeRef.current = null;
+    }
+
+    const context = audioContextRef.current;
+    if (context && context.state !== "closed") {
+      void context.close();
+      audioContextRef.current = null;
     }
 
     if (mediaStreamRef.current) {
@@ -332,54 +390,48 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
 
     mediaStreamRef.current = stream;
 
-    const preferredMime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-      ? "audio/webm;codecs=opus"
-      : (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "");
+    const audioContext = new AudioContext();
+    await audioContext.resume();
 
-    const recorder = preferredMime
-      ? new MediaRecorder(stream, { mimeType: preferredMime })
-      : new MediaRecorder(stream);
+    const sourceNode = audioContext.createMediaStreamSource(stream);
+    const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+    const silentGain = audioContext.createGain();
+    silentGain.gain.value = 0;
 
-    mediaRecorderRef.current = recorder;
+    sourceNode.connect(processorNode);
+    processorNode.connect(silentGain);
+    silentGain.connect(audioContext.destination);
+
+    audioContextRef.current = audioContext;
+    sourceNodeRef.current = sourceNode;
+    processorNodeRef.current = processorNode;
+
     setInterimTranscript("");
     setInput("");
     setIsSending(false);
     setIsListening(true);
 
-    recorder.ondataavailable = (event) => {
-      const blob = event.data;
-      if (!blob || blob.size === 0) {
+    processorNode.onaudioprocess = (event) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
         return;
       }
 
-      void (async () => {
-        try {
-          const base64 = await blobToBase64(blob);
-          if (!base64) {
-            return;
-          }
+      try {
+        const inputChannelData = event.inputBuffer.getChannelData(0);
+        const downsampled = downsampleTo16kHz(inputChannelData, audioContext.sampleRate);
+        const pcm16 = float32ToPcm16(downsampled);
+        const base64 = pcm16ToBase64(pcm16);
 
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              type: "audio_data",
-              data: base64,
-              mime_type: recorder.mimeType || "audio/webm",
-              language: "en"
-            }));
-          }
-        } catch (err) {
-          console.error("Failed to send audio chunk", err);
-        }
-      })();
+        ws.send(JSON.stringify({
+          type: "audio_data",
+          data: base64,
+          mime_type: "audio/l16;rate=16000",
+          language: "en"
+        }));
+      } catch (err) {
+        console.error("Failed to send PCM audio chunk", err);
+      }
     };
-
-    recorder.onerror = () => {
-      setIsListening(false);
-      setIsSending(false);
-      addMessage({ id: uid(), role: "assistant", text: "Error: Failed to capture microphone audio", createdAt: Date.now() });
-    };
-
-    recorder.start(250);
   };
 
   const handleMic = async () => {

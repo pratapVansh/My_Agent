@@ -54,6 +54,18 @@ services:
       - key: LANGSMITH_PROJECT
         value: my-agent
 
+  - type: web
+    name: my-agent-frontend
+    env: node
+    plan: starter
+    rootDir: frontend
+    autoDeploy: true
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start -- -p $PORT
+    envVars:
+      - key: NEXT_PUBLIC_API_BASE
+        sync: false
+
 databases:
   - name: my-agent-postgres
     plan: starter
