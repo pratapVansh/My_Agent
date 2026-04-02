@@ -2,10 +2,14 @@
 FastAPI main application entry point.
 Configures async FastAPI server with Groq integration and hybrid memory system.
 """
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 from app.services.groq_service import groq_service
 from app.services.cohere_service import cohere_service
 from app.services.qdrant_service import qdrant_service
@@ -21,62 +25,57 @@ async def lifespan(app: FastAPI):
     Initializes memory systems and verifies API connectivity.
     """
     # Startup
-    print(f"Starting {settings.app_name} v{settings.app_version}")
-    print(f"Environment: {settings.environment}")
-    print(f"Groq Model: {settings.groq_model}")
+    logger.info("Starting %s v%s", settings.app_name, settings.app_version)
+    logger.info("Environment: %s | Groq model: %s", settings.environment, settings.groq_model)
 
     # Optional observability setup
     if configure_langsmith():
-        print(f"✓ LangSmith tracing enabled ({settings.langsmith_project})")
+        logger.info("LangSmith tracing enabled (project=%s)", settings.langsmith_project)
     else:
-        print("- LangSmith tracing disabled")
+        logger.info("LangSmith tracing disabled")
 
     # Initialize memory system
-    print("Initializing hybrid memory system...")
+    logger.info("Initializing hybrid memory system...")
     try:
         await memory_manager.initialize()
-        print("✓ Memory system initialized")
-        print(f"  - Long-term: Qdrant ({settings.qdrant_url})")
-        print(f"  - Embeddings: Cohere ({settings.cohere_model})")
-        print(f"  - Short-term: PostgreSQL ({settings.postgres_host}:{settings.postgres_port})")
-        print(f"  - Smart: mem0 (Cohere embeddings)")
+        logger.info(
+            "Memory system initialized — Qdrant=%s, Cohere=%s, PG=%s:%s",
+            settings.qdrant_url, settings.cohere_model,
+            settings.postgres_host, settings.postgres_port,
+        )
     except Exception as e:
-        print(f"✗ Warning: Memory initialization failed: {str(e)}")
+        logger.warning("Memory initialization failed: %s", e)
 
     # Verify API connections
-    print("\nVerifying API connections...")
-
-    # Groq LLM
     is_healthy = await groq_service.health_check()
-    if is_healthy:
-        print("✓ Groq API connection verified")
-    else:
-        print("✗ Warning: Groq API health check failed")
+    logger.info("Groq API: %s", "OK" if is_healthy else "DEGRADED")
 
-    # Cohere embeddings
     cohere_healthy = await cohere_service.health_check()
-    if cohere_healthy:
-        print("✓ Cohere API connection verified")
-    else:
-        print("✗ Warning: Cohere API health check failed")
+    logger.info("Cohere API: %s", "OK" if cohere_healthy else "DEGRADED")
 
-    # Qdrant vector database
     qdrant_healthy = await qdrant_service.health_check()
-    if qdrant_healthy:
-        print("✓ Qdrant connection verified")
+    logger.info("Qdrant: %s", "OK" if qdrant_healthy else "DEGRADED")
+
+    if settings.is_streaming_stt_available:
+        logger.info("Deepgram streaming STT enabled (linear16, 16000 Hz, WebSocket)")
     else:
-        print("✗ Warning: Qdrant connection failed")
+        logger.warning("Deepgram streaming STT disabled — no API key")
+
+    if settings.cartesia_api_key and settings.cartesia_api_key != "your_cartesia_api_key_here":
+        logger.info("Cartesia TTS enabled")
+    else:
+        logger.info("Cartesia TTS disabled — no API key")
 
     yield
 
     # Shutdown
-    print(f"Shutting down {settings.app_name}")
+    logger.info("Shutting down %s", settings.app_name)
     try:
         await memory_manager.cleanup()
         await voice_service.close()
-        print("✓ Memory system cleaned up")
+        logger.info("Memory system cleaned up")
     except Exception as e:
-        print(f"Warning: Memory cleanup error: {str(e)}")
+        logger.warning("Memory cleanup error: %s", e)
 
 
 # Initialize FastAPI app
@@ -87,10 +86,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware for cross-origin requests
+# CORS — origins controlled via settings.allowed_origins (set ALLOWED_ORIGINS in .env)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

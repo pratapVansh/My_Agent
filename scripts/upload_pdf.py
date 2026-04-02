@@ -5,13 +5,10 @@ Supports both single file and multiple files.
 import asyncio
 import sys
 from pathlib import Path
+import argparse
 from PyPDF2 import PdfReader
 from app.memory.memory_manager import memory_manager
 from app.services.chunking_service import chunking_service
-
-# ===== CONFIGURE YOUR USER ID =====
-YOUR_USER_ID = "Vansh"  # Change this to your name or ID
-# ==================================
 
 
 async def extract_text_from_pdf(pdf_path: str) -> str:
@@ -134,22 +131,31 @@ async def main():
     print("=" * 60)
     print()
 
-    if len(sys.argv) < 2:
+    parser = argparse.ArgumentParser(description="Upload PDF documents into long-term memory")
+    parser.add_argument("path", help="Path to PDF file or directory containing PDFs")
+    parser.add_argument("--user-id", required=True, help="Stable user_id used by chat queries")
+    args = parser.parse_args()
+
+    if not args.path:
         print("Usage:")
         print()
         print("  Upload single PDF:")
-        print(f"    python scripts/upload_pdf.py path/to/your/file.pdf")
+        print(f"    python scripts/upload_pdf.py path/to/your/file.pdf --user-id your_user_id")
         print()
         print("  Upload all PDFs from folder:")
-        print(f"    python scripts/upload_pdf.py path/to/your/folder/")
+        print(f"    python scripts/upload_pdf.py path/to/your/folder/ --user-id your_user_id")
         print()
         print("Examples:")
-        print(f"    python scripts/upload_pdf.py C:/Users/iamch/Documents/my_resume.pdf")
-        print(f"    python scripts/upload_pdf.py C:/Users/iamch/Documents/my_pdfs/")
+        print(f"    python scripts/upload_pdf.py C:/Users/iamch/Documents/my_resume.pdf --user-id user_123")
+        print(f"    python scripts/upload_pdf.py C:/Users/iamch/Documents/my_pdfs/ --user-id user_123")
         print()
         sys.exit(1)
 
-    path = sys.argv[1]
+    path = args.path
+    user_id = args.user_id.strip().lower()
+
+    print("UPLOAD user_id:", user_id)
+
     path_obj = Path(path)
 
     if not path_obj.exists():
@@ -158,9 +164,9 @@ async def main():
 
     # Upload single file or folder
     if path_obj.is_file():
-        await upload_single_pdf(str(path_obj), YOUR_USER_ID)
+        await upload_single_pdf(str(path_obj), user_id)
     elif path_obj.is_dir():
-        await upload_multiple_pdfs(str(path_obj), YOUR_USER_ID)
+        await upload_multiple_pdfs(str(path_obj), user_id)
     else:
         print(f"[ERROR] Invalid path: {path}")
 

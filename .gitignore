@@ -28,21 +28,16 @@ venv/
 ENV/
 env/
 .venv/
-
-# =========================
-# Environment variables / Secrets
-# =========================
-.env
-.env.local
-.env.*.local
-.env.production
-.env.development
-.env.staging
-secrets.json
-credentials.json
-*.pem
 *.key
 *.crt
+
+# =========================
+# Environment files
+# =========================
+.env
+.env.*
+*.env
+!.env.example
 
 # =========================
 # Node.js / Next.js
@@ -136,6 +131,7 @@ uploads/
 tmp/
 temp/
 *.tmp
+scripts/_erp_debug.html
 
 # =========================
 # Docker
@@ -158,3 +154,8 @@ langsmith/
 # OS
 # =========================
 Thumbs.db
+
+# =========================
+# Claude Code
+# =========================
+.claude/

@@ -40,7 +40,7 @@ class ResponseAgent(BaseAgent):
             state["display_text"] = self._format_error_display(error)
             state["speech_text"] = self._format_error_speech(error)
             state["current_agent"] = self.name
-            if state.get("execution_path"):
+            if state.get("execution_path") is not None:
                 state["execution_path"].append(self.name)
             return state
 
@@ -49,12 +49,12 @@ class ResponseAgent(BaseAgent):
             state["display_text"] = "I couldn't process your request. Please try again."
             state["speech_text"] = "I couldn't process your request. Please try again."
             state["current_agent"] = self.name
-            if state.get("execution_path"):
+            if state.get("execution_path") is not None:
                 state["execution_path"].append(self.name)
             return state
 
-        # Extract metadata for task classification
-        content = task_result.get("content", "")
+        # Extract metadata — supports both TaskEnvelope and legacy flat dict
+        content = task_result.get("result", {}).get("content") or task_result.get("content", "")
         agent_name = task_result.get("agent", "assistant")
         output_mode = (state.get("output_mode") or "user").strip().lower()
         if output_mode not in {"user", "recruiter"}:

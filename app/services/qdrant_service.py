@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Optional
 import uuid
 import logging
 from app.config import settings
+from app.services.debug_logger import log_step
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -77,18 +78,23 @@ class QdrantService:
                     f"{vector_size or self.vector_size} dimensions"
                 )
 
-            # Create payload index for user_id (required for filtering)
-            try:
-                await self.client.create_payload_index(
-                    collection_name=collection_name,
-                    field_name="user_id",
-                    field_schema=PayloadSchemaType.KEYWORD
-                )
-                logger.info(f"Created payload index for 'user_id' in '{collection_name}'")
-            except Exception as e:
-                # Index might already exist
-                if "already exists" not in str(e).lower():
-                    logger.warning(f"Could not create user_id index: {str(e)}")
+            # Create payload indexes required for filtering.
+            for field_name in ["user_id", "type", "semantic_type"]:
+                try:
+                    await self.client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field_name,
+                        field_schema=PayloadSchemaType.KEYWORD
+                    )
+                    logger.info(
+                        f"Created payload index for '{field_name}' in '{collection_name}'"
+                    )
+                except Exception as e:
+                    # Index might already exist
+                    if "already exists" not in str(e).lower():
+                        logger.warning(
+                            f"Could not create {field_name} index: {str(e)}"
+                        )
 
             return True
 
@@ -135,7 +141,7 @@ class QdrantService:
             )
             raise
 
-    async def search(
+    async def query_points(
         self,
         collection_name: str,
         query_vector: List[float],
@@ -144,7 +150,7 @@ class QdrantService:
         filter_conditions: Optional[Dict[str, Any]] = None
     ) -> List[ScoredPoint]:
         """
-        Search for similar vectors in a collection.
+        Query points in a collection using vector similarity.
 
         Args:
             collection_name: Name of the collection
@@ -181,14 +187,42 @@ class QdrantService:
                 with_payload=True
             )
 
+            log_step(
+                "QDRANT RESULT",
+                {
+                    "collection": collection_name,
+                    "limit": limit,
+                    "filters": filter_conditions or {},
+                    "count": len(results.points),
+                },
+            )
             logger.info(
-                f"Search in '{collection_name}': found {len(results.points)} results"
+                f"Query in '{collection_name}': found {len(results.points)} results"
             )
             return results.points
 
         except Exception as e:
-            logger.error(f"Search failed in '{collection_name}': {str(e)}")
+            logger.error(f"Query failed in '{collection_name}': {str(e)}")
             raise
+
+    async def search(
+        self,
+        collection_name: str,
+        query_vector: List[float],
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        filter_conditions: Optional[Dict[str, Any]] = None
+    ) -> List[ScoredPoint]:
+        """
+        Backward-compatible wrapper. Prefer query_points().
+        """
+        return await self.query_points(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            limit=limit,
+            score_threshold=score_threshold,
+            filter_conditions=filter_conditions,
+        )
 
     async def get_by_id(
         self,
@@ -264,6 +298,36 @@ class QdrantService:
             logger.error(
                 f"Failed to delete points from '{collection_name}': {str(e)}"
             )
+            raise
+
+    async def delete_by_filter(
+        self,
+        collection_name: str,
+        filter_conditions: Dict[str, Any]
+    ) -> bool:
+        """
+        Delete all points matching filter conditions (e.g. all points for a user).
+
+        Args:
+            collection_name: Name of the collection
+            filter_conditions: e.g. {"user_id": "vansh"}
+
+        Returns:
+            True if deletion successful
+        """
+        try:
+            conditions = [
+                FieldCondition(key=k, match=MatchValue(value=v))
+                for k, v in filter_conditions.items()
+            ]
+            await self.client.delete(
+                collection_name=collection_name,
+                points_selector=Filter(must=conditions)
+            )
+            logger.info(f"Deleted points from '{collection_name}' matching {filter_conditions}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete by filter from '{collection_name}': {str(e)}")
             raise
 
     async def scroll_collection(

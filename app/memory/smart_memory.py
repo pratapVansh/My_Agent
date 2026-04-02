@@ -7,8 +7,16 @@ the system will gracefully disable smart memory (non-blocking).
 """
 from mem0 import Memory
 from typing import List, Dict, Any, Optional
+import logging
+import uuid
+from qdrant_client.models import PointStruct
 from app.config import settings
 from app.services.groq_service import groq_service
+from app.services.qdrant_service import qdrant_service
+from app.services.cohere_service import cohere_service
+from app.services.debug_logger import log_step
+
+logger = logging.getLogger(__name__)
 
 
 class SmartMemory:
@@ -20,6 +28,9 @@ class SmartMemory:
     def __init__(self):
         """Initialize mem0 with Groq LLM and Cohere embeddings."""
         self.memory = None
+        self.qdrant = qdrant_service
+        self.cohere = cohere_service
+        self.collection_name = "smart_memory_chunks"
 
         # Configure mem0 to use Groq LLM and HuggingFace embeddings (free, no API key)
         config = {
@@ -50,6 +61,61 @@ class SmartMemory:
             # which can instantiate OpenAI embeddings and require OPENAI_API_KEY.
             self.memory = None
 
+    async def initialize(self):
+        """Initialize smart memory collection in Qdrant."""
+        await self.qdrant.ensure_collection(self.collection_name)
+
+    async def store_memory(
+        self,
+        user_id: str,
+        text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Store assistant response as retrievable long-term memory."""
+        if not text.strip():
+            return None
+
+        try:
+            log_step("EMBEDDING DONE", {"input_type": "search_document", "target": "memory"})
+            embedding = await self.cohere.embed_text(
+                text=text,
+                input_type="search_document",
+            )
+
+            point_id = str(uuid.uuid4())
+            payload = {
+                "user_id": user_id,
+                "type": "memory",
+                "text": text,
+            }
+            if metadata:
+                payload.update(metadata)
+
+            await self.qdrant.upsert_points(
+                collection_name=self.collection_name,
+                points=[
+                    PointStruct(
+                        id=point_id,
+                        vector=embedding,
+                        payload=payload,
+                    )
+                ],
+            )
+
+            log_step(
+                "MEMORY UPSERT",
+                {
+                    "collection": self.collection_name,
+                    "point_id": point_id,
+                    "user_id": user_id,
+                    "type": "memory",
+                },
+            )
+            return point_id
+        except Exception as e:
+            print(f"Smart memory upsert error: {str(e)}")
+            return None
+
     async def extract_and_store(
         self,
         user_id: str,
@@ -67,24 +133,21 @@ class SmartMemory:
         Returns:
             List of extracted memory IDs
         """
-        if self.memory is None:
-            return []
-
         try:
-            # mem0 automatically extracts insights from messages
-            result = self.memory.add(
-                messages=messages,
-                user_id=user_id,
-                metadata=metadata
-            )
-
-            # Extract memory IDs from result
-            if isinstance(result, dict) and "results" in result:
-                return [item.get("id", "") for item in result.get("results", [])]
-            elif isinstance(result, list):
-                return [item.get("id", "") for item in result]
-            else:
-                return []
+            memory_ids: List[str] = []
+            for message in messages:
+                content = (message or {}).get("content", "").strip()
+                role = (message or {}).get("role", "user")
+                if not content:
+                    continue
+                memory_id = await self.store_memory(
+                    user_id=user_id,
+                    text=content,
+                    metadata={**(metadata or {}), "role": role},
+                )
+                if memory_id:
+                    memory_ids.append(memory_id)
+            return memory_ids
 
         except Exception as e:
             # Silent fail for memory extraction errors
@@ -108,21 +171,12 @@ class SmartMemory:
         Returns:
             Memory ID
         """
-        if self.memory is None:
-            return None
-
         try:
-            result = self.memory.add(
-                messages=[{"role": "user", "content": preference}],
+            return await self.store_memory(
                 user_id=user_id,
-                metadata=metadata
+                text=preference,
+                metadata={**(metadata or {}), "kind": "preference"},
             )
-
-            if isinstance(result, dict) and "results" in result:
-                return result["results"][0].get("id") if result["results"] else None
-            elif isinstance(result, list) and result:
-                return result[0].get("id")
-            return None
 
         except Exception as e:
             print(f"Smart memory add error: {str(e)}")
@@ -145,31 +199,49 @@ class SmartMemory:
         Returns:
             List of preferences/interests
         """
-        if self.memory is None:
-            return []
-
         try:
-            if query:
-                # Semantic search
-                results = self.memory.search(
-                    query=query,
-                    user_id=user_id,
-                    limit=limit
-                )
-            else:
-                # Get all memories
-                results = self.memory.get_all(
-                    user_id=user_id,
-                    limit=limit
+            if not query:
+                # Return latest stored memory points when no semantic query is provided.
+                points = await self.qdrant.scroll_collection(
+                    collection_name=self.collection_name,
+                    filter_conditions={"user_id": user_id, "type": "memory"},
+                    limit=limit,
                 )
 
-            # Format results
-            if isinstance(results, dict) and "results" in results:
-                return results["results"]
-            elif isinstance(results, list):
-                return results
-            else:
-                return []
+                formatted = [
+                    {
+                        "memory": p.get("payload", {}).get("text", ""),
+                        "metadata": p.get("payload", {}),
+                    }
+                    for p in points
+                    if p.get("payload", {}).get("text")
+                ]
+                if not formatted:
+                    return []
+                return formatted
+
+            query_embedding = await self.cohere.embed_text(
+                text=query,
+                input_type="search_query",
+            )
+            log_step("EMBEDDING DONE", {"input_type": "search_query", "target": "memory"})
+
+            results = await self.qdrant.query_points(
+                collection_name=self.collection_name,
+                query_vector=query_embedding,
+                limit=limit,
+                filter_conditions={"user_id": user_id, "type": "memory"},
+            )
+
+            return [
+                {
+                    "memory": result.payload.get("text", ""),
+                    "score": result.score,
+                    "metadata": result.payload,
+                }
+                for result in results
+                if result.payload.get("text")
+            ]
 
         except Exception as e:
             print(f"Smart memory retrieval error: {str(e)}")
@@ -207,43 +279,72 @@ class SmartMemory:
 
     async def delete_memory(self, user_id: str, memory_id: str) -> bool:
         """
-        Delete a specific memory.
+        Delete a specific memory point by ID, verifying it belongs to this user.
 
         Args:
-            user_id: User identifier
-            memory_id: Memory ID to delete
+            user_id: User identifier (ownership check)
+            memory_id: Qdrant point ID to delete
 
         Returns:
-            Success status
+            True if deleted, False if not found or error
         """
-        if self.memory is None:
-            return False
-
         try:
-            self.memory.delete(memory_id=memory_id, user_id=user_id)
+            # Scroll all points for this user and check ownership before deleting.
+            # This prevents one user from deleting another user's memories.
+            points = await self.qdrant.scroll_collection(
+                collection_name=self.collection_name,
+                filter_conditions={"user_id": user_id},
+                limit=1000,
+            )
+            owned_ids = {p["id"] for p in points}
+            if memory_id not in owned_ids:
+                logger.warning(
+                    "delete_memory: memory_id=%s not found for user=%s", memory_id, user_id
+                )
+                return False
+
+            await self.qdrant.delete_points(
+                collection_name=self.collection_name,
+                point_ids=[memory_id],
+            )
+            logger.info("delete_memory: deleted memory_id=%s for user=%s", memory_id, user_id)
             return True
         except Exception as e:
-            print(f"Smart memory delete error: {str(e)}")
+            logger.error("Smart memory delete error for user=%s: %s", user_id, e)
             return False
 
     async def reset_user_memories(self, user_id: str) -> bool:
         """
-        Reset all memories for a user.
+        Delete ALL memory points for a user (e.g. GDPR right-to-erasure).
 
         Args:
             user_id: User identifier
 
         Returns:
-            Success status
+            True if all points deleted (or none existed), False on error
         """
-        if self.memory is None:
-            return False
-
         try:
-            self.memory.reset(user_id=user_id)
+            points = await self.qdrant.scroll_collection(
+                collection_name=self.collection_name,
+                filter_conditions={"user_id": user_id},
+                limit=1000,
+            )
+            if not points:
+                logger.info("reset_user_memories: no memories found for user=%s", user_id)
+                return True
+
+            point_ids = [p["id"] for p in points]
+            await self.qdrant.delete_points(
+                collection_name=self.collection_name,
+                point_ids=point_ids,
+            )
+            logger.info(
+                "reset_user_memories: deleted %d memory points for user=%s",
+                len(point_ids), user_id,
+            )
             return True
         except Exception as e:
-            print(f"Smart memory reset error: {str(e)}")
+            logger.error("Smart memory reset error for user=%s: %s", user_id, e)
             return False
 
 

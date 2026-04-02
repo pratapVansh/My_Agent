@@ -3,7 +3,7 @@ Application configuration using Pydantic Settings.
 Loads environment variables for Groq API and application settings.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     deepgram_model: str = "nova-2"
     deepgram_streaming_enabled: bool = False
     deepgram_interim_results: bool = True
-    deepgram_utterance_end_ms: int = 1000
+    deepgram_utterance_end_ms: int = 800  # Reduced for faster VAD response (~500-1500ms latency gain)
     deepgram_vad_events: bool = True
 
     # Voice: Cartesia TTS
@@ -74,9 +74,18 @@ class Settings(BaseSettings):
     # Voice Agent Optimization Feature Flags
     streaming_stt_enabled: bool = True
     streaming_tts_enabled: bool = False
-    parallel_workflow_enabled: bool = False
+    parallel_workflow_enabled: bool = True  # Run memory + planner concurrently (~200-300ms gain)
     binary_audio_enabled: bool = False
     vad_enabled: bool = True
+
+    # CORS — restrict in production (comma-separated origins in .env)
+    allowed_origins: List[str] = ["http://localhost:3000", "http://localhost:3001"]
+
+    # SMTP Email Sending (Gmail)
+    smtp_email: Optional[str] = None        # your Gmail address
+    smtp_password: Optional[str] = None     # Gmail App Password (not normal password)
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
 
     # Observability: LangSmith
     langsmith_api_key: Optional[str] = None
@@ -88,6 +97,11 @@ class Settings(BaseSettings):
     def postgres_url(self) -> str:
         """Build PostgreSQL connection URL."""
         return f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+
+    @property
+    def is_streaming_stt_available(self) -> bool:
+        """Check if streaming STT should be enabled based on API key availability."""
+        return bool(self.deepgram_api_key and self.deepgram_api_key.strip())
 
     model_config = SettingsConfigDict(
         env_file=".env",

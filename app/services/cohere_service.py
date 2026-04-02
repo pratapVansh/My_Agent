@@ -3,9 +3,11 @@ Cohere API service wrapper for embeddings.
 Provides async embedding generation with batching and retry logic.
 """
 import cohere
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 import asyncio
+import hashlib
 import logging
+import time
 from app.config import settings
 
 # Configure logging
@@ -28,6 +30,10 @@ class CohereService:
         self.model = settings.cohere_model
         self.embedding_dimension = settings.cohere_embedding_dimension
         self.max_batch_size = 96  # Cohere's max batch size
+
+        # TTL cache for search_query embeddings only (60s TTL, max 512 entries)
+        # search_document embeddings are for ingestion only — not cached
+        self._query_cache: Dict[str, Tuple[List[float], float]] = {}
 
     async def _retry_with_backoff(
         self,
@@ -71,18 +77,39 @@ class CohereService:
     ) -> List[float]:
         """
         Generate embedding for a single text.
+        search_query embeddings are cached for 60s to avoid redundant API calls.
 
         Args:
             text: Text to embed
-            input_type: Type of input - "search_document" for storage,
-                       "search_query" for retrieval
+            input_type: "search_document" for storage, "search_query" for retrieval
 
         Returns:
             List of floats representing the embedding (1024 dimensions)
-
-        Raises:
-            Exception: If embedding generation fails
         """
+        if input_type == "search_query":
+            cache_key = hashlib.md5(text.encode()).hexdigest()
+            now = time.monotonic()
+            if cache_key in self._query_cache:
+                embedding, cached_at = self._query_cache[cache_key]
+                if now - cached_at < 60.0:
+                    return embedding
+            result = await self._embed_text_uncached(text, input_type)
+            self._query_cache[cache_key] = (result, now)
+            # Prune oldest entries when cache exceeds 512
+            if len(self._query_cache) > 512:
+                oldest = sorted(self._query_cache.items(), key=lambda x: x[1][1])
+                for k, _ in oldest[:128]:
+                    del self._query_cache[k]
+            return result
+
+        return await self._embed_text_uncached(text, input_type)
+
+    async def _embed_text_uncached(
+        self,
+        text: str,
+        input_type: str,
+    ) -> List[float]:
+        """Internal embed call without cache."""
         async def _embed():
             try:
                 response = await self.client.embed(
@@ -90,17 +117,12 @@ class CohereService:
                     model=self.model,
                     input_type=input_type
                 )
-
-                # Extract embedding and convert to float32 for Qdrant
                 embedding = [float(x) for x in response.embeddings[0]]
-
                 logger.info(
                     f"Generated embedding: {len(embedding)} dimensions, "
                     f"input_type={input_type}"
                 )
-
                 return embedding
-
             except Exception as e:
                 logger.error(f"Cohere embedding error: {str(e)}")
                 raise

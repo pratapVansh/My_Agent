@@ -1,19 +1,22 @@
 """
-Planner Agent - Detects intent and routes to appropriate task agent.
-Controls the workflow by analyzing user input and selecting the right specialist.
+Planner Agent - Detects intent, scores confidence, and routes to appropriate task agent.
+If confidence < 0.6, raises a clarifying question instead of routing blindly.
 """
 from typing import Dict, Any
 import json
 from app.agents.base_agent import BaseAgent
 from app.services.langsmith_service import traceable
 
+CONFIDENCE_THRESHOLD = 0.6
+
 
 class PlannerAgent(BaseAgent):
     """
     Planner Agent responsible for:
     - Detecting user intent from input
-    - Routing to the appropriate task agent
-    - Controlling multi-step execution flow
+    - Scoring routing confidence (0.0–1.0)
+    - Routing to the appropriate task agent when confident
+    - Asking a clarifying question when not confident enough
     """
 
     def __init__(self):
@@ -23,25 +26,15 @@ class PlannerAgent(BaseAgent):
         )
         self.available_agents = {
             "job": "Job-related queries (search, applications, career advice)",
-            "email": "Email management (compose, send, organize)",
-            "academic": "Academic tasks (research, study help, assignments)",
-            "profile": "User profile operations (view, update, preferences)"
+            "email": "Email management (compose, draft, organize)",
+            "academic": "Academic tasks (timetable, attendance, study help, exams, daily plans, reminders, tasks)",
+            "profile": "User profile, resume, skills, projects, general queries"
         }
 
     @traceable(name="planner_decision", run_type="chain", tags=["planner", "decision"])
     async def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Analyze user input and determine routing.
-
-        Args:
-            state: Current workflow state with user_input
-
-        Returns:
-            Updated state with detected_intent and selected_agent
-        """
         user_input = state["user_input"]
 
-        # Build prompt for intent detection
         system_prompt = self.inject_memory_context(self._build_system_prompt(), state)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -49,20 +42,26 @@ class PlannerAgent(BaseAgent):
         ]
 
         try:
-            # Call Groq with low latency settings
             response = await self.call_groq(
                 messages=messages,
-                temperature=0.3,  # Lower temp for more consistent routing
-                max_tokens=256  # Small response for fast routing
+                temperature=0.2,
+                max_tokens=500
             )
 
-            # Parse response
-            routing_decision = self._parse_response(response)
+            routing = self._parse_response(response)
 
-            # Update state
-            state["detected_intent"] = routing_decision["intent"]
-            state["selected_agent"] = routing_decision["agent"]
+            state["detected_intent"] = routing["intent"]
+            state["selected_agent"] = routing["agent"]
+            state["planner_confidence"] = routing["confidence"]
+            state["needs_clarification"] = routing["needs_clarification"]
+            state["clarification_question"] = routing.get("clarification_question", "")
             state["current_agent"] = "planner"
+
+            # Fix 1: store the execution plan from planner
+            state["execution_plan"] = routing.get("execution_plan", [])
+            state["current_step_index"] = 0
+            state["step_results"] = {}
+            state["inter_step_context"] = None
 
             if "execution_path" not in state or state["execution_path"] is None:
                 state["execution_path"] = []
@@ -72,68 +71,136 @@ class PlannerAgent(BaseAgent):
 
         except Exception as e:
             state["error"] = f"Planner error: {str(e)}"
-            state["selected_agent"] = "response"  # Fallback to response
+            state["selected_agent"] = "profile"
+            state["planner_confidence"] = 0.5
+            state["needs_clarification"] = False
+            state["execution_plan"] = []
+            state["current_step_index"] = 0
+            state["step_results"] = {}
+            state["inter_step_context"] = None
             return state
 
     def _build_system_prompt(self) -> str:
-        """Build system prompt with available agents and routing rules."""
         agents_desc = "\n".join([
             f"- {name}: {desc}"
             for name, desc in self.available_agents.items()
         ])
 
-        return f"""You are a routing agent that analyzes user queries and selects the best specialist agent.
+        return f"""You are a planning agent that decomposes user requests into an ordered execution plan.
 
 Available agents:
 {agents_desc}
 
-Analyze the user's query and respond with a JSON object containing:
-1. "intent": A brief description of what the user wants
-2. "agent": The name of the best agent to handle this (job/email/academic/profile)
+Analyze the user query and respond with a JSON object:
+{{
+  "intent": "brief description of the overall goal",
+  "agent": "first agent to run (job|email|academic|profile)",
+  "confidence": 0.0-1.0,
+  "needs_clarification": true|false,
+  "clarification_question": "question if unclear, else empty string",
+  "execution_plan": [
+    {{"step": 1, "agent": "agent_name", "goal": "specific goal for this step"}},
+    {{"step": 2, "agent": "agent_name", "goal": "specific goal using results from step 1"}}
+  ]
+}}
 
-Rules:
-- Choose exactly ONE agent
-- Base decision on query content and context
-- If unclear, default to "profile" for general queries
-- Respond ONLY with valid JSON
+Rules for execution_plan:
+- ALWAYS include at least 1 step, even for simple tasks.
+- Add MORE steps when the user asks to do multiple distinct things in one message, e.g.:
+  * "search for jobs AND draft a cover letter" → step1: job(search), step2: email(draft)
+  * "find ML jobs in NYC then send me an email summary" → step1: job(search), step2: email(send summary)
+  * "check my attendance and email my professor" → step1: academic(attendance), step2: email(draft to professor)
+- Single-step examples (only 1 step needed):
+  * "find software jobs" → step1: job(search)
+  * "what's my timetable?" → step1: academic(timetable)
+  * "draft an email to HR" → step1: email(draft)
+- In multi-step plans, the goal for step N+1 should reference "results from step N" so the agent knows to use prior output.
+- "agent" at the top level must equal the agent of step 1.
 
-Example response:
-{{"intent": "user wants to search for jobs", "agent": "job"}}"""
+Confidence scoring:
+- 0.9–1.0: Query clearly maps to a specific plan
+- 0.7–0.89: Likely correct, minor ambiguity
+- 0.6–0.69: Could be planned differently
+- Below 0.6: Set needs_clarification=true
 
-    def _parse_response(self, response: str) -> Dict[str, str]:
-        """
-        Parse LLM response to extract routing decision.
+Additional rules:
+- If needs_clarification is true, write a short natural clarifying question.
+- If needs_clarification is false, clarification_question must be "".
+- Default to "profile" for general personal questions.
+- Respond ONLY with valid JSON, no other text.
 
-        Args:
-            response: LLM output
+Example — single step:
+{{"intent": "find software jobs", "agent": "job", "confidence": 0.95, "needs_clarification": false, "clarification_question": "", "execution_plan": [{{"step": 1, "agent": "job", "goal": "Search for software engineering job listings"}}]}}
 
-        Returns:
-            Dictionary with intent and agent
-        """
+Example — multi step:
+{{"intent": "search jobs and draft cover letter", "agent": "job", "confidence": 0.9, "needs_clarification": false, "clarification_question": "", "execution_plan": [{{"step": 1, "agent": "job", "goal": "Search for relevant job listings"}}, {{"step": 2, "agent": "email", "goal": "Draft a tailored cover letter using the job search results from step 1"}}]}}"""
+
+    def _parse_response(self, response: str) -> Dict[str, Any]:
         try:
-            # Try to parse as JSON
-            response_clean = response.strip()
-            if response_clean.startswith("```json"):
-                response_clean = response_clean.split("```json")[1].split("```")[0].strip()
-            elif response_clean.startswith("```"):
-                response_clean = response_clean.split("```")[1].split("```")[0].strip()
+            clean = response.strip()
+            if clean.startswith("```json"):
+                clean = clean.split("```json")[1].split("```")[0].strip()
+            elif clean.startswith("```"):
+                clean = clean.split("```")[1].split("```")[0].strip()
 
-            parsed = json.loads(response_clean)
+            parsed = json.loads(clean)
 
-            # Validate agent selection
             agent = parsed.get("agent", "profile").lower()
             if agent not in self.available_agents:
-                agent = "profile"  # Default fallback
+                agent = "profile"
+
+            confidence = float(parsed.get("confidence", 0.5))
+            confidence = max(0.0, min(1.0, confidence))
+
+            needs_clarification = bool(parsed.get("needs_clarification", False))
+
+            # Safety-net: only override for extreme low-confidence cases
+            if not needs_clarification and confidence < 0.35:
+                needs_clarification = True
+
+            clarification_question = str(parsed.get("clarification_question", "")).strip()
+            if needs_clarification and not clarification_question:
+                clarification_question = "Could you clarify what you need help with?"
+
+            # Parse execution_plan — validate each step has required fields
+            raw_plan = parsed.get("execution_plan", [])
+            execution_plan = []
+            if isinstance(raw_plan, list):
+                for item in raw_plan:
+                    if isinstance(item, dict):
+                        step_agent = str(item.get("agent", "profile")).lower()
+                        if step_agent not in self.available_agents:
+                            step_agent = "profile"
+                        execution_plan.append({
+                            "step": int(item.get("step", len(execution_plan) + 1)),
+                            "agent": step_agent,
+                            "goal": str(item.get("goal", "")),
+                        })
+
+            # Always ensure at least one step exists
+            if not execution_plan:
+                execution_plan = [{"step": 1, "agent": agent, "goal": parsed.get("intent", "complete the user request")}]
+
+            # Ensure `agent` matches the first step's agent
+            agent = execution_plan[0]["agent"]
 
             return {
                 "intent": parsed.get("intent", "general query"),
-                "agent": agent
+                "agent": agent,
+                "confidence": confidence,
+                "needs_clarification": needs_clarification,
+                "clarification_question": clarification_question,
+                "execution_plan": execution_plan,
             }
+
         except Exception:
-            # Fallback parsing if JSON fails
             return {
                 "intent": "general query",
-                "agent": "profile"
+                "agent": "profile",
+                "confidence": 0.5,
+                "needs_clarification": False,
+                "clarification_question": "",
+                "execution_plan": [{"step": 1, "agent": "profile", "goal": "handle the user request"}],
             }
 
 

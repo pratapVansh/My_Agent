@@ -7,6 +7,8 @@ export type ChatMessage = {
   audioBase64?: string;
   mimeType?: string;
   createdAt: number;
+  agentName?: string;
+  jobResults?: JobResult[];
 };
 
 export type JobResult = {

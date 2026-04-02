@@ -6,7 +6,8 @@ Low-latency voice service.
 from __future__ import annotations
 
 import base64
-from typing import Any, Dict, Optional
+import json
+from typing import Any, AsyncGenerator, Dict, Optional
 import asyncio
 
 import httpx
@@ -93,55 +94,56 @@ class VoiceService:
                 "error": f"Deepgram transcription failed: {str(e)}",
             }
 
-    async def create_deepgram_websocket(self):
+    def create_deepgram_connection(self):
         """
-        Create a streaming WebSocket connection to Deepgram for real-time STT.
+        Create a Deepgram WebSocket connection object and options WITHOUT starting it.
 
-        This provides significantly lower latency than chunk-based HTTP API:
-        - HTTP chunk: 500-800ms latency
-        - WebSocket streaming: 50-200ms latency
+        The caller must register event handlers and then call `await conn.start(options)`.
+        This ordering ensures no events (open/close/error) are missed due to a race
+        between connection start and handler registration.
 
         Returns:
-            Deepgram WebSocket connection configured for low-latency streaming
+            (dg_connection, LiveOptions) — connection is NOT yet started
         """
         if not settings.deepgram_api_key:
             raise ValueError("Missing DEEPGRAM_API_KEY for streaming STT")
 
-        try:
-            # Configure Deepgram client
-            deepgram_config = DeepgramClientOptions(
-                options={"keepalive": "true"}
-            )
-            deepgram_client = DeepgramClient(
-                settings.deepgram_api_key,
-                deepgram_config
-            )
+        deepgram_config = DeepgramClientOptions(
+            options={"keepalive": "true"}
+        )
+        deepgram_client = DeepgramClient(
+            settings.deepgram_api_key,
+            deepgram_config
+        )
 
-            # Get WebSocket connection
-            dg_connection = deepgram_client.listen.asyncwebsocket.v("1")
+        dg_connection = deepgram_client.listen.asyncwebsocket.v("1")
 
-            # Configure streaming options for ultra-low latency
-            options = LiveOptions(
-                model=settings.deepgram_model,
-                language="en",
-                smart_format=True,
-                punctuate=True,
-                interim_results=settings.deepgram_interim_results,
-                utterance_end_ms=str(settings.deepgram_utterance_end_ms),
-                vad_events=settings.deepgram_vad_events,
-                encoding="linear16",
-                sample_rate=16000,
-                channels=1
-            )
+        options = LiveOptions(
+            model=settings.deepgram_model,
+            language="en",
+            smart_format=True,
+            punctuate=True,
+            interim_results=settings.deepgram_interim_results,
+            utterance_end_ms=str(settings.deepgram_utterance_end_ms),
+            vad_events=settings.deepgram_vad_events,
+            encoding="linear16",
+            sample_rate=16000,
+            channels=1
+        )
 
-            # Start the connection
-            if await dg_connection.start(options):
-                return dg_connection
-            else:
-                raise Exception("Failed to start Deepgram WebSocket connection")
+        return dg_connection, options
 
-        except Exception as e:
-            raise Exception(f"Failed to create Deepgram WebSocket: {str(e)}")
+    async def create_deepgram_websocket(self):
+        """
+        Create and start a Deepgram WebSocket connection (no event handlers registered).
+
+        Prefer `create_deepgram_connection()` when you need to attach event handlers
+        before the connection opens.
+        """
+        dg_connection, options = self.create_deepgram_connection()
+        if await dg_connection.start(options):
+            return dg_connection
+        raise Exception("Failed to start Deepgram WebSocket connection")
 
     async def synthesize_speech(
         self,
@@ -196,6 +198,56 @@ class VoiceService:
                 "audio_base64": "",
                 "error": f"Cartesia synthesis failed: {str(e)}",
             }
+
+    async def synthesize_speech_stream(
+        self,
+        text: str,
+        voice_id: Optional[str] = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Stream raw PCM S16LE audio chunks from Cartesia (24kHz mono).
+
+        Yields bytes chunks as they arrive from Cartesia instead of waiting for
+        the full response — reduces time-to-first-audio from ~1-2s to ~200-400ms.
+        """
+        if not settings.cartesia_api_key or settings.cartesia_api_key == "your_cartesia_api_key_here":
+            return
+
+        if not text or not text.strip():
+            return
+
+        payload = {
+            "model_id": settings.cartesia_model_id,
+            "transcript": text,
+            "voice": {
+                "mode": "id",
+                "id": voice_id or settings.cartesia_voice_id,
+            },
+            "output_format": {
+                "container": "raw",
+                "sample_rate": settings.cartesia_sample_rate,
+                "encoding": "pcm_s16le",
+            },
+        }
+
+        try:
+            async with self._client.stream(
+                "POST",
+                "https://api.cartesia.ai/tts/bytes",
+                headers={
+                    "X-API-Key": settings.cartesia_api_key,
+                    "Cartesia-Version": settings.cartesia_version,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=httpx.Timeout(5.0, read=30.0),
+            ) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+        except Exception as e:
+            print(f"[TTS Stream] Cartesia streaming failed: {e}")
 
     async def close(self):
         await self._client.aclose()
