@@ -38,3 +38,7 @@ psycopg2-binary==2.9.10
 cohere>=5.0.0
 qdrant-client>=1.7.0
 tiktoken>=0.5.0
+
+# LiveKit WebRTC (Phase 0 — token generation SDK only)
+livekit-api>=1.0.0
+livekit>=1.0.0

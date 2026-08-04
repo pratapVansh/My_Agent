@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     deepgram_model: str = "nova-2"
     deepgram_streaming_enabled: bool = False
     deepgram_interim_results: bool = True
-    deepgram_utterance_end_ms: int = 800  # Reduced for faster VAD response (~500-1500ms latency gain)
+    deepgram_utterance_end_ms: int = 1000  # Deepgram API strictly requires a minimum of 1000ms
     deepgram_vad_events: bool = True
 
     # Voice: Cartesia TTS
@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     cartesia_version: str = "2024-06-10"
     cartesia_sample_rate: int = 24000
     cartesia_streaming_enabled: bool = False
+
+    # LiveKit WebRTC (Phase 0 — settings only, not active yet)
+    livekit_url: Optional[str] = None
+    livekit_api_key: Optional[str] = None
+    livekit_api_secret: Optional[str] = None
 
     # Voice Agent Optimization Feature Flags
     streaming_stt_enabled: bool = True
@@ -102,6 +107,15 @@ class Settings(BaseSettings):
     def is_streaming_stt_available(self) -> bool:
         """Check if streaming STT should be enabled based on API key availability."""
         return bool(self.deepgram_api_key and self.deepgram_api_key.strip())
+
+    @property
+    def is_livekit_configured(self) -> bool:
+        """Check if LiveKit credentials are fully configured."""
+        return bool(
+            self.livekit_url
+            and self.livekit_api_key
+            and self.livekit_api_secret
+        )
 
     model_config = SettingsConfigDict(
         env_file=".env",

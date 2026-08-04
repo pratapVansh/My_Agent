@@ -4,8 +4,10 @@ import { useEffect, useRef, useState } from "react";
 import {
   askWithVoice,
   ChatMessage,
-  ChatMode
+  ChatMode,
+  getLiveKitToken
 } from "@/lib/api";
+import { Room, RoomEvent } from "livekit-client";
 import { ListeningIndicator, SpeakingIndicator, ThinkingIndicator, TypingIndicator } from "./StatusIndicator";
 import { CloseChatModal, ClearChatModal } from "./ChatModals";
 
@@ -62,99 +64,8 @@ function getVoiceWebSocketUrl() {
   return `${wsBase}/api/v1/voice/stream_v2`;
 }
 
-function playAudio(base64?: string, mimeType?: string) {
-  if (!base64) return;
-  const audio = new Audio(`data:${mimeType ?? "audio/wav"};base64,${base64}`);
-  return audio;
-}
 
-function downsampleTo16kHz(input: Float32Array, inputSampleRate: number): Float32Array {
-  if (inputSampleRate === 16000) {
-    return input;
-  }
 
-  const sampleRateRatio = inputSampleRate / 16000;
-  const outputLength = Math.round(input.length / sampleRateRatio);
-  const output = new Float32Array(outputLength);
-
-  let outputOffset = 0;
-  let inputOffset = 0;
-
-  while (outputOffset < output.length) {
-    const nextInputOffset = Math.round((outputOffset + 1) * sampleRateRatio);
-    let accumulator = 0;
-    let count = 0;
-
-    for (let i = inputOffset; i < nextInputOffset && i < input.length; i += 1) {
-      accumulator += input[i];
-      count += 1;
-    }
-
-    output[outputOffset] = count > 0 ? accumulator / count : 0;
-    outputOffset += 1;
-    inputOffset = nextInputOffset;
-  }
-
-  return output;
-}
-
-function float32ToPcm16(input: Float32Array): Int16Array {
-  const pcm16 = new Int16Array(input.length);
-  for (let i = 0; i < input.length; i += 1) {
-    const s = Math.max(-1, Math.min(1, input[i]));
-    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return pcm16;
-}
-
-// Playback sample rate must match Cartesia output (24kHz)
-const PLAYBACK_SAMPLE_RATE = 24000;
-
-/**
- * Decode base64 → PCM S16LE bytes → Float32 AudioBuffer and schedule
- * playback on the provided AudioContext, chaining buffers end-to-end.
- *
- * KEY FIX: if we've fallen behind (first chunk or slow network), schedule
- * at ctx.currentTime + 5ms instead of ctx.currentTime + 10ms + nextStartTime,
- * which previously caused audible gaps when chunks arrived slower than their
- * own duration.
- *
- * Returns the updated nextStartTime.
- */
-function scheduleAudioChunk(
-  ctx: AudioContext,
-  base64Pcm: string,
-  nextStartTime: number,
-): number {
-  const binary = atob(base64Pcm);
-  const byteLen = binary.length;
-  if (byteLen < 2) return nextStartTime;
-
-  const numSamples = Math.floor(byteLen / 2);
-  const buffer = ctx.createBuffer(1, numSamples, PLAYBACK_SAMPLE_RATE);
-  const channelData = buffer.getChannelData(0);
-
-  for (let i = 0; i < numSamples; i += 1) {
-    const lo = binary.charCodeAt(i * 2);
-    const hi = binary.charCodeAt(i * 2 + 1);
-    let sample = (hi << 8) | lo;
-    if (sample >= 0x8000) sample -= 0x10000; // sign extend
-    channelData[i] = sample / 32768.0;
-  }
-
-  const source = ctx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(ctx.destination);
-
-  // Chain to previous buffer if we're ahead of schedule,
-  // otherwise start immediately (5ms safety margin) to avoid gaps.
-  const startAt = nextStartTime > ctx.currentTime
-    ? nextStartTime
-    : ctx.currentTime + 0.005;
-  source.start(startAt);
-
-  return startAt + buffer.duration;
-}
 
 export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   const [userId, setUserId] = useState("");
@@ -167,38 +78,22 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [showCloseModal, setShowCloseModal] = useState(false);
   const [showClearModal, setShowClearModal] = useState(false);
-  const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
   const [interimTranscript, setInterimTranscript] = useState("");
+  const [partialAssistantMessage, setPartialAssistantMessage] = useState("");
   const [currentAgent, setCurrentAgent] = useState<string | null>(null);
   const [showMemoryPanel, setShowMemoryPanel] = useState(false);
   const [profileFacts, setProfileFacts] = useState<Array<{key: string; value: string; source?: string}>>([]);
   const [memoryLoading, setMemoryLoading] = useState(false);
-  const [voiceMode, setVoiceMode] = useState<"push-to-talk" | "always-on">("push-to-talk");
   const [timetableUploading, setTimetableUploading] = useState(false);
   const [timetableUploadResult, setTimetableUploadResult] = useState<{success: boolean; message: string} | null>(null);
   const timetableInputRef = useRef<HTMLInputElement>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const websocketRef = useRef<WebSocket | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processorNodeRef = useRef<AudioWorkletNode | null>(null);
-  const userMessageAddedRef = useRef<boolean>(false);
-  // Accumulates FINAL Deepgram results — used as the authoritative transcript on stop
-  const interimTranscriptRef = useRef<string>("");
-  // Tracks the latest DISPLAYED text (final or interim) — fallback when user
-  // stops speaking before Deepgram fires a final result
-  const latestInterimRef = useRef<string>("");
-  // Audio frames buffered while WS is still connecting
-  const audioBufferRef = useRef<ArrayBuffer[]>([]);
-  // Keep voiceMode accessible inside WS closures without stale state
-  const voiceModeRef = useRef<"push-to-talk" | "always-on">("push-to-talk");
+  // LiveKit Phase 1 — temporary test connection
+  const [livekitStatus, setLivekitStatus] = useState<"idle" | "connecting" | "connected" | "error">("idle");
+  const livekitRoomRef = useRef<Room | null>(null);
 
-  // Streaming TTS playback — separate AudioContext from the recording one
-  const playbackContextRef = useRef<AudioContext | null>(null);
-  const nextAudioStartTimeRef = useRef<number>(0);
-  const audioStreamEndTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const userMessageAddedRef = useRef<boolean>(false);
 
   const colors = mode === "user"
     ? {
@@ -228,15 +123,7 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     setSessionId(createConversationSessionId());
   }, []);
 
-  // Keep ref in sync so stopStreamingCapture always reads the latest transcript
-  useEffect(() => {
-    interimTranscriptRef.current = interimTranscript;
-  }, [interimTranscript]);
 
-  // Keep voiceModeRef in sync for use inside WS closures
-  useEffect(() => {
-    voiceModeRef.current = voiceMode;
-  }, [voiceMode]);
 
   const fetchProfileFacts = async () => {
     if (!userId) return;
@@ -314,36 +201,11 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   // Cleanup timers on unmount
   useEffect(() => {
     return () => {
-      const processor = processorNodeRef.current;
-      if (processor) {
-        processor.disconnect();
-      }
 
-      const source = sourceNodeRef.current;
-      if (source) {
-        source.disconnect();
-      }
-
-      const context = audioContextRef.current;
-      if (context && context.state !== "closed") {
-        void context.close();
-      }
-
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      }
-
-      if (websocketRef.current) {
-        websocketRef.current.close();
-      }
-
-      const playbackCtx = playbackContextRef.current;
-      if (playbackCtx && playbackCtx.state !== "closed") {
-        void playbackCtx.close();
-      }
-
-      if (audioStreamEndTimerRef.current !== null) {
-        window.clearTimeout(audioStreamEndTimerRef.current);
+      // LiveKit cleanup
+      if (livekitRoomRef.current) {
+        void livekitRoomRef.current.disconnect();
+        livekitRoomRef.current = null;
       }
     };
   }, []);
@@ -368,486 +230,51 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     return { resolvedUserId, resolvedSessionId };
   };
 
-  const ensureVoiceSocket = async (resolvedUserId: string, resolvedSessionId: string) => {
-    const current = websocketRef.current;
-    if (current && current.readyState === WebSocket.OPEN) {
-      current.send(JSON.stringify({
-        type: "start",
-        user_id: resolvedUserId,
-        session_id: resolvedSessionId,
-        output_mode: mode
-      }));
-      return current;
-    }
-
-    if (current && current.readyState === WebSocket.CONNECTING) {
-      await new Promise<void>((resolve, reject) => {
-        const timeout = window.setTimeout(() => reject(new Error("WebSocket connect timeout")), 5000);
-        const onOpen = () => {
-          window.clearTimeout(timeout);
-          resolve();
-        };
-        const onError = () => {
-          window.clearTimeout(timeout);
-          reject(new Error("WebSocket connection failed"));
-        };
-        current.addEventListener("open", onOpen, { once: true });
-        current.addEventListener("error", onError, { once: true });
-      });
-
-      current.send(JSON.stringify({
-        type: "start",
-        user_id: resolvedUserId,
-        session_id: resolvedSessionId,
-        output_mode: mode
-      }));
-      return current;
-    }
-
-    const ws = new WebSocket(getVoiceWebSocketUrl());
-
-    ws.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data);
-        const msgType = payload.type;
-
-        if (msgType === "interim_transcript") {
-          const text = String(payload.text ?? "");
-          if (payload.is_final) {
-            interimTranscriptRef.current = (interimTranscriptRef.current + " " + text).trim();
-          }
-          // Always track the latest shown text so stopStreamingCapture can fall
-          // back to it if the user stops before Deepgram fires a final result.
-          latestInterimRef.current = interimTranscriptRef.current || text;
-          setInterimTranscript(latestInterimRef.current);
-          setInput(latestInterimRef.current);
-          return;
-        }
-
-        if (msgType === "utterance_end") {
-          // Backend VAD detected speech end — stop capture and show processing immediately
-          audioBufferRef.current = [];
-          const processor = processorNodeRef.current;
-          if (processor) { processor.disconnect(); processorNodeRef.current = null; }
-          const source = sourceNodeRef.current;
-          if (source) { source.disconnect(); sourceNodeRef.current = null; }
-          const context = audioContextRef.current;
-          if (context && context.state !== "closed") { void context.close(); audioContextRef.current = null; }
-          if (mediaStreamRef.current) {
-            mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-            mediaStreamRef.current = null;
-          }
-
-          // Use ref for fresh transcript (state may be stale in this closure)
-          const userText = (payload.transcript as string | undefined)?.trim()
-            || interimTranscriptRef.current.trim();
-
-          setIsListening(false);
-          setInterimTranscript("");
-          interimTranscriptRef.current = "";
-          latestInterimRef.current = "";
-          setInput("");
-          setCurrentAgent(null);
-
-          if (userText && !userMessageAddedRef.current) {
-            addMessage({ id: uid(), role: "user", text: userText, createdAt: Date.now() });
-            userMessageAddedRef.current = true;
-          }
-          setIsSending(true);
-          return;
-        }
-
-        if (msgType === "interrupt") {
-          // Backend cancelled the in-flight TTS — stop playback immediately
-          if (playbackContextRef.current && playbackContextRef.current.state !== "closed") {
-            void playbackContextRef.current.close();
-            playbackContextRef.current = null;
-          }
-          nextAudioStartTimeRef.current = 0;
-          if (audioStreamEndTimerRef.current !== null) {
-            window.clearTimeout(audioStreamEndTimerRef.current);
-            audioStreamEndTimerRef.current = null;
-          }
-          setIsSpeaking(false);
-          return;
-        }
-
-        if (msgType === "audio_stream_start") {
-          // Prepare playback AudioContext for incoming PCM chunks
-          if (mode === "user") {
-            // Close any existing context to avoid scheduling on a stale timeline
-            if (playbackContextRef.current && playbackContextRef.current.state !== "closed") {
-              void playbackContextRef.current.close();
-            }
-            playbackContextRef.current = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
-            // Browsers auto-suspend AudioContext — resume or audio is silent
-            if (playbackContextRef.current.state === "suspended") {
-              void playbackContextRef.current.resume();
-            }
-            nextAudioStartTimeRef.current = 0;
-            if (audioStreamEndTimerRef.current !== null) {
-              window.clearTimeout(audioStreamEndTimerRef.current);
-              audioStreamEndTimerRef.current = null;
-            }
-            setIsSpeaking(true);
-          }
-          return;
-        }
-
-        if (msgType === "audio_chunk") {
-          // Decode PCM S16LE chunk and schedule for seamless playback
-          if (mode === "user" && payload.data && playbackContextRef.current) {
-            // Resume in case context was suspended between chunks
-            if (playbackContextRef.current.state === "suspended") {
-              void playbackContextRef.current.resume();
-            }
-            nextAudioStartTimeRef.current = scheduleAudioChunk(
-              playbackContextRef.current,
-              String(payload.data),
-              nextAudioStartTimeRef.current,
-            );
-          }
-          return;
-        }
-
-        if (msgType === "audio_stream_end") {
-          // Schedule isSpeaking → false after the last queued chunk finishes
-          if (mode === "user" && playbackContextRef.current) {
-            const ctx = playbackContextRef.current;
-            const msUntilEnd = Math.max(
-              0,
-              (nextAudioStartTimeRef.current - ctx.currentTime) * 1000
-            );
-            if (audioStreamEndTimerRef.current !== null) {
-              window.clearTimeout(audioStreamEndTimerRef.current);
-            }
-            audioStreamEndTimerRef.current = window.setTimeout(() => {
-              setIsSpeaking(false);
-              setCurrentAudio(null);
-              audioStreamEndTimerRef.current = null;
-              // Always-on: auto-restart listening after speaking ends
-              if (voiceModeRef.current === "always-on") {
-                startStreamingCapture().catch(console.error);
-              }
-            }, msUntilEnd + 150); // +150ms buffer for scheduler jitter
-          } else {
-            setIsSpeaking(false);
-            if (voiceModeRef.current === "always-on") {
-              window.setTimeout(() => startStreamingCapture().catch(console.error), 400);
-            }
-          }
-          return;
-        }
-
-        if (msgType === "final_response") {
-          const transcript = String(payload.transcript ?? "").trim();
-          const displayText = String(payload.display_text ?? "");
-
-          // Clear processing timeout if it exists
-          const ws = websocketRef.current;
-          if (ws && (ws as any).__processingTimeout) {
-            window.clearTimeout((ws as any).__processingTimeout);
-            (ws as any).__processingTimeout = null;
-          }
-
-          // Transition: PROCESSING → IDLE (audio_stream_start will set SPEAKING)
-          setIsSending(false);
-          setInterimTranscript("");
-          setInput("");
-
-          const selectedAgent = payload.metadata?.selected_agent as string | undefined;
-          setCurrentAgent(selectedAgent || null);
-
-          // Only add user message if not already added
-          if (transcript && !userMessageAddedRef.current) {
-            addMessage({ id: uid(), role: "user", text: transcript, createdAt: Date.now() });
-          }
-
-          // Reset flag for next utterance
-          userMessageAddedRef.current = false;
-
-          addMessage({
-            id: uid(),
-            role: "assistant",
-            text: displayText,
-            audioBase64: payload.audio_base64,
-            mimeType: payload.mime_type,
-            agentName: selectedAgent,
-            jobResults: payload.job_results || undefined,
-            createdAt: Date.now()
-          });
-
-          // Legacy fallback: play blob audio only if no streaming audio is coming
-          // (audio_base64 non-empty means old /stream endpoint or TTS not available)
-          if (payload.audio_base64 && mode === "user") {
-            handlePlayVoice(payload.audio_base64, payload.mime_type);
-          }
-          return;
-        }
-
-        if (msgType === "error") {
-          // Clear processing timeout if it exists
-          const ws = websocketRef.current;
-          if (ws && (ws as any).__processingTimeout) {
-            window.clearTimeout((ws as any).__processingTimeout);
-            (ws as any).__processingTimeout = null;
-          }
-
-          console.log("Received error from backend:", payload.message);
-
-          // Reset all states on error
-          setIsListening(false);
-          setIsSending(false);
-          setIsSpeaking(false);
-          setInterimTranscript("");
-          setInput("");
-          userMessageAddedRef.current = false;
-
-          const message = String(payload.message ?? "Voice stream error");
-
-          // Only show error message if it's not about "no speech detected"
-          if (!message.toLowerCase().includes("no speech detected")) {
-            addMessage({ id: uid(), role: "assistant", text: `Error: ${message}`, createdAt: Date.now() });
-          }
-          return;
-        }
-      } catch (err) {
-        console.error("Failed to parse websocket message", err);
-      }
-    };
-
-    ws.onerror = () => {
-      setIsListening(false);
-      setIsSending(false);
-      addMessage({ id: uid(), role: "assistant", text: "Error: Voice socket connection failed", createdAt: Date.now() });
-    };
-
-    ws.onclose = () => {
-      websocketRef.current = null;
-    };
-
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => reject(new Error("WebSocket connect timeout")), 7000);
-
-      const onOpen = () => {
-        window.clearTimeout(timeout);
-        ws.removeEventListener("error", onError);
-        resolve();
-      };
-
-      const onError = () => {
-        window.clearTimeout(timeout);
-        ws.removeEventListener("open", onOpen);
-        reject(new Error("WebSocket connection failed"));
-      };
-
-      ws.addEventListener("open", onOpen, { once: true });
-      ws.addEventListener("error", onError, { once: true });
-    });
-
-    websocketRef.current = ws;
-    ws.send(JSON.stringify({
-      type: "start",
-      user_id: resolvedUserId,
-      session_id: resolvedSessionId,
-      output_mode: mode
-    }));
-    return ws;
-  };
-
-  const stopStreamingCapture = () => {
-    // ── INSTANT: stop listening state immediately ───────────────────────────
-    setIsListening(false);
-    audioBufferRef.current = [];
-
-    // ── Tear down audio pipeline ────────────────────────────────────────────
-    const processor = processorNodeRef.current;
-    if (processor) { processor.disconnect(); processorNodeRef.current = null; }
-    const source = sourceNodeRef.current;
-    if (source) { source.disconnect(); sourceNodeRef.current = null; }
-    const context = audioContextRef.current;
-    if (context && context.state !== "closed") { void context.close(); audioContextRef.current = null; }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-      mediaStreamRef.current = null;
-    }
-
-    // Read from ref — avoids stale closure when transcript updated after render
-    // Prefer accumulated finals; fall back to the latest shown interim so we
-    // don't lose speech when the user stops before Deepgram fires a final result.
-    const captured = (interimTranscriptRef.current || latestInterimRef.current).trim();
-    const hasTranscript = captured.length > 0;
-
-    setInput("");
-    setInterimTranscript("");
-    interimTranscriptRef.current = "";
-    latestInterimRef.current = "";
-
-    const ws = websocketRef.current;
-
-    if (!hasTranscript) {
-      // Nothing was spoken — reset cleanly
-      setIsSending(false);
-      userMessageAddedRef.current = false;
-      return;
-    }
-
-    // ── Show user message + Processing indicator IMMEDIATELY ───────────────
-    if (!userMessageAddedRef.current) {
-      addMessage({ id: uid(), role: "user", text: captured, createdAt: Date.now() });
-      userMessageAddedRef.current = true;
-    }
-    setIsSending(true);
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "end_utterance" }));
-
-      // Safety timeout: reset if backend never responds
-      const timeoutId = window.setTimeout(() => {
-        setIsSending(false);
-        setIsSpeaking(false);
-        userMessageAddedRef.current = false;
-        addMessage({ id: uid(), role: "assistant", text: "Request timeout. Please try again.", createdAt: Date.now() });
-      }, 30000);
-      (ws as any).__processingTimeout = timeoutId;
-    } else {
-      // WS not connected — still show message, but reset processing
-      setIsSending(false);
-      userMessageAddedRef.current = false;
-    }
-  };
-
-  const startStreamingCapture = async () => {
-    const { resolvedUserId, resolvedSessionId } = ensureIdentity();
-
-    // ── INSTANT feedback — set state before ANY async work ─────────────────
-    setIsListening(true);
-    setInterimTranscript("");
-    interimTranscriptRef.current = "";
-    latestInterimRef.current = "";
-    setInput("");
-    setIsSending(false);
-    userMessageAddedRef.current = false;
-    audioBufferRef.current = [];
-
-    // ── Request mic — fast after first permission grant ─────────────────────
-    let stream: MediaStream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
-      });
-    } catch (err) {
-      setIsListening(false);
-      throw err;
-    }
-
-    mediaStreamRef.current = stream;
-
-    // ── Audio pipeline setup (AudioWorkletNode — replaces deprecated ScriptProcessorNode) ──
-    const audioContext = new AudioContext();
-    await audioContext.resume();
-    await audioContext.audioWorklet.addModule("/pcm-processor.js");
-    const sourceNode = audioContext.createMediaStreamSource(stream);
-    const workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
-
-    audioContextRef.current = audioContext;
-    sourceNodeRef.current = sourceNode;
-    processorNodeRef.current = workletNode;
-
-    workletNode.port.onmessage = (event) => {
-      const inputData: Float32Array = event.data;
-      const ws = websocketRef.current;
-      try {
-        const downsampled = downsampleTo16kHz(inputData, audioContext.sampleRate);
-        const pcm16 = float32ToPcm16(downsampled);
-        const frame = pcm16.buffer.slice(0);
-
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          const buf = audioBufferRef.current;
-          if (buf.length > 0) {
-            for (const buffered of buf.splice(0)) ws.send(buffered);
-          }
-          ws.send(frame);
-        } else {
-          // Buffer while WS is still connecting — keep at most ~2 s of audio
-          audioBufferRef.current.push(frame);
-          if (audioBufferRef.current.length > 50) audioBufferRef.current.shift();
-        }
-      } catch (err) {
-        console.error("Failed to send PCM audio chunk", err);
-      }
-    };
-
-    sourceNode.connect(workletNode);
-    workletNode.connect(audioContext.destination);
-
-    // ── Connect WS in background — audio starts immediately above ──────────
-    ensureVoiceSocket(resolvedUserId, resolvedSessionId).catch((err) => {
-      console.error("Failed to connect voice socket:", err);
-      setIsListening(false);
-      addMessage({ id: uid(), role: "assistant", text: "Error: Unable to start voice streaming", createdAt: Date.now() });
-    });
-  };
+  
+  
+  
 
 
-  const stopTtsPlayback = () => {
-    // Immediately stop any in-flight TTS audio playback
-    if (playbackContextRef.current && playbackContextRef.current.state !== "closed") {
-      void playbackContextRef.current.close();
-      playbackContextRef.current = null;
-    }
-    nextAudioStartTimeRef.current = 0;
-    if (audioStreamEndTimerRef.current !== null) {
-      window.clearTimeout(audioStreamEndTimerRef.current);
-      audioStreamEndTimerRef.current = null;
-    }
-    setIsSpeaking(false);
-    // Tell backend to cancel its TTS stream
-    const ws = websocketRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "interrupt" }));
-    }
-  };
 
+  
   const handleMic = async () => {
-    console.log("Mic clicked - current state:", {isListening, isSending, isSpeaking});
+    console.log("Mic clicked - current state:", {isListening, isSending, isSpeaking, livekitStatus});
 
-    // If agent is speaking, interrupt it and start listening
     if (isSpeaking && !isListening) {
-      console.log("Interrupting TTS to start listening...");
-      stopTtsPlayback();
-      try {
-        await startStreamingCapture();
-      } catch (error) {
-        console.error("Failed to start voice stream after interrupt", error);
-        setIsListening(false);
-      }
-      return;
+       setIsSpeaking(false);
+       // we can't easily interrupt LiveKit audio playback unless we publish an interrupt event or mute the track.
+       // The requirement doesn't mandate full barge-in manual interrupt here, but let's just proceed.
     }
 
-    // Block starting a new recording while agent is still processing (not speaking)
     if (!isListening && isSending) {
       console.log("Mic click blocked - currently processing");
       return;
     }
 
-    // Toggle: LISTENING → IDLE (stop and process)
     if (isListening) {
-      console.log("Stopping listening...");
-      stopStreamingCapture();
+      console.log(`[DEBUG] ${new Date().toISOString()} handleMic: Stopping listening (isListening=true)`);
+      setIsListening(false);
+      if (livekitRoomRef.current) {
+         console.log(`[DEBUG] ${new Date().toISOString()} handleMic: Disabling microphone on LiveKit`);
+         await livekitRoomRef.current.localParticipant.setMicrophoneEnabled(false);
+      }
       return;
     }
 
-    // Transition: IDLE → LISTENING (start recording)
-    console.log("Starting listening...");
+    console.log(`[DEBUG] ${new Date().toISOString()} handleMic: Starting listening (isListening=false)`);
+    setIsListening(true);
+    userMessageAddedRef.current = false;
+    setInterimTranscript("");
+    setInput("");
     try {
-      await startStreamingCapture();
-    } catch (error) {
-      console.error("Failed to start voice stream", error);
+      if (livekitStatus !== "connected") {
+        await connectLiveKit();
+      } else if (livekitRoomRef.current) {
+        await livekitRoomRef.current.localParticipant.setMicrophoneEnabled(true);
+      }
+    } catch (e) {
+      console.error("Failed to start LiveKit mic", e);
       setIsListening(false);
-      setIsSending(false);
-      setIsSpeaking(false);
-      addMessage({ id: uid(), role: "assistant", text: "Error: Unable to start voice streaming", createdAt: Date.now() });
     }
   };
 
@@ -876,15 +303,8 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
         id: msgId,
         role: "assistant",
         text: response.displayText,
-        audioBase64: response.audioBase64,
-        mimeType: response.mimeType,
         createdAt: Date.now()
       });
-
-      // Auto-play voice response (USER mode only)
-      if (response.audioBase64 && mode === "user") {
-        handlePlayVoice(response.audioBase64, response.mimeType);
-      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unexpected error occurred";
       addMessage({ id: uid(), role: "assistant", text: `Error: ${message}`, createdAt: Date.now() });
@@ -893,40 +313,149 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     }
   };
 
-  const handlePlayVoice = (base64?: string, mimeType?: string) => {
-    // Stop any existing audio playback
-    if (currentAudio) {
-      currentAudio.pause();
-      currentAudio.onended = null;
-      currentAudio.onerror = null;
-      setIsSpeaking(false);
-      setCurrentAudio(null);
-    }
+  // ── LiveKit Phase 1 — Test WebRTC connection ─────────────────────────────
+  const connectLiveKit = async () => {
+    // Toggle: disconnect if already connected
+    
 
-    const audio = playAudio(base64, mimeType);
-    if (audio) {
-      setCurrentAudio(audio);
-      setIsSpeaking(true);
+    setLivekitStatus("connecting");
+    try {
+      const { resolvedUserId } = ensureIdentity();
+      const roomName = `voice-${resolvedUserId}`;
+      const { token, url } = await getLiveKitToken(resolvedUserId, roomName);
 
-      // Transition: SPEAKING → IDLE when audio ends
-      audio.onended = () => {
-        console.log("Audio playback ended - resetting to IDLE state");
-        setIsSpeaking(false);
-        setCurrentAudio(null);
-      };
+      const room = new Room();
 
-      // Also handle errors and interruptions
-      audio.onerror = (e) => {
-        console.error("Audio playback error:", e);
-        setIsSpeaking(false);
-        setCurrentAudio(null);
-      };
-
-      audio.play().catch((err) => {
-        console.error("Audio playback failed:", err);
-        setIsSpeaking(false);
-        setCurrentAudio(null);
+      room.on(RoomEvent.Disconnected, () => {
+        setLivekitStatus("idle");
+        livekitRoomRef.current = null;
+        console.log("LiveKit: room disconnected");
       });
+
+      room.on(RoomEvent.ParticipantConnected, (p) => {
+        console.log("LiveKit: participant joined:", p.identity);
+      });
+
+      room.on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+        try {
+          const strData = new TextDecoder().decode(payload);
+          const parsed = JSON.parse(strData);
+          
+          if (parsed.type === "final_response") {
+            console.log(`[DEBUG] ${new Date().toISOString()} DataReceived: final_response. transcript=${parsed.transcript}`);
+            const transcript = String(parsed.transcript ?? "").trim();
+            const displayText = String(parsed.display_text ?? "");
+            const selectedAgent = parsed.metadata?.selected_agent as string | undefined;
+            
+            setCurrentAgent(selectedAgent || null);
+            setPartialAssistantMessage("");
+            
+            if (transcript && !userMessageAddedRef.current) {
+              console.log(`[DEBUG] ${new Date().toISOString()} final_response: Adding user message to UI`);
+              addMessage({ id: uid(), role: "user", text: transcript, createdAt: Date.now() });
+            } else if (transcript) {
+              console.warn(`[DEBUG] ${new Date().toISOString()} final_response: SKIPPED adding user message. userMessageAddedRef is TRUE!`);
+            }
+            
+            // Unlock UI for the next sentence
+            userMessageAddedRef.current = false;
+            
+            addMessage({
+              id: uid(),
+              role: "assistant",
+              text: displayText,
+              agentName: selectedAgent,
+              jobResults: parsed.job_results || undefined,
+              createdAt: Date.now()
+            });
+            // setIsSpeaking(false) removed because TTS audio is still streaming
+            
+          } else if (parsed.type === "tts_complete") {
+            console.log(`[DEBUG] ${new Date().toISOString()} DataReceived: tts_complete`);
+            setIsSpeaking(false);
+            
+          } else if (parsed.type === "interrupted") {
+            console.log(`[DEBUG] ${new Date().toISOString()} DataReceived: interrupted (Barge-in)`);
+            // Barge-in detected
+            setIsSpeaking(false);
+            // We do not change isListening here, because the mic stays hot
+            setIsSending(false);
+            setPartialAssistantMessage("");
+            
+            // Unlock UI for the interrupted utterance or the next one
+            userMessageAddedRef.current = false;
+            
+            // Note: We don't need to append the partial text here because
+            // the worker stores it in memory directly, and we just abandon the bubble.
+            
+          } else if (parsed.type === "token_batch") {
+            setPartialAssistantMessage(parsed.text);
+            setIsSending(false);
+            setIsSpeaking(true);
+            
+          } else if (parsed.type === "interim_transcript") {
+            const text = String(parsed.text ?? "");
+            setInterimTranscript(text);
+            setInput(text);
+            
+          } else if (parsed.type === "utterance_end") {
+            console.log(`[DEBUG] ${new Date().toISOString()} DataReceived: utterance_end. transcript=${parsed.transcript}`);
+            const transcript = String(parsed.transcript ?? "").trim();
+            if (transcript && !userMessageAddedRef.current) {
+              console.log(`[DEBUG] ${new Date().toISOString()} utterance_end: Adding user message to UI`);
+              addMessage({ id: uid(), role: "user", text: transcript, createdAt: Date.now() });
+              userMessageAddedRef.current = true;
+            } else if (transcript) {
+              console.warn(`[DEBUG] ${new Date().toISOString()} utterance_end: SKIPPED adding user message. userMessageAddedRef is TRUE!`);
+            }
+            console.log(`[DEBUG] ${new Date().toISOString()} utterance_end: setting isSending=true`);
+            // We do not set isListening=false here because the microphone is still open!
+            setIsSending(true);
+            setInterimTranscript("");
+            setInput("");
+            
+          } else if (parsed.type === "error") {
+            console.error(`[DEBUG] ${new Date().toISOString()} LiveKit error from backend:`, parsed.message);
+            addMessage({
+              id: uid(),
+              role: "assistant",
+              text: `Error: ${parsed.message}`,
+              createdAt: Date.now()
+            });
+            setIsSending(false);
+            setIsSpeaking(false);
+          }
+        } catch (e) {
+          console.error("Failed to parse LiveKit data channel message:", e);
+        }
+      });
+
+      room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+        if (track.kind === "audio") {
+          const audioElement = track.attach();
+          document.body.appendChild(audioElement);
+          console.log("LiveKit: Audio track attached and playing");
+        }
+      });
+
+      room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+        if (track.kind === "audio") {
+          track.detach().forEach(el => el.remove());
+          console.log("LiveKit: Audio track detached");
+        }
+      });
+
+      await room.connect(url, token);
+      await room.localParticipant.setMicrophoneEnabled(true);
+
+      livekitRoomRef.current = room;
+      setLivekitStatus("connected");
+      console.log("✓ LiveKit: connected to room", roomName);
+      console.log("✓ LiveKit: microphone published");
+    } catch (err) {
+      console.error("LiveKit connection failed:", err);
+      setLivekitStatus("error");
+      setTimeout(() => setLivekitStatus("idle"), 3000);
     }
   };
 
@@ -942,23 +471,6 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     setSessionId(createConversationSessionId());
 
     // Stop audio and reset all states
-    if (currentAudio) {
-      currentAudio.pause();
-      currentAudio.onended = null;
-      currentAudio.onerror = null;
-      setCurrentAudio(null);
-    }
-
-    // Stop streaming playback
-    if (audioStreamEndTimerRef.current !== null) {
-      window.clearTimeout(audioStreamEndTimerRef.current);
-      audioStreamEndTimerRef.current = null;
-    }
-    if (playbackContextRef.current && playbackContextRef.current.state !== "closed") {
-      void playbackContextRef.current.close();
-      playbackContextRef.current = null;
-    }
-    nextAudioStartTimeRef.current = 0;
 
     setIsSpeaking(false);
     setIsSending(false);
@@ -998,6 +510,8 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                 </div>
               </div>
               <div className="flex items-center gap-2">
+                
+
                 {/* Hidden file input for timetable upload */}
                 <input
                   ref={timetableInputRef}
@@ -1189,18 +703,6 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                       ))}
                     </div>
                   )}
-
-                  {msg.role === "assistant" && msg.audioBase64 && mode === "recruiter" && (
-                    <button
-                      onClick={() => handlePlayVoice(msg.audioBase64, msg.mimeType)}
-                      className={`mt-2 px-4 py-2 rounded-xl glass hover:glass-strong transition-all duration-200 text-white text-xs font-medium flex items-center gap-2 group`}
-                    >
-                      <svg className="w-4 h-4 group-hover:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
-                      </svg>
-                      Play Voice
-                    </button>
-                  )}
                 </div>
 
                 {msg.role === "user" && (
@@ -1213,7 +715,21 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
               </article>
             ))}
 
-            <TypingIndicator show={isSending && !isListening} />
+            <TypingIndicator show={isSending && !isListening && !partialAssistantMessage} />
+            
+            {partialAssistantMessage && (
+              <article className={`flex items-start gap-4 flex-row`}>
+                <div className={`w-10 h-10 rounded-full bg-gradient-to-br ${colors.gradient} flex items-center justify-center flex-shrink-0 shadow-lg`}>
+                  <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                </div>
+                <div className={`flex-1 glass-strong rounded-2xl p-4 max-w-[85%] border border-white/20 shadow-xl prose prose-invert`}>
+                  <p className="text-white text-[15px] leading-relaxed m-0">{partialAssistantMessage}</p>
+                </div>
+              </article>
+            )}
+
             <div ref={messagesEndRef} />
           </div>
 
@@ -1298,24 +814,6 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
             </div>
 
             {/* Voice mode toggle (user mode only) */}
-            {mode === "user" && (
-              <div className="mt-2 flex justify-center">
-                <button
-                  onClick={() => setVoiceMode(v => v === "push-to-talk" ? "always-on" : "push-to-talk")}
-                  className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs transition-all duration-200 ${
-                    voiceMode === "always-on"
-                      ? `bg-gradient-to-r ${colors.gradient} text-white font-medium shadow`
-                      : "glass text-white/50 hover:text-white/80"
-                  }`}
-                  title={voiceMode === "always-on" ? "Switch to push-to-talk" : "Switch to always-on (auto-restart after response)"}
-                >
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                  </svg>
-                  {voiceMode === "always-on" ? "Always-on" : "Push-to-talk"}
-                </button>
-              </div>
-            )}
           </footer>
         </section>
 

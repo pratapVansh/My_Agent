@@ -66,6 +66,12 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Cartesia TTS disabled — no API key")
 
+    # LiveKit WebRTC readiness (Phase 0 — informational only)
+    if settings.is_livekit_configured:
+        logger.info("LiveKit WebRTC configured (url=%s)", settings.livekit_url)
+    else:
+        logger.info("LiveKit WebRTC not configured — WebSocket transport active")
+
     yield
 
     # Shutdown
@@ -125,10 +131,10 @@ async def health_check():
 
 # Include routers
 from app.routes import agent_routes
-from app.routes import voice_routes
+from app.routes import livekit_routes
 
 app.include_router(agent_routes.router, prefix="/api/v1/agents", tags=["agents"])
-app.include_router(voice_routes.router, prefix="/api/v1/voice", tags=["voice"])
+app.include_router(livekit_routes.router, prefix="/api/v1/voice", tags=["voice"])
 
 
 if __name__ == "__main__":

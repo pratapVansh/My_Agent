@@ -47,10 +47,8 @@ export async function askWithVoice(params: {
 }): Promise<{
   displayText: string;
   speechText: string;
-  audioBase64?: string;
-  mimeType?: string;
 }> {
-  const resp = await fetch(`${API_BASE}/api/v1/voice/query`, {
+  const resp = await fetch(`${API_BASE}/api/v1/agents/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -69,8 +67,6 @@ export async function askWithVoice(params: {
   return {
     displayText: data.display_text ?? "",
     speechText: data.speech_text ?? "",
-    audioBase64: data.voice?.audio_base64,
-    mimeType: data.voice?.mime_type
   };
 }
 
@@ -117,4 +113,26 @@ export async function fetchAttendanceSuggestions(userId: string): Promise<Attend
 
   const data = await resp.json();
   return (data.suggestions ?? []) as AttendanceSuggestion[];
+}
+
+/**
+ * Fetch a LiveKit access token from the backend.
+ * Phase 1 — used to join a LiveKit room for WebRTC audio.
+ */
+export async function getLiveKitToken(
+  userId: string,
+  roomName: string
+): Promise<{ token: string; url: string }> {
+  const resp = await fetch(`${API_BASE}/api/v1/voice/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, room_name: roomName }),
+  });
+
+  if (!resp.ok) {
+    const detail = await resp.text();
+    throw new Error(`LiveKit token request failed (${resp.status}): ${detail}`);
+  }
+
+  return resp.json();
 }
