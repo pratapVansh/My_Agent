@@ -6,10 +6,12 @@ Fix 7: This module is now wired to the /stream WebSocket route in agent_routes.p
 The workflow skips tool-calling (trades completeness for sub-second first-token latency)
 which is the right trade-off for voice/streaming UI contexts.
 """
+import asyncio
 import uuid
 import logging
-from typing import Dict, Any, AsyncGenerator
-from app.agents.workflow import memory_node, planner_node
+from typing import Dict, Any, AsyncGenerator, FrozenSet, Optional
+from app.agents.agent_profiles import get_capabilities
+from app.agents.workflow import parallel_init_node
 from app.agents.job_agent import job_agent
 from app.agents.email_agent import email_agent
 from app.agents.academic_agent import academic_agent
@@ -17,6 +19,10 @@ from app.agents.profile_agent import profile_agent
 from app.services.groq_service import groq_service
 
 logger = logging.getLogger(__name__)
+
+# Ceiling on memory retrieval + planning. Past this the assistant answers from
+# the transcript alone, which is far better than saying nothing at all.
+_INIT_TIMEOUT_SECONDS = 4.0
 
 
 def get_agent_by_name(agent_name: str):
@@ -40,7 +46,10 @@ def get_agent_by_name(agent_name: str):
 
 def _get_agent_system_prompt(agent, state: Dict[str, Any]) -> str:
     """
-    Get appropriate system prompt for each agent type with memory context.
+    Build the system prompt for an agent in the streaming (tool-free) path.
+
+    Capability text comes from the shared agent profile registry so this path
+    and the tool-calling workflow always describe the same agent the same way.
 
     Args:
         agent: Agent instance
@@ -49,55 +58,7 @@ def _get_agent_system_prompt(agent, state: Dict[str, Any]) -> str:
     Returns:
         System prompt with memory context injected
     """
-    # Agent-specific prompts
-    agent_prompts = {
-        "job": """You are a job search and career advisor assistant.
-
-Your capabilities:
-- Help users search and find relevant jobs
-- Provide application guidance and tips
-- Offer career advice and development suggestions
-- Assist with resume/interview preparation
-
-Provide practical, actionable advice tailored to the user's query.
-Be concise but comprehensive.""",
-
-        "email": """You are an email management and composition assistant.
-
-Your capabilities:
-- Draft professional emails
-- Manage email organization
-- Compose responses and follow-ups
-- Schedule meetings via email
-
-Write clear, professional, context-appropriate emails.""",
-
-        "academic": """You are an academic tracking and planning assistant.
-
-Your capabilities:
-- Track attendance records
-- Manage timetables and schedules
-- Provide academic planning advice
-- Help with course management
-
-Provide accurate, helpful academic guidance.""",
-
-        "profile": """You are a profile management and general assistance agent.
-
-Your capabilities:
-- Help with user profile information
-- Manage preferences and settings
-- Handle general queries that don't fit other categories
-- Provide friendly, helpful responses
-
-Be helpful, conversational, and adapt to the user's needs.
-For general queries, provide useful information or assistance."""
-    }
-
-    # Get base prompt for this agent
-    base_prompt = agent_prompts.get(agent.name, agent.description)
-
-    # Inject memory context
+    base_prompt = get_capabilities(agent.name, default=agent.description)
     return agent.inject_memory_context(base_prompt, state)
 
 
@@ -106,7 +67,8 @@ async def run_streaming_workflow(
     user_id: str = None,
     session_id: str = None,
     conversation_history: list = None,
-    output_mode: str = "user"
+    output_mode: str = "user",
+    scopes: Optional[FrozenSet[str]] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     Run workflow with true LLM token streaming for low-latency voice/UI.
@@ -131,6 +93,7 @@ async def run_streaming_workflow(
         "session_id": session_id,
         "conversation_history": conversation_history or [],
         "output_mode": output_mode,
+        "scopes": scopes,
         "memory_context": None,
         "memory_prompt": None,
         "detected_intent": None,
@@ -155,18 +118,29 @@ async def run_streaming_workflow(
         "error": None,
     }
 
-    # ── Step 1: Memory retrieval ─────────────────────────────────────────────
+    # ── Step 1+2: Memory retrieval and planning, concurrently ────────────────
+    # These are independent — the planner classifies intent from the raw
+    # utterance and does not read memory — so running them in series simply
+    # added one round trip's worth of silence before the first token. The
+    # timeout matters just as much: memory touches Postgres, Cohere, and
+    # Qdrant, and any one of them hanging used to stall the whole spoken turn
+    # forever with no audio and no error.
     try:
-        state = await memory_node(state)
+        state = await asyncio.wait_for(
+            parallel_init_node(state), timeout=_INIT_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Streaming workflow init exceeded %.1fs; answering without memory context",
+            _INIT_TIMEOUT_SECONDS,
+        )
     except Exception as e:
-        logger.warning("Streaming workflow memory_node failed: %s", e)
+        logger.warning("Streaming workflow init failed: %s", e)
 
-    # ── Step 2: Intent detection & routing ───────────────────────────────────
-    try:
-        state = await planner_node(state)
-    except Exception as e:
-        logger.warning("Streaming workflow planner_node failed: %s", e)
+    state.setdefault("memory_prompt", "")
+    if not state.get("selected_agent"):
         state["selected_agent"] = "profile"
+    if not state.get("detected_intent"):
         state["detected_intent"] = user_input
 
     # Handle clarification — emit as a complete event immediately

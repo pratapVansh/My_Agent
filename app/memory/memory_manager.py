@@ -99,15 +99,29 @@ class MemoryManager:
         )
 
         # Persist assistant response as vector memory after every response.
-        await self.smart.store_memory(
+        #
+        # These are two independent stores with no shared transaction. The
+        # Postgres write above is authoritative for conversation history; if the
+        # vector write below fails, that turn is missing from semantic recall
+        # while chat history still has it. store_memory() returns None on
+        # failure (and logs), so surface the divergence here too rather than
+        # letting it pass silently.
+        point_id = await self.smart.store_memory(
             user_id=user_id,
             text=agent_response,
             metadata=metadata,
         )
-        log_step(
-            "MEMORY UPSERT",
-            {"user_id": user_id, "type": "memory", "chars": len(agent_response)},
-        )
+        if point_id is None:
+            logger.error(
+                "Vector memory write failed for user=%s session=%s — chat history was "
+                "saved but this turn is absent from semantic memory.",
+                user_id, session_id,
+            )
+        else:
+            log_step(
+                "MEMORY UPSERT",
+                {"user_id": user_id, "type": "memory", "chars": len(agent_response)},
+            )
 
     async def retrieve_context(
         self,
@@ -347,6 +361,28 @@ class MemoryManager:
         """Store resume in long-term memory."""
         return await self.long_term.store_resume(user_id, resume_text, metadata)
 
+    async def search_long_term(
+        self, user_id: str, query: str, limit: int = 5
+    ) -> Dict[str, Any]:
+        """Semantic search across resume, skills, and projects collections."""
+        return await self.long_term.search_all(user_id=user_id, query=query, limit=limit)
+
+    async def retrieve_skills(
+        self, user_id: str, query: Optional[str] = None, limit: int = 10
+    ) -> Any:
+        """Retrieve stored skills from long-term vector memory."""
+        return await self.long_term.retrieve_skills(user_id=user_id, query=query, limit=limit)
+
+    async def retrieve_projects(
+        self, user_id: str, query: Optional[str] = None, limit: int = 10
+    ) -> Any:
+        """Retrieve stored projects from long-term vector memory."""
+        return await self.long_term.retrieve_projects(user_id=user_id, query=query, limit=limit)
+
+    async def retrieve_resume(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve the most recently stored resume."""
+        return await self.long_term.retrieve_resume(user_id=user_id)
+
     async def store_skill(self, user_id: str, skill_name: str, skill_level: str, metadata: Optional[Dict] = None) -> str:
         """Store skill in long-term memory."""
         return await self.long_term.store_skill(user_id, skill_name, skill_level, metadata)
@@ -371,7 +407,12 @@ class MemoryManager:
         status: str,
         notes: Optional[str] = None
     ) -> str:
-        """Store attendance record."""
+        """
+        Store an attendance record.
+
+        Idempotent on (user_id, date, subject) — recording the same class twice
+        updates the existing row rather than creating a duplicate.
+        """
         return await self.short_term.store_attendance(user_id, date, subject, status, notes)
 
     async def retrieve_attendance(
@@ -381,7 +422,7 @@ class MemoryManager:
         end_date: Optional[date] = None,
         subject: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Retrieve attendance records."""
+        """Retrieve attendance records (bounded to the most recent entries)."""
         return await self.short_term.retrieve_attendance(user_id, start_date, end_date, subject)
 
     async def store_timetable_entry(

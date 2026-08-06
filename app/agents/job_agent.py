@@ -9,6 +9,7 @@ New capabilities:
 from typing import Dict, Any
 from app.agents.base_agent import BaseAgent
 from app.agents.state import make_envelope
+from app.auth.models import Scope
 from app.tools.job_search_tool import job_search_tool
 from app.tools.email_draft_tool import email_draft_tool
 from app.memory.short_term_memory import short_term_memory
@@ -134,6 +135,7 @@ For career advice (no tool needed): give practical guidance based on the user's 
                     "Args: query (str), location (str, optional), max_results (int, default 6)."
                 ),
                 "callable": tool_job_search,
+                "scope": Scope.JOBS_SEARCH.value,
             },
             "save_job_bookmark": {
                 "description": (
@@ -142,10 +144,12 @@ For career advice (no tool needed): give practical guidance based on the user's 
                     "rank_score (float), skills_matched (list of str)."
                 ),
                 "callable": tool_save_bookmark,
+                "scope": Scope.JOBS_WRITE.value,
             },
             "get_bookmarked_jobs": {
                 "description": "Show all previously saved/bookmarked jobs. Args: limit (int, default 10).",
                 "callable": tool_get_bookmarks,
+                "scope": Scope.JOBS_SEARCH.value,
             },
             "draft_application_email": {
                 "description": (
@@ -154,6 +158,7 @@ For career advice (no tool needed): give practical guidance based on the user's 
                     "Args: job_title (str), company (str), job_url (str), job_description (str)."
                 ),
                 "callable": tool_draft_application_email,
+                "scope": Scope.EMAIL_DRAFT.value,
             },
         }
 

@@ -6,10 +6,9 @@ import tiktoken
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 import logging
+import re
 from app.config import settings
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -127,9 +126,24 @@ class ChunkingService:
                         current_chunk = paragraph
                         current_start = current_start + len(chunks[-1].text)
                 else:
-                    # Paragraph itself is too long, need to split it
-                    current_chunk = paragraph
-                    current_start = 0
+                    # The paragraph alone exceeds the budget, so it must be
+                    # split rather than emitted whole — text extracted from PDFs
+                    # frequently has no blank-line breaks at all, which would
+                    # otherwise produce one oversized chunk for a whole document.
+                    for piece in self._split_oversized(paragraph, chunk_size):
+                        chunk_metadata = {
+                            **metadata,
+                            "chunk_index": len(chunks),
+                            "char_range_start": current_start,
+                            "char_range_end": current_start + len(piece),
+                        }
+                        chunks.append(Chunk(
+                            text=piece,
+                            metadata=chunk_metadata,
+                            char_range=(current_start, current_start + len(piece)),
+                        ))
+                        current_start += len(piece)
+                    current_chunk = ""
 
         # Add remaining chunk
         if current_chunk:
@@ -150,12 +164,60 @@ class ChunkingService:
         for chunk in chunks:
             chunk.metadata["total_chunks"] = len(chunks)
 
-        logger.info(
-            f"Split text into {len(chunks)} chunks "
-            f"(chunk_size={chunk_size}, overlap={overlap})"
+        logger.debug(
+            "Split text into %d chunks (chunk_size=%d, overlap=%d)",
+            len(chunks), chunk_size, overlap,
         )
 
         return chunks
+
+    def _split_oversized(self, text: str, chunk_size: int) -> List[str]:
+        """
+        Break a single over-budget paragraph into chunk_size-token pieces.
+
+        Splits on sentence boundaries where possible so chunks stay semantically
+        coherent, and falls back to hard token windows for text with no sentence
+        punctuation (bullet lists, tabular resume sections).
+        """
+        if self.count_tokens(text) <= chunk_size:
+            return [text]
+
+        # Prefer sentence boundaries.
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        pieces: List[str] = []
+        current = ""
+
+        for sentence in sentences:
+            candidate = f"{current} {sentence}".strip() if current else sentence
+            if self.count_tokens(candidate) <= chunk_size:
+                current = candidate
+                continue
+            if current:
+                pieces.append(current)
+            # A single sentence can still exceed the budget — window it.
+            if self.count_tokens(sentence) > chunk_size:
+                pieces.extend(self._split_by_tokens(sentence, chunk_size))
+                current = ""
+            else:
+                current = sentence
+
+        if current:
+            pieces.append(current)
+
+        return [p for p in pieces if p.strip()]
+
+    def _split_by_tokens(self, text: str, chunk_size: int) -> List[str]:
+        """Hard-split text into fixed token windows (last-resort splitter)."""
+        if not self.encoder:
+            # Without a tokenizer, approximate using the 4-chars-per-token rule.
+            width = max(1, chunk_size * 4)
+            return [text[i:i + width] for i in range(0, len(text), width)]
+
+        tokens = self.encoder.encode(text)
+        return [
+            self.encoder.decode(tokens[i:i + chunk_size])
+            for i in range(0, len(tokens), chunk_size)
+        ]
 
     def _get_overlap_text(self, text: str, overlap_tokens: int) -> str:
         """

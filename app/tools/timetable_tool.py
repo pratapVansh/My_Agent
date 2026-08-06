@@ -3,12 +3,15 @@ Timetable tool for storing user input and suggesting classes based on attendance
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Any, Dict, List, Optional
 
 from app.memory.memory_manager import memory_manager
 from app.services.langsmith_service import traceable
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -32,12 +35,28 @@ class TimetableTool:
         entries: List[TimetableInput],
     ) -> Dict[str, Any]:
         stored_ids: List[str] = []
+        skipped: List[Dict[str, str]] = []
+
         for entry in entries:
             start_t = self._parse_time(entry.start_time)
             end_t = self._parse_time(entry.end_time)
+            # Rejected rows are reported rather than dropped silently: a parse
+            # failure across a whole import otherwise looks like a valid but
+            # nearly-empty timetable.
             if start_t is None or end_t is None:
+                skipped.append({
+                    "reason": "unparseable_time",
+                    "subject": str(entry.subject)[:80],
+                    "start_time": str(entry.start_time)[:20],
+                    "end_time": str(entry.end_time)[:20],
+                })
                 continue
             if entry.day_of_week < 0 or entry.day_of_week > 6:
+                skipped.append({
+                    "reason": "invalid_day_of_week",
+                    "subject": str(entry.subject)[:80],
+                    "day_of_week": str(entry.day_of_week),
+                })
                 continue
 
             rec_id = await memory_manager.store_timetable_entry(
@@ -52,11 +71,19 @@ class TimetableTool:
             )
             stored_ids.append(rec_id)
 
+        if skipped:
+            logger.warning(
+                "Timetable store for user=%s skipped %d/%d entries (first reason: %s)",
+                user_id, len(skipped), len(entries), skipped[0]["reason"],
+            )
+
         return {
             "tool": "timetable_store",
             "success": True,
             "user_id": user_id,
             "stored_count": len(stored_ids),
+            "skipped_count": len(skipped),
+            "skipped": skipped[:10],
             "stored_ids": stored_ids,
         }
 

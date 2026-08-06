@@ -37,30 +37,47 @@ export type AttendanceSuggestion = {
   suggestion_reason: string;
 };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+/**
+ * Backend API client.
+ *
+ * No function here takes a userId: the server derives identity from the
+ * session cookie, so sending one from the browser would be meaningless at best
+ * and rejected at worst. Every call goes through authFetch, which attaches
+ * credentials, adds the CSRF header, and transparently refreshes an expired
+ * access token once before giving up.
+ */
+import { authFetch } from "./auth";
+
+async function readError(resp: Response, fallback: string): Promise<string> {
+  try {
+    const body = await resp.json();
+    if (typeof body.detail === "string") return body.detail;
+    if (body.detail?.message) return body.detail.message;
+  } catch {
+    /* response was not JSON */
+  }
+  return fallback;
+}
 
 export async function askWithVoice(params: {
   query: string;
-  userId: string;
   sessionId: string;
   mode: ChatMode;
 }): Promise<{
   displayText: string;
   speechText: string;
 }> {
-  const resp = await fetch(`${API_BASE}/api/v1/agents/query`, {
+  const resp = await authFetch(`/api/v1/agents/query`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       query: params.query,
-      user_id: params.userId,
       session_id: params.sessionId,
       output_mode: params.mode
     })
   });
 
   if (!resp.ok) {
-    throw new Error(`Voice query failed: ${resp.status}`);
+    throw new Error(await readError(resp, `Request failed (${resp.status})`));
   }
 
   const data = await resp.json();
@@ -70,68 +87,108 @@ export async function askWithVoice(params: {
   };
 }
 
-export async function fetchJobs(userId: string, query: string): Promise<JobResult[]> {
-  const resp = await fetch(`${API_BASE}/api/v1/agents/tools/job-search`, {
+export async function fetchJobs(query: string): Promise<JobResult[]> {
+  const resp = await authFetch(`/api/v1/agents/tools/job-search`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, query, max_results: 6, min_score: 0.2 })
+    body: JSON.stringify({ query, max_results: 6, min_score: 0.2 })
   });
 
   if (!resp.ok) {
-    throw new Error(`Job search failed: ${resp.status}`);
+    throw new Error(await readError(resp, `Job search failed (${resp.status})`));
   }
 
   const data = await resp.json();
   return (data.results ?? []) as JobResult[];
 }
 
-export async function draftEmail(userId: string, query: string): Promise<EmailDraft | null> {
-  const resp = await fetch(`${API_BASE}/api/v1/agents/tools/email-draft`, {
+export async function draftEmail(query: string): Promise<EmailDraft | null> {
+  const resp = await authFetch(`/api/v1/agents/tools/email-draft`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, query, tone: "professional" })
+    body: JSON.stringify({ query, tone: "professional" })
   });
 
   if (!resp.ok) {
-    throw new Error(`Email draft failed: ${resp.status}`);
+    throw new Error(await readError(resp, `Email draft failed (${resp.status})`));
   }
 
   const data = await resp.json();
   return data.draft ?? null;
 }
 
-export async function fetchAttendanceSuggestions(userId: string): Promise<AttendanceSuggestion[]> {
-  const resp = await fetch(`${API_BASE}/api/v1/agents/tools/timetable/suggest`, {
+export async function fetchAttendanceSuggestions(): Promise<AttendanceSuggestion[]> {
+  const resp = await authFetch(`/api/v1/agents/tools/timetable/suggest`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, low_attendance_threshold: 75 })
+    body: JSON.stringify({ low_attendance_threshold: 75 })
   });
 
   if (!resp.ok) {
-    throw new Error(`Attendance suggestions failed: ${resp.status}`);
+    throw new Error(await readError(resp, `Attendance suggestions failed (${resp.status})`));
   }
 
   const data = await resp.json();
   return (data.suggestions ?? []) as AttendanceSuggestion[];
 }
 
-/**
- * Fetch a LiveKit access token from the backend.
- * Phase 1 — used to join a LiveKit room for WebRTC audio.
- */
-export async function getLiveKitToken(
-  userId: string,
-  roomName: string
-): Promise<{ token: string; url: string }> {
-  const resp = await fetch(`${API_BASE}/api/v1/voice/token`, {
+export async function fetchProfileFacts(
+  userId: string
+): Promise<Array<{ key: string; value: string; source?: string }>> {
+  const resp = await authFetch(
+    `/api/v1/agents/memory/profile/${encodeURIComponent(userId)}`,
+    { method: "GET" }
+  );
+  if (!resp.ok) {
+    throw new Error(await readError(resp, `Could not load memory (${resp.status})`));
+  }
+  const data = await resp.json();
+  return data.facts ?? [];
+}
+
+export async function forgetProfileFact(userId: string, key: string): Promise<void> {
+  const resp = await authFetch(
+    `/api/v1/agents/memory/profile/${encodeURIComponent(userId)}/${encodeURIComponent(key)}`,
+    { method: "DELETE" }
+  );
+  if (!resp.ok) {
+    throw new Error(await readError(resp, `Could not forget fact (${resp.status})`));
+  }
+}
+
+export async function uploadTimetablePdf(file: File): Promise<{
+  entries_stored: number;
+  filename: string;
+  old_entries_cleared: number;
+}> {
+  const formData = new FormData();
+  formData.append("clear_existing", "true");
+  formData.append("file", file);
+
+  const resp = await authFetch(`/api/v1/agents/tools/timetable/upload-pdf`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, room_name: roomName }),
+    body: formData,
   });
 
   if (!resp.ok) {
-    const detail = await resp.text();
-    throw new Error(`LiveKit token request failed (${resp.status}): ${detail}`);
+    throw new Error(await readError(resp, "Upload failed"));
+  }
+  return resp.json();
+}
+
+/**
+ * Request a LiveKit token for this session's own voice room.
+ * The room is derived server-side from the authenticated identity.
+ */
+export async function getLiveKitToken(): Promise<{
+  token: string;
+  url: string;
+  room_name: string;
+}> {
+  const resp = await authFetch(`/api/v1/voice/token`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+
+  if (!resp.ok) {
+    throw new Error(await readError(resp, `Could not start voice session (${resp.status})`));
   }
 
   return resp.json();

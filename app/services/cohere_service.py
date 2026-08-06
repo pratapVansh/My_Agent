@@ -3,16 +3,19 @@ Cohere API service wrapper for embeddings.
 Provides async embedding generation with batching and retry logic.
 """
 import cohere
-from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
+from typing import List, Optional, Tuple
 import asyncio
 import hashlib
 import logging
+import random
 import time
 from app.config import settings
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_QUERY_CACHE_TTL_SECONDS = 60.0
+_QUERY_CACHE_MAX_ENTRIES = 512
 
 
 class CohereService:
@@ -22,18 +25,30 @@ class CohereService:
     """
 
     def __init__(self):
-        """Initialize Cohere client with API key from settings."""
-        self.client = cohere.AsyncClient(
-            api_key=settings.cohere_api_key,
-            timeout=60
-        )
+        """Prepare defaults. The API client itself is built lazily."""
+        self._client: Optional[cohere.AsyncClient] = None
         self.model = settings.cohere_model
         self.embedding_dimension = settings.cohere_embedding_dimension
         self.max_batch_size = 96  # Cohere's max batch size
 
-        # TTL cache for search_query embeddings only (60s TTL, max 512 entries)
-        # search_document embeddings are for ingestion only — not cached
-        self._query_cache: Dict[str, Tuple[List[float], float]] = {}
+        # LRU+TTL cache for search_query embeddings only.
+        # search_document embeddings are for ingestion only — not cached.
+        # OrderedDict gives O(1) eviction; a plain dict required a full sort.
+        self._query_cache: "OrderedDict[str, Tuple[List[float], float]]" = OrderedDict()
+
+    @property
+    def client(self) -> cohere.AsyncClient:
+        """Build the Cohere client on first use (see GroqService.client)."""
+        if self._client is None:
+            if not (settings.cohere_api_key or "").strip():
+                raise RuntimeError(
+                    "COHERE_API_KEY is not configured. Set it in your .env file."
+                )
+            self._client = cohere.AsyncClient(
+                api_key=settings.cohere_api_key,
+                timeout=60
+            )
+        return self._client
 
     async def _retry_with_backoff(
         self,
@@ -42,15 +57,11 @@ class CohereService:
         backoff_base: float = 2.0
     ):
         """
-        Retry a function with exponential backoff.
+        Retry a function with jittered exponential backoff.
 
-        Args:
-            func: Async function to retry
-            max_attempts: Maximum number of retry attempts
-            backoff_base: Base for exponential backoff
-
-        Returns:
-            Function result
+        Jitter matters here because many callers embed concurrently: without it
+        every caller that hits a rate limit backs off for an identical interval
+        and retries in lockstep, amplifying the burst that caused the limit.
 
         Raises:
             Exception: If all retries fail
@@ -63,10 +74,10 @@ class CohereService:
                     logger.error(f"All {max_attempts} attempts failed: {str(e)}")
                     raise
 
-                wait_time = backoff_base ** attempt
+                wait_time = (backoff_base ** attempt) * (1.0 + random.random() * 0.5)
                 logger.warning(
                     f"Attempt {attempt + 1}/{max_attempts} failed: {str(e)}. "
-                    f"Retrying in {wait_time}s..."
+                    f"Retrying in {wait_time:.2f}s..."
                 )
                 await asyncio.sleep(wait_time)
 
@@ -89,17 +100,22 @@ class CohereService:
         if input_type == "search_query":
             cache_key = hashlib.md5(text.encode()).hexdigest()
             now = time.monotonic()
-            if cache_key in self._query_cache:
-                embedding, cached_at = self._query_cache[cache_key]
-                if now - cached_at < 60.0:
+
+            cached = self._query_cache.get(cache_key)
+            if cached is not None:
+                embedding, cached_at = cached
+                if now - cached_at < _QUERY_CACHE_TTL_SECONDS:
+                    self._query_cache.move_to_end(cache_key)
                     return embedding
+                del self._query_cache[cache_key]
+
             result = await self._embed_text_uncached(text, input_type)
             self._query_cache[cache_key] = (result, now)
-            # Prune oldest entries when cache exceeds 512
-            if len(self._query_cache) > 512:
-                oldest = sorted(self._query_cache.items(), key=lambda x: x[1][1])
-                for k, _ in oldest[:128]:
-                    del self._query_cache[k]
+            self._query_cache.move_to_end(cache_key)
+
+            # O(1) LRU eviction — pop from the least-recently-used end.
+            while len(self._query_cache) > _QUERY_CACHE_MAX_ENTRIES:
+                self._query_cache.popitem(last=False)
             return result
 
         return await self._embed_text_uncached(text, input_type)

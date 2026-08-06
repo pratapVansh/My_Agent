@@ -5,6 +5,7 @@ Returns a TaskEnvelope for structured coordination.
 from typing import Dict, Any
 from app.agents.base_agent import BaseAgent
 from app.agents.state import make_envelope
+from app.auth.models import Scope
 from app.memory.long_term_memory_qdrant import long_term_memory_qdrant
 from app.memory.memory_manager import memory_manager
 
@@ -225,6 +226,7 @@ Rules:
                     "Use for 'summarize my experience', 'who am I', 'tell me about myself'. Args: none."
                 ),
                 "callable": tool_get_profile_summary,
+                "scope": Scope.PROFILE_READ.value,
             },
             "get_skills": {
                 "description": (
@@ -232,6 +234,7 @@ Rules:
                     "Use for 'what skills do I have', 'what technologies do I know'. Args: limit (int, default 15)."
                 ),
                 "callable": tool_get_skills,
+                "scope": Scope.PROFILE_READ.value,
             },
             "get_projects": {
                 "description": (
@@ -239,6 +242,7 @@ Rules:
                     "Use for 'what projects have I worked on', 'show my portfolio'. Args: limit (int, default 10)."
                 ),
                 "callable": tool_get_projects,
+                "scope": Scope.PROFILE_READ.value,
             },
             "get_resume": {
                 "description": (
@@ -246,6 +250,7 @@ Rules:
                     "Use for 'show my resume', 'what's in my resume'. Args: none."
                 ),
                 "callable": tool_get_resume,
+                "scope": Scope.PROFILE_READ.value,
             },
             "get_strengths": {
                 "description": (
@@ -253,6 +258,7 @@ Rules:
                     "Use for 'what are my strengths', 'what am I good at', 'what are my strong points'. Args: none."
                 ),
                 "callable": tool_get_strengths,
+                "scope": Scope.PROFILE_READ.value,
             },
             "remember_preference": {
                 "description": (
@@ -262,6 +268,7 @@ Rules:
                     "source (str: explicit|inferred, default explicit), confidence (float 0–1, default 1.0)."
                 ),
                 "callable": tool_remember_preference,
+                "scope": Scope.PROFILE_WRITE.value,
             },
             "forget_preference": {
                 "description": (
@@ -270,6 +277,7 @@ Rules:
                     "Args: key (str)."
                 ),
                 "callable": tool_forget_preference,
+                "scope": Scope.PROFILE_WRITE.value,
             },
             "list_my_memories": {
                 "description": (
@@ -278,6 +286,7 @@ Rules:
                     "Args: none."
                 ),
                 "callable": tool_list_my_memories,
+                "scope": Scope.PROFILE_WRITE.value,
             },
         }
 

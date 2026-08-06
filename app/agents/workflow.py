@@ -6,7 +6,7 @@ LangGraph workflow with Phase 1 upgrades:
 """
 import logging
 import uuid
-from typing import Dict, Any, Literal
+from typing import Dict, Any, FrozenSet, Literal, Optional
 import asyncio
 
 from langgraph.graph import StateGraph, END
@@ -426,10 +426,17 @@ async def run_workflow(
     user_id: str,
     session_id: str = None,
     conversation_history: list = None,
-    output_mode: str = "user"
+    output_mode: str = "user",
+    scopes: Optional[FrozenSet[str]] = None,
 ) -> Dict[str, Any]:
     """
     Execute the multi-agent workflow.
+
+    Args:
+        scopes: Capabilities of the authenticated caller. Specialist agents
+            filter their tools against this set, so a restricted caller cannot
+            reach privileged tools by asking for them. None means unrestricted
+            and must only be used for internal/CLI invocation.
 
     Returns:
         Final state with display_text and speech_text
@@ -449,6 +456,7 @@ async def run_workflow(
         "user_id": user_id,
         "session_id": session_id,
         "output_mode": output_mode,
+        "scopes": scopes,
         "conversation_history": conversation_history or [],
         "memory_context": None,
         "memory_prompt": None,
@@ -476,7 +484,29 @@ async def run_workflow(
         "error": None,
     }
 
-    final_state = await multi_agent_workflow.ainvoke(initial_state)
+    # Overall deadline. Reflect retries × reasoning iterations × per-call
+    # timeouts can otherwise stack into several minutes of work continuing
+    # server-side long after the client has given up waiting.
+    try:
+        final_state = await asyncio.wait_for(
+            multi_agent_workflow.ainvoke(initial_state),
+            timeout=settings.workflow_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "Workflow timed out after %.0fs (user=%s, request_id=%s)",
+            settings.workflow_timeout_seconds, user_id, initial_state["request_id"],
+        )
+        timeout_message = (
+            "That request took too long to complete. "
+            "Please try again, or break it into smaller steps."
+        )
+        return {
+            **initial_state,
+            "display_text": timeout_message,
+            "speech_text": timeout_message,
+            "error": "workflow_timeout",
+        }
 
     # Save agent response to memory
     try:

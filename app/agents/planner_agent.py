@@ -4,10 +4,26 @@ If confidence < 0.6, raises a clarifying question instead of routing blindly.
 """
 from typing import Dict, Any
 import json
+import logging
 from app.agents.base_agent import BaseAgent
 from app.services.langsmith_service import traceable
 
+logger = logging.getLogger(__name__)
+
+# Guidance given to the model: below this it should ask a clarifying question
+# itself, via needs_clarification in its JSON response.
 CONFIDENCE_THRESHOLD = 0.6
+
+# Server-side safety net. Deliberately lower than CONFIDENCE_THRESHOLD: it only
+# overrides the model when it reported very low confidence yet still asked to
+# route, so ordinary 0.4–0.6 routing decisions are left to the model's judgment.
+FORCE_CLARIFICATION_BELOW = 0.35
+
+# How many prior turns the planner sees. Routing a follow-up like "email him
+# about that" is impossible without recent context, and every specialist
+# already receives history — the planner was the only component flying blind.
+_PLANNER_HISTORY_TURNS = 4
+_PLANNER_HISTORY_CHARS = 300
 
 
 class PlannerAgent(BaseAgent):
@@ -38,7 +54,8 @@ class PlannerAgent(BaseAgent):
         system_prompt = self.inject_memory_context(self._build_system_prompt(), state)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
+            *self._recent_history_messages(state),
+            {"role": "user", "content": user_input},
         ]
 
         try:
@@ -70,6 +87,7 @@ class PlannerAgent(BaseAgent):
             return state
 
         except Exception as e:
+            logger.error("Planner execution failed, defaulting to profile agent: %s", e, exc_info=True)
             state["error"] = f"Planner error: {str(e)}"
             state["selected_agent"] = "profile"
             state["planner_confidence"] = 0.5
@@ -79,6 +97,15 @@ class PlannerAgent(BaseAgent):
             state["step_results"] = {}
             state["inter_step_context"] = None
             return state
+
+    def _recent_history_messages(self, state: Dict[str, Any]) -> list:
+        """Recent conversation turns, trimmed, for context-aware routing."""
+        raw_history = state.get("conversation_history") or []
+        return [
+            {"role": turn["role"], "content": str(turn.get("content", ""))[:_PLANNER_HISTORY_CHARS]}
+            for turn in raw_history[-_PLANNER_HISTORY_TURNS:]
+            if turn.get("role") in ("user", "assistant") and turn.get("content")
+        ]
 
     def _build_system_prompt(self) -> str:
         agents_desc = "\n".join([
@@ -155,7 +182,11 @@ Example — multi step:
             needs_clarification = bool(parsed.get("needs_clarification", False))
 
             # Safety-net: only override for extreme low-confidence cases
-            if not needs_clarification and confidence < 0.35:
+            if not needs_clarification and confidence < FORCE_CLARIFICATION_BELOW:
+                logger.info(
+                    "Forcing clarification: planner reported confidence %.2f (below %.2f)",
+                    confidence, FORCE_CLARIFICATION_BELOW,
+                )
                 needs_clarification = True
 
             clarification_question = str(parsed.get("clarification_question", "")).strip()
@@ -193,7 +224,15 @@ Example — multi step:
                 "execution_plan": execution_plan,
             }
 
-        except Exception:
+        except Exception as exc:
+            # Logged (not silent) so a drift in the routing model's output
+            # format shows up as misrouting warnings instead of an invisible
+            # slide into always choosing the default agent.
+            logger.warning(
+                "Planner returned unparseable routing output (%s); defaulting to profile. "
+                "First 200 chars: %.200s",
+                exc, response,
+            )
             return {
                 "intent": "general query",
                 "agent": "profile",

@@ -1,14 +1,19 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   askWithVoice,
   ChatMessage,
   ChatMode,
-  getLiveKitToken
+  fetchProfileFacts,
+  forgetProfileFact,
+  getLiveKitToken,
+  uploadTimetablePdf
 } from "@/lib/api";
-import { Room, RoomEvent } from "livekit-client";
-import { ListeningIndicator, SpeakingIndicator, ThinkingIndicator, TypingIndicator } from "./StatusIndicator";
+import { Identity, ensureSession, hasScope, logout } from "@/lib/auth";
+import { RemoteTrack, Room, RoomEvent, Track } from "livekit-client";
+import { ListeningIndicator, SpeakingIndicator, ThinkingIndicator } from "./StatusIndicator";
 import { CloseChatModal, ClearChatModal } from "./ChatModals";
 
 type ChatShellProps = {
@@ -21,9 +26,6 @@ function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-const USER_ID_STORAGE_KEY = "user_id";
-const STABLE_USER_ID = "vansh";
-
 const AGENT_LABELS: Record<string, string> = {
   job: "Job Agent",
   email: "Email Agent",
@@ -34,41 +36,17 @@ const AGENT_LABELS: Record<string, string> = {
   clarification: "Clarifying",
 };
 
-function generateStableId(prefix: "user" | "session") {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return `${prefix}_${crypto.randomUUID()}`;
-  }
-  return `${prefix}_${uid()}_${Date.now()}`;
-}
-
-function getOrCreateUserId() {
-  if (typeof window === "undefined") {
-    return STABLE_USER_ID;
-  }
-
-  const existing = window.localStorage.getItem(USER_ID_STORAGE_KEY);
-  if (existing !== STABLE_USER_ID) {
-    window.localStorage.setItem(USER_ID_STORAGE_KEY, STABLE_USER_ID);
-  }
-
-  return STABLE_USER_ID;
-}
-
 function createConversationSessionId() {
-  return generateStableId("session");
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `session_${crypto.randomUUID()}`;
+  }
+  return `session_${uid()}_${Date.now()}`;
 }
-
-function getVoiceWebSocketUrl() {
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
-  const wsBase = apiBase.replace(/^http/i, "ws");
-  return `${wsBase}/api/v1/voice/stream_v2`;
-}
-
-
-
 
 export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
-  const [userId, setUserId] = useState("");
+  const router = useRouter();
+  const [identity, setIdentity] = useState<Identity | null>(null);
+  const [authState, setAuthState] = useState<"loading" | "ready" | "unauthenticated">("loading");
   const [sessionId, setSessionId] = useState("");
 
   const [input, setInput] = useState("");
@@ -88,12 +66,37 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   const [timetableUploadResult, setTimetableUploadResult] = useState<{success: boolean; message: string} | null>(null);
   const timetableInputRef = useRef<HTMLInputElement>(null);
 
-  // LiveKit Phase 1 — temporary test connection
   const [livekitStatus, setLivekitStatus] = useState<"idle" | "connecting" | "connected" | "error">("idle");
+  // Set when the browser blocks autoplay, so the user can be offered a tap to
+  // enable sound. Without this the assistant speaks into a muted element and
+  // appears to never reply.
+  const [audioBlocked, setAudioBlocked] = useState(false);
   const livekitRoomRef = useRef<Room | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const userMessageAddedRef = useRef<boolean>(false);
+  // Guards against a second connect starting while the first is still in
+  // flight (React Strict Mode double-invoke, or a fast double-click on the
+  // mic). Without it, two LiveKit rooms are opened for one participant.
+  const livekitConnectingRef = useRef<boolean>(false);
+  // Audio elements created by track.attach(), so unmount can remove them.
+  // They were previously appended to document.body and leaked on every
+  // reconnect, leaving several elements playing the same track.
+  const audioElementsRef = useRef<HTMLMediaElement[]>([]);
+  // The authoritative reply, held from `final_response` until the audio finishes.
+  // The bubble is committed at turn_end so the permanent message appears when the
+  // assistant has actually finished saying it, rather than the moment the model
+  // stopped generating — which for a long answer is a minute earlier.
+  const pendingReplyRef = useRef<{ text: string; agentName?: string; jobResults?: ChatMessage["jobResults"] } | null>(null);
+  // Mirror of the live caption. endTurn needs the current value synchronously and
+  // is called from a handler closure registered once at connect time, so reading
+  // the state variable would see a stale value — and reading it through a
+  // setState updater would mean calling addMessage from inside an updater, which
+  // React may invoke twice and would duplicate the message.
+  const spokenTextRef = useRef<string>("");
+  // Fails the turn open again if the worker never sends a terminal event, so a
+  // dropped data message can't leave the mic permanently disabled.
+  const turnWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const colors = mode === "user"
     ? {
@@ -117,24 +120,49 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
+  // Establish a session before anything can be sent. Recruiter mode
+  // self-provisions a read-only guest session; user mode requires a real
+  // sign-in and redirects to /login when there isn't one.
   useEffect(() => {
-    const stableUserId = getOrCreateUserId();
-    setUserId(stableUserId);
-    setSessionId(createConversationSessionId());
-  }, []);
+    let cancelled = false;
 
+    (async () => {
+      try {
+        const session = await ensureSession(mode);
+        if (cancelled) return;
 
+        if (!session) {
+          setAuthState("unauthenticated");
+          router.replace(`/login?next=${encodeURIComponent(mode === "user" ? "/user" : "/recruiter")}`);
+          return;
+        }
 
-  const fetchProfileFacts = async () => {
-    if (!userId) return;
+        setIdentity(session);
+        setSessionId(createConversationSessionId());
+        setAuthState("ready");
+      } catch (e) {
+        if (cancelled) return;
+        console.error("Could not establish a session", e);
+        setAuthState("unauthenticated");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, router]);
+
+  const canEditMemory = hasScope(identity, "profile:write");
+  const canManageTimetable = hasScope(identity, "timetable:write");
+
+  const loadProfileFacts = async () => {
+    if (!identity) return;
     setMemoryLoading(true);
     try {
-      const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
-      const res = await fetch(`${apiBase}/api/v1/agents/memory/profile/${userId}`);
-      const data = await res.json();
-      setProfileFacts(data.facts || []);
+      setProfileFacts(await fetchProfileFacts(identity.user_id));
     } catch (e) {
       console.error("Failed to fetch profile facts", e);
+      setProfileFacts([]);
     } finally {
       setMemoryLoading(false);
     }
@@ -145,25 +173,10 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
       setTimetableUploadResult({ success: false, message: "Please select a PDF file." });
       return;
     }
-    const { resolvedUserId } = ensureIdentity();
     setTimetableUploading(true);
     setTimetableUploadResult(null);
     try {
-      const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
-      const formData = new FormData();
-      formData.append("user_id", resolvedUserId);
-      formData.append("clear_existing", "true");
-      formData.append("file", file);
-      const res = await fetch(`${apiBase}/api/v1/agents/tools/timetable/upload-pdf`, {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        const detail = data?.detail?.message ?? data?.detail ?? "Upload failed";
-        setTimetableUploadResult({ success: false, message: String(detail) });
-        return;
-      }
+      const data = await uploadTimetablePdf(file);
       setTimetableUploadResult({
         success: true,
         message: `Imported ${data.entries_stored} classes from "${data.filename}".${data.old_entries_cleared ? ` Replaced ${data.old_entries_cleared} old entries.` : ""}`,
@@ -175,7 +188,10 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
         createdAt: Date.now(),
       });
     } catch (e) {
-      setTimetableUploadResult({ success: false, message: "Network error. Is the server running?" });
+      setTimetableUploadResult({
+        success: false,
+        message: e instanceof Error ? e.message : "Upload failed.",
+      });
     } finally {
       setTimetableUploading(false);
       if (timetableInputRef.current) timetableInputRef.current.value = "";
@@ -183,26 +199,30 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   };
 
   const forgetFact = async (key: string) => {
+    if (!identity) return;
     try {
-      const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
-      await fetch(`${apiBase}/api/v1/agents/memory/profile/${userId}/${encodeURIComponent(key)}`, {
-        method: "DELETE"
-      });
+      await forgetProfileFact(identity.user_id, key);
       setProfileFacts(prev => prev.filter(f => f.key !== key));
     } catch (e) {
       console.error("Failed to forget fact", e);
     }
   };
 
+  const handleSignOut = async () => {
+    await logout();
+    router.replace("/login");
+  };
+
   useEffect(() => {
     scrollToBottom();
   }, [messages, isSending]);
 
-  // Cleanup timers on unmount
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
-
-      // LiveKit cleanup
+      if (turnWatchdogRef.current) clearTimeout(turnWatchdogRef.current);
+      audioElementsRef.current.forEach((el) => el.remove());
+      audioElementsRef.current = [];
       if (livekitRoomRef.current) {
         void livekitRoomRef.current.disconnect();
         livekitRoomRef.current = null;
@@ -214,20 +234,11 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     setMessages((prev) => [...prev, msg]);
   };
 
-  const ensureIdentity = () => {
-    let resolvedUserId = userId;
-    if (!resolvedUserId) {
-      resolvedUserId = getOrCreateUserId();
-      setUserId(resolvedUserId);
-    }
-
-    let resolvedSessionId = sessionId;
-    if (!resolvedSessionId) {
-      resolvedSessionId = createConversationSessionId();
-      setSessionId(resolvedSessionId);
-    }
-
-    return { resolvedUserId, resolvedSessionId };
+  const ensureConversationId = () => {
+    if (sessionId) return sessionId;
+    const fresh = createConversationSessionId();
+    setSessionId(fresh);
+    return fresh;
   };
 
   
@@ -237,40 +248,32 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
 
 
   
+  // The mic is a toggle for the whole voice session, not for a single utterance:
+  // once it is on it stays on across turns, which is what makes barge-in
+  // possible. It is never disabled while the assistant is thinking or speaking —
+  // doing that removed the only way to interrupt, and any turn whose terminal
+  // event went missing left the button dead permanently.
   const handleMic = async () => {
-    console.log("Mic clicked - current state:", {isListening, isSending, isSpeaking, livekitStatus});
-
-    if (isSpeaking && !isListening) {
-       setIsSpeaking(false);
-       // we can't easily interrupt LiveKit audio playback unless we publish an interrupt event or mute the track.
-       // The requirement doesn't mandate full barge-in manual interrupt here, but let's just proceed.
-    }
-
-    if (!isListening && isSending) {
-      console.log("Mic click blocked - currently processing");
-      return;
-    }
+    if (livekitConnectingRef.current) return;
 
     if (isListening) {
-      console.log(`[DEBUG] ${new Date().toISOString()} handleMic: Stopping listening (isListening=true)`);
       setIsListening(false);
-      if (livekitRoomRef.current) {
-         console.log(`[DEBUG] ${new Date().toISOString()} handleMic: Disabling microphone on LiveKit`);
-         await livekitRoomRef.current.localParticipant.setMicrophoneEnabled(false);
-      }
+      endTurn();
+      const room = livekitRoomRef.current;
+      if (room) await room.localParticipant.setMicrophoneEnabled(false);
       return;
     }
 
-    console.log(`[DEBUG] ${new Date().toISOString()} handleMic: Starting listening (isListening=false)`);
     setIsListening(true);
     userMessageAddedRef.current = false;
     setInterimTranscript("");
     setInput("");
     try {
-      if (livekitStatus !== "connected") {
+      if (!livekitRoomRef.current) {
         await connectLiveKit();
-      } else if (livekitRoomRef.current) {
+      } else {
         await livekitRoomRef.current.localParticipant.setMicrophoneEnabled(true);
+        await enableAudioPlayback();
       }
     } catch (e) {
       console.error("Failed to start LiveKit mic", e);
@@ -280,9 +283,9 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
 
   const handleSend = async (textOverride?: string) => {
     const text = (textOverride ?? input).trim();
-    if (!text || isSending) return;
+    if (!text || isSending || authState !== "ready") return;
 
-    const { resolvedUserId, resolvedSessionId } = ensureIdentity();
+    const conversationId = ensureConversationId();
 
     setIsSending(true);
     setInput("");
@@ -293,8 +296,7 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     try {
       const response = await askWithVoice({
         query: text,
-        userId: resolvedUserId,
-        sessionId: resolvedSessionId,
+        sessionId: conversationId,
         mode
       });
 
@@ -313,23 +315,113 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     }
   };
 
-  // ── LiveKit Phase 1 — Test WebRTC connection ─────────────────────────────
+  // Every path that ends a turn funnels through here, so the input controls can
+  // never be left disabled by a missing or out-of-order event. The live caption
+  // is promoted to a permanent message on the way out.
+  const endTurn = ({ interrupted = false }: { interrupted?: boolean } = {}) => {
+    if (turnWatchdogRef.current) {
+      clearTimeout(turnWatchdogRef.current);
+      turnWatchdogRef.current = null;
+    }
+    const pending = pendingReplyRef.current;
+    const spoken = spokenTextRef.current.trim();
+    pendingReplyRef.current = null;
+    spokenTextRef.current = "";
+
+    // A completed turn commits the authoritative text. An interrupted one commits
+    // only what was actually spoken — the full reply was generated but the user
+    // never heard the rest of it, so showing it would misrepresent the exchange.
+    const text = interrupted ? spoken : (pending?.text || spoken);
+    if (text) {
+      addMessage({
+        id: uid(),
+        role: "assistant",
+        text,
+        agentName: pending?.agentName,
+        jobResults: interrupted ? undefined : pending?.jobResults,
+        createdAt: Date.now(),
+      });
+    }
+
+    setPartialAssistantMessage("");
+    setIsSending(false);
+    setIsSpeaking(false);
+    userMessageAddedRef.current = false;
+  };
+
+  const beginTurn = () => {
+    pendingReplyRef.current = null;
+    spokenTextRef.current = "";
+    setPartialAssistantMessage("");
+    setIsSending(true);
+    if (turnWatchdogRef.current) clearTimeout(turnWatchdogRef.current);
+    // Backstop only — the worker cancels a genuinely stalled turn itself. This
+    // catches the case where its terminal event never reaches us at all. It has
+    // to outlast a long spoken reply, so it is refreshed by every caption.
+    turnWatchdogRef.current = setTimeout(() => {
+      console.warn("Turn watchdog fired — no terminal event from the worker");
+      endTurn();
+    }, 60000);
+  };
+
+  // Any sign the turn is still alive pushes the backstop out. Without this a
+  // reply that takes longer than the watchdog to speak would be torn down by
+  // the client even though the worker was streaming it perfectly well.
+  const keepTurnAlive = () => {
+    if (!turnWatchdogRef.current) return;
+    clearTimeout(turnWatchdogRef.current);
+    turnWatchdogRef.current = setTimeout(() => {
+      console.warn("Turn watchdog fired — no terminal event from the worker");
+      endTurn();
+    }, 60000);
+  };
+
   const connectLiveKit = async () => {
-    // Toggle: disconnect if already connected
-    
+    // Idempotency guard — see livekitConnectingRef.
+    if (livekitConnectingRef.current || livekitRoomRef.current) {
+      console.log("LiveKit: connect already in progress or established; skipping");
+      return;
+    }
+    livekitConnectingRef.current = true;
 
     setLivekitStatus("connecting");
     try {
-      const { resolvedUserId } = ensureIdentity();
-      const roomName = `voice-${resolvedUserId}`;
-      const { token, url } = await getLiveKitToken(resolvedUserId, roomName);
+      // The room is derived server-side from the authenticated identity, so
+      // there is nothing for the client to choose (or spoof) here.
+      const { token, url, room_name: roomName } = await getLiveKitToken();
 
-      const room = new Room();
+      const room = new Room({
+        // Echo cancellation is what stops the assistant's own voice being
+        // captured, transcribed, and answered as if the user had said it.
+        audioCaptureDefaults: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
 
       room.on(RoomEvent.Disconnected, () => {
         setLivekitStatus("idle");
+        setIsListening(false);
+        endTurn();
+        audioElementsRef.current.forEach((el) => el.remove());
+        audioElementsRef.current = [];
         livekitRoomRef.current = null;
+        livekitConnectingRef.current = false;
         console.log("LiveKit: room disconnected");
+      });
+
+      room.on(RoomEvent.Reconnecting, () => console.log("LiveKit: reconnecting…"));
+      room.on(RoomEvent.Reconnected, () => {
+        console.log("LiveKit: reconnected");
+        // A reconnect can drop the mic publication; re-assert the intent.
+        if (isListening) void room.localParticipant.setMicrophoneEnabled(true);
+      });
+
+      // Browsers refuse to play audio without a user gesture. Surface it rather
+      // than letting the assistant speak inaudibly into a blocked element.
+      room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+        setAudioBlocked(!room.canPlaybackAudio);
       });
 
       room.on(RoomEvent.ParticipantConnected, (p) => {
@@ -341,121 +433,166 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
           const strData = new TextDecoder().decode(payload);
           const parsed = JSON.parse(strData);
           
-          if (parsed.type === "final_response") {
-            console.log(`[DEBUG] ${new Date().toISOString()} DataReceived: final_response. transcript=${parsed.transcript}`);
-            const transcript = String(parsed.transcript ?? "").trim();
-            const displayText = String(parsed.display_text ?? "");
-            const selectedAgent = parsed.metadata?.selected_agent as string | undefined;
-            
-            setCurrentAgent(selectedAgent || null);
-            setPartialAssistantMessage("");
-            
-            if (transcript && !userMessageAddedRef.current) {
-              console.log(`[DEBUG] ${new Date().toISOString()} final_response: Adding user message to UI`);
-              addMessage({ id: uid(), role: "user", text: transcript, createdAt: Date.now() });
-            } else if (transcript) {
-              console.warn(`[DEBUG] ${new Date().toISOString()} final_response: SKIPPED adding user message. userMessageAddedRef is TRUE!`);
+          switch (parsed.type) {
+            case "utterance_end": {
+              // The user's turn is complete. The mic deliberately stays open so
+              // they can interrupt the reply.
+              const transcript = String(parsed.transcript ?? "").trim();
+              if (transcript && !userMessageAddedRef.current) {
+                addMessage({ id: uid(), role: "user", text: transcript, createdAt: Date.now() });
+                userMessageAddedRef.current = true;
+              }
+              beginTurn();
+              setInterimTranscript("");
+              setInput("");
+              break;
             }
-            
-            // Unlock UI for the next sentence
-            userMessageAddedRef.current = false;
-            
-            addMessage({
-              id: uid(),
-              role: "assistant",
-              text: displayText,
-              agentName: selectedAgent,
-              jobResults: parsed.job_results || undefined,
-              createdAt: Date.now()
-            });
-            // setIsSpeaking(false) removed because TTS audio is still streaming
-            
-          } else if (parsed.type === "tts_complete") {
-            console.log(`[DEBUG] ${new Date().toISOString()} DataReceived: tts_complete`);
-            setIsSpeaking(false);
-            
-          } else if (parsed.type === "interrupted") {
-            console.log(`[DEBUG] ${new Date().toISOString()} DataReceived: interrupted (Barge-in)`);
-            // Barge-in detected
-            setIsSpeaking(false);
-            // We do not change isListening here, because the mic stays hot
-            setIsSending(false);
-            setPartialAssistantMessage("");
-            
-            // Unlock UI for the interrupted utterance or the next one
-            userMessageAddedRef.current = false;
-            
-            // Note: We don't need to append the partial text here because
-            // the worker stores it in memory directly, and we just abandon the bubble.
-            
-          } else if (parsed.type === "token_batch") {
-            setPartialAssistantMessage(parsed.text);
-            setIsSending(false);
-            setIsSpeaking(true);
-            
-          } else if (parsed.type === "interim_transcript") {
-            const text = String(parsed.text ?? "");
-            setInterimTranscript(text);
-            setInput(text);
-            
-          } else if (parsed.type === "utterance_end") {
-            console.log(`[DEBUG] ${new Date().toISOString()} DataReceived: utterance_end. transcript=${parsed.transcript}`);
-            const transcript = String(parsed.transcript ?? "").trim();
-            if (transcript && !userMessageAddedRef.current) {
-              console.log(`[DEBUG] ${new Date().toISOString()} utterance_end: Adding user message to UI`);
-              addMessage({ id: uid(), role: "user", text: transcript, createdAt: Date.now() });
-              userMessageAddedRef.current = true;
-            } else if (transcript) {
-              console.warn(`[DEBUG] ${new Date().toISOString()} utterance_end: SKIPPED adding user message. userMessageAddedRef is TRUE!`);
+
+            case "interim_transcript": {
+              const text = String(parsed.text ?? "");
+              setInterimTranscript(text);
+              setInput(text);
+              break;
             }
-            console.log(`[DEBUG] ${new Date().toISOString()} utterance_end: setting isSending=true`);
-            // We do not set isListening=false here because the microphone is still open!
-            setIsSending(true);
-            setInterimTranscript("");
-            setInput("");
-            
-          } else if (parsed.type === "error") {
-            console.error(`[DEBUG] ${new Date().toISOString()} LiveKit error from backend:`, parsed.message);
-            addMessage({
-              id: uid(),
-              role: "assistant",
-              text: `Error: ${parsed.message}`,
-              createdAt: Date.now()
-            });
-            setIsSending(false);
-            setIsSpeaking(false);
+
+            case "caption": {
+              // One word, timed by the worker to the instant it is heard. This
+              // is the only thing that advances the on-screen reply, which is
+              // what keeps text and voice in step.
+              const delta = String(parsed.delta ?? "");
+              if (!delta) break;
+              spokenTextRef.current = spokenTextRef.current
+                ? `${spokenTextRef.current} ${delta}`
+                : delta;
+              setPartialAssistantMessage(spokenTextRef.current);
+              setIsSending(false);
+              setIsSpeaking(true);
+              keepTurnAlive();
+              break;
+            }
+
+            case "final_response": {
+              const transcript = String(parsed.transcript ?? "").trim();
+              const displayText = String(parsed.display_text ?? "");
+              const selectedAgent = parsed.metadata?.selected_agent as string | undefined;
+
+              setCurrentAgent(selectedAgent || null);
+
+              if (transcript && !userMessageAddedRef.current) {
+                addMessage({ id: uid(), role: "user", text: transcript, createdAt: Date.now() });
+              }
+              userMessageAddedRef.current = false;
+
+              // Held, not rendered. The model has finished generating but the
+              // assistant is still speaking; rendering the whole reply here is
+              // exactly what put the text a minute ahead of the audio.
+              pendingReplyRef.current = {
+                text: displayText,
+                agentName: selectedAgent,
+                jobResults: parsed.job_results || undefined,
+              };
+              keepTurnAlive();
+              break;
+            }
+
+            case "turn_end": {
+              // The single terminal event for a turn — success, timeout, or
+              // failure alike. Everything the UI disabled is re-enabled here.
+              endTurn();
+              break;
+            }
+
+            case "interrupted": {
+              // Barge-in. isListening is untouched because the mic stays hot.
+              endTurn({ interrupted: true });
+              break;
+            }
+
+            case "error": {
+              console.error("Voice worker error:", parsed.message);
+              // Commit anything already said first, so the reply and the notice
+              // read in the order they happened. A TTS failure in particular
+              // carries a perfectly good reply that belongs on screen.
+              endTurn();
+              addMessage({
+                id: uid(),
+                role: "assistant",
+                text: `Error: ${parsed.message}`,
+                createdAt: Date.now(),
+              });
+              break;
+            }
+
+            default:
+              break;
           }
         } catch (e) {
           console.error("Failed to parse LiveKit data channel message:", e);
         }
       });
 
-      room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-        if (track.kind === "audio") {
-          const audioElement = track.attach();
-          document.body.appendChild(audioElement);
-          console.log("LiveKit: Audio track attached and playing");
-        }
+      room.on(RoomEvent.TrackSubscribed, (track: RemoteTrack) => {
+        if (track.kind !== Track.Kind.Audio) return;
+        const el = track.attach();
+        el.autoplay = true;
+        // Hidden rather than absent: an element detached from the document does
+        // not reliably play in every browser.
+        el.style.display = "none";
+        document.body.appendChild(el);
+        audioElementsRef.current.push(el);
+        console.log("LiveKit: agent audio attached");
       });
 
-      room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
-        if (track.kind === "audio") {
-          track.detach().forEach(el => el.remove());
-          console.log("LiveKit: Audio track detached");
-        }
+      room.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
+        if (track.kind !== Track.Kind.Audio) return;
+        track.detach().forEach((el) => {
+          el.remove();
+          audioElementsRef.current = audioElementsRef.current.filter((x) => x !== el);
+        });
+        console.log("LiveKit: agent audio detached");
       });
 
       await room.connect(url, token);
+      // Publish the mic only after the room is up, so the worker (which this
+      // same request started) has a chance to join and subscribe.
       await room.localParticipant.setMicrophoneEnabled(true);
+
+      // connect() runs inside the mic click, so this normally succeeds outright;
+      // it is the fallback for browsers that still withhold playback.
+      try {
+        await room.startAudio();
+        setAudioBlocked(false);
+      } catch {
+        setAudioBlocked(!room.canPlaybackAudio);
+      }
 
       livekitRoomRef.current = room;
       setLivekitStatus("connected");
       console.log("✓ LiveKit: connected to room", roomName);
-      console.log("✓ LiveKit: microphone published");
     } catch (err) {
       console.error("LiveKit connection failed:", err);
       setLivekitStatus("error");
+      setIsListening(false);
+      addMessage({
+        id: uid(),
+        role: "assistant",
+        text: "I couldn't start the voice session. Check your microphone permission and try again.",
+        createdAt: Date.now(),
+      });
       setTimeout(() => setLivekitStatus("idle"), 3000);
+    } finally {
+      livekitConnectingRef.current = false;
+    }
+  };
+
+  const enableAudioPlayback = async () => {
+    const room = livekitRoomRef.current;
+    if (!room) return;
+    try {
+      await room.startAudio();
+      setAudioBlocked(false);
+    } catch (e) {
+      console.error("Could not start audio playback", e);
     }
   };
 
@@ -469,12 +606,9 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     setInput("");
     setInterimTranscript("");
     setSessionId(createConversationSessionId());
-
-    // Stop audio and reset all states
-
-    setIsSpeaking(false);
-    setIsSending(false);
+    endTurn();
     setIsListening(false);
+    void livekitRoomRef.current?.localParticipant.setMicrophoneEnabled(false);
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -483,6 +617,23 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
       handleSend();
     }
   };
+
+  // Hold the UI until a session exists, so nothing can be typed into a chat
+  // that would be rejected the moment it is sent.
+  if (authState !== "ready") {
+    return (
+      <main className={`min-h-screen ${colors.bg} flex items-center justify-center`}>
+        <div className="flex flex-col items-center gap-4 text-white/60">
+          <svg className="w-8 h-8 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          <p className="text-sm">
+            {authState === "loading" ? "Starting your session…" : "Redirecting to sign in…"}
+          </p>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className={`min-h-screen ${colors.bg} relative overflow-hidden`}>
@@ -506,12 +657,17 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                 </div>
                 <div>
                   <h1 className="text-xl font-bold text-white">{title}</h1>
-                  <p className="text-sm text-white/60">{subtitle}</p>
+                  <p className="text-sm text-white/60">
+                    {subtitle}
+                    {identity?.role === "guest" && (
+                      <span className="ml-2 px-2 py-0.5 rounded-full bg-white/10 text-[10px] uppercase tracking-wide align-middle">
+                        Guest · read-only
+                      </span>
+                    )}
+                  </p>
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                
-
                 {/* Hidden file input for timetable upload */}
                 <input
                   ref={timetableInputRef}
@@ -523,7 +679,8 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                     if (file) void handleTimetableUpload(file);
                   }}
                 />
-                {/* Timetable upload button */}
+                {/* Timetable upload — owner only; a guest has no write scope */}
+                {canManageTimetable && (
                 <button
                   onClick={() => timetableInputRef.current?.click()}
                   disabled={timetableUploading}
@@ -542,8 +699,11 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                     </svg>
                   )}
                 </button>
+                )}
+                {/* Memory panel — owner only; guests have no stored facts */}
+                {canEditMemory && (
                 <button
-                  onClick={() => { setShowMemoryPanel(true); fetchProfileFacts(); }}
+                  onClick={() => { setShowMemoryPanel(true); void loadProfileFacts(); }}
                   className="p-2.5 rounded-xl glass hover:glass-strong transition-all duration-200 text-white/80 hover:text-white group"
                   title="Memory panel"
                 >
@@ -551,6 +711,18 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
                   </svg>
                 </button>
+                )}
+                {identity?.role === "owner" && (
+                <button
+                  onClick={() => void handleSignOut()}
+                  className="p-2.5 rounded-xl glass hover:glass-strong transition-all duration-200 text-white/80 hover:text-white group"
+                  title="Sign out"
+                >
+                  <svg className="w-5 h-5 group-hover:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                  </svg>
+                </button>
+                )}
                 <button
                   onClick={() => setShowClearModal(true)}
                   className="p-2.5 rounded-xl glass hover:glass-strong transition-all duration-200 text-white/80 hover:text-white group"
@@ -588,10 +760,32 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
             </div>
           )}
 
-          {/* Status indicators */}
+          {/* Playback blocked by the browser's autoplay policy */}
+          {audioBlocked && (
+            <button
+              onClick={() => void enableAudioPlayback()}
+              className="px-6 py-2 w-full text-left border-b border-white/10 text-sm text-amber-300 hover:text-amber-200 transition-colors"
+            >
+              🔇 Your browser blocked audio playback — click here to enable sound.
+            </button>
+          )}
+
+          {/* Status indicators. The mic stays open across a turn, so these are
+              driven by what the assistant is doing rather than by isListening. */}
           {(isListening || isSending || isSpeaking) && (
             <div className="px-6 py-3 border-b border-white/10">
-              {isListening && (
+              {isSpeaking ? (
+                <SpeakingIndicator />
+              ) : isSending ? (
+                <div className="flex items-center gap-3">
+                  <ThinkingIndicator />
+                  {currentAgent && (
+                    <span className={`px-2.5 py-1 rounded-full text-xs font-medium bg-gradient-to-r ${colors.gradient} text-white/90 animate-pulse`}>
+                      {AGENT_LABELS[currentAgent] ?? currentAgent}
+                    </span>
+                  )}
+                </div>
+              ) : (
                 <div>
                   <ListeningIndicator />
                   {interimTranscript && (
@@ -601,17 +795,6 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                   )}
                 </div>
               )}
-              {isSending && !isListening && (
-                <div className="flex items-center gap-3">
-                  <ThinkingIndicator />
-                  {currentAgent && (
-                    <span className={`px-2.5 py-1 rounded-full text-xs font-medium bg-gradient-to-r ${colors.gradient} text-white/90 animate-pulse`}>
-                      {AGENT_LABELS[currentAgent] ?? currentAgent}
-                    </span>
-                  )}
-                </div>
-              )}
-              {isSpeaking && !isListening && !isSending && <SpeakingIndicator />}
             </div>
           )}
 
@@ -715,8 +898,9 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
               </article>
             ))}
 
-            <TypingIndicator show={isSending && !isListening && !partialAssistantMessage} />
-            
+            {/* Thinking state lives in the status bar above: the mic now stays
+                open across a turn, so a duplicate indicator keyed on
+                !isListening could never render anyway. */}
             {partialAssistantMessage && (
               <article className={`flex items-start gap-4 flex-row`}>
                 <div className={`w-10 h-10 rounded-full bg-gradient-to-br ${colors.gradient} flex items-center justify-center flex-shrink-0 shadow-lg`}>
@@ -738,26 +922,24 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
             <div className="flex gap-3 items-end">
               <button
                 onClick={handleMic}
-                disabled={isSending || isSpeaking}
+                disabled={livekitStatus === "connecting"}
                 className={`p-3 rounded-xl ${
                   isListening
                     ? `bg-gradient-to-br ${colors.gradient} shadow-lg scale-110`
-                    : (isSending || isSpeaking)
+                    : livekitStatus === "connecting"
                     ? "glass opacity-50 cursor-not-allowed"
                     : "glass hover:glass-strong"
                 } transition-all duration-200 text-white ${mode === "user" ? "flex-1" : "flex-shrink-0"} group btn-ripple`}
                 type="button"
                 title={
-                  isSending
-                    ? "Processing your request..."
-                    : isSpeaking
-                    ? "Speaking response..."
-                    : isListening
-                    ? "Click to stop and process"
-                    : "Click to start speaking"
+                  isListening
+                    ? "Voice is live — just speak, or click to end the session"
+                    : livekitStatus === "connecting"
+                    ? "Connecting…"
+                    : "Click to start a voice session"
                 }
               >
-                {isSending ? (
+                {isSending && !isListening ? (
                   <svg className="w-6 h-6 animate-spin mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
@@ -772,12 +954,14 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                 )}
                 {mode === "user" && (
                   <span className="ml-3 text-sm font-medium">
-                    {isListening
-                      ? "Click to stop & process"
-                      : isSending
-                      ? "Processing..."
-                      : isSpeaking
-                      ? "Speaking..."
+                    {livekitStatus === "connecting"
+                      ? "Connecting…"
+                      : isListening && isSpeaking
+                      ? "Speaking — talk to interrupt"
+                      : isListening && isSending
+                      ? "Thinking…"
+                      : isListening
+                      ? "Listening — click to end"
                       : "Tap to speak"}
                   </span>
                 )}
@@ -886,7 +1070,7 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
             {/* Refresh button */}
             <div className={`px-4 py-3 border-t border-white/10 ${colors.surface}`}>
               <button
-                onClick={fetchProfileFacts}
+                onClick={() => void loadProfileFacts()}
                 disabled={memoryLoading}
                 className="w-full py-2 rounded-xl glass hover:glass-strong transition-all text-white/60 hover:text-white text-xs disabled:opacity-50"
               >

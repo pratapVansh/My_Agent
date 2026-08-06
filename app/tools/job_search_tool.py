@@ -9,12 +9,15 @@ Phase 2 upgrades:
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Dict, List, Optional, Set
 
 from app.config import settings
 from app.memory.memory_manager import memory_manager
 from app.memory.short_term_memory import short_term_memory
 from app.services.langsmith_service import traceable
+
+logger = logging.getLogger(__name__)
 
 
 class JobSearchTool:
@@ -84,7 +87,7 @@ class JobSearchTool:
         Returns a flat list of skill tokens (e.g. ['Python', 'React', 'Node.js']).
         """
         try:
-            skills_data = await memory_manager.long_term.retrieve_skills(
+            skills_data = await memory_manager.retrieve_skills(
                 user_id=user_id,
                 query="technical skills programming languages tools frameworks",
                 limit=5,
@@ -113,7 +116,10 @@ class JobSearchTool:
             return unique[:30]  # cap at 30 skills
 
         except Exception as e:
-            print(f"[JobSearchTool] Could not fetch user skills: {e}")
+            logger.warning(
+                "Could not fetch skills for user=%s; ranking without skill match: %s",
+                user_id, e,
+            )
             return []
 
     def _build_search_query(
@@ -130,6 +136,7 @@ class JobSearchTool:
 
     async def _search_with_tavily(self, search_query: str, max_results: int) -> List[Dict[str, Any]]:
         if not settings.tavily_api_key:
+            logger.warning("TAVILY_API_KEY is not configured — job search returns no results")
             return []
         try:
             from tavily import AsyncTavilyClient
@@ -141,7 +148,10 @@ class JobSearchTool:
                 include_raw_content=False,
             )
             return response.get("results", [])
-        except Exception:
+        except Exception as e:
+            # Degrade gracefully for the user, but make the cause visible:
+            # an expired key otherwise looks identical to "no jobs found".
+            logger.error("Tavily search failed: %s", e, exc_info=True)
             return []
 
     def _filter_results(
@@ -283,7 +293,10 @@ class JobSearchTool:
             return list(match_lists)
 
         except Exception as e:
-            print(f"[JobSearchTool] Semantic skill match failed, falling back to empty: {e}")
+            logger.warning(
+                "Semantic skill match failed for user=%s; falling back to substring matching: %s",
+                user_id, e,
+            )
             return [[] for _ in job_texts]
 
     def _rank_results(

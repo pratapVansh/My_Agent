@@ -4,13 +4,22 @@ Stores chat history, attendance, and timetable using async SQLAlchemy.
 """
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import select, and_, desc
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql import func
 from typing import List, Dict, Any, Optional
 from datetime import date, time, datetime
+import logging
+import re
 import uuid
 
 from app.config import settings
 from app.memory.models import Base, ChatHistory, Attendance, Timetable, JobBookmark, EmailDraft, EmailTemplate, Exam, UserProfile, EpisodicMemory, AgentPlaybook, Plan, ToolMemory
+
+logger = logging.getLogger(__name__)
+
+# Safety ceiling on unbounded history reads so a long-lived account cannot
+# degrade a request into a full-table scan.
+_MAX_ATTENDANCE_ROWS = 5000
 
 
 class ShortTermMemory:
@@ -21,10 +30,18 @@ class ShortTermMemory:
 
     def __init__(self):
         """Initialize async database engine and session."""
+        # Explicit pool sizing: each chat turn issues several concurrent writes
+        # and each LiveKit participant runs its own workflow, so SQLAlchemy's
+        # 5+10 default is exhausted under modest concurrency. pool_timeout makes
+        # exhaustion raise promptly instead of hanging the request.
         self.engine = create_async_engine(
             settings.postgres_url,
-            echo=settings.environment == "development",
-            pool_pre_ping=True
+            echo=False,  # SQL echo is far too verbose for request-path logging
+            pool_pre_ping=True,
+            pool_size=settings.postgres_pool_size,
+            max_overflow=settings.postgres_max_overflow,
+            pool_timeout=settings.postgres_pool_timeout,
+            pool_recycle=settings.postgres_pool_recycle,
         )
         self.async_session_maker = async_sessionmaker(
             self.engine,
@@ -159,33 +176,84 @@ class ShortTermMemory:
         Returns:
             Attendance record ID
         """
+        return await self.upsert_attendance(
+            user_id=user_id, date=date, subject=subject, status=status, notes=notes
+        )
+
+    async def upsert_attendance(
+        self,
+        user_id: str,
+        date: date,
+        subject: str,
+        status: str,
+        notes: Optional[str] = None
+    ) -> str:
+        """
+        Insert or update the attendance record for (user_id, date, subject).
+
+        Attendance is a fact about a specific class on a specific day, so
+        recording it twice must not create two rows: duplicates inflate the
+        'total classes' denominator and silently corrupt the attendance
+        percentages the academic agent bases its advice on.
+
+        Returns the record ID.
+        """
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
         async with self.async_session_maker() as session:
-            attendance = Attendance(
+            stmt = pg_insert(Attendance).values(
+                id=uuid.uuid4(),
                 user_id=user_id,
                 date=date,
                 subject=subject,
                 status=status,
-                notes=notes
-            )
-            session.add(attendance)
-            await session.commit()
-            return str(attendance.id)
+                notes=notes,
+            ).on_conflict_do_update(
+                index_elements=["user_id", "date", "subject"],
+                set_=dict(status=status, notes=notes),
+            ).returning(Attendance.id)
+
+            try:
+                result = await session.execute(stmt)
+                await session.commit()
+                row = result.fetchone()
+                return str(row[0]) if row else ""
+            except Exception:
+                # Falls back to a plain insert when the unique index is absent
+                # (pre-migration database) so existing deployments keep working.
+                await session.rollback()
+                logger.debug(
+                    "Attendance upsert unavailable (missing unique index?); "
+                    "falling back to insert. Run the migration in AUDIT_REPORT.md."
+                )
+                attendance = Attendance(
+                    user_id=user_id,
+                    date=date,
+                    subject=subject,
+                    status=status,
+                    notes=notes,
+                )
+                session.add(attendance)
+                await session.commit()
+                return str(attendance.id)
 
     async def retrieve_attendance(
         self,
         user_id: str,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
-        subject: Optional[str] = None
+        subject: Optional[str] = None,
+        limit: int = _MAX_ATTENDANCE_ROWS,
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve attendance records.
+        Retrieve attendance records, newest first.
 
         Args:
             user_id: User identifier
             start_date: Optional start date filter
             end_date: Optional end date filter
             subject: Optional subject filter
+            limit: Safety ceiling on rows returned (most recent kept)
 
         Returns:
             List of attendance records
@@ -200,7 +268,7 @@ class ShortTermMemory:
             if subject:
                 query = query.where(Attendance.subject == subject)
 
-            query = query.order_by(desc(Attendance.date))
+            query = query.order_by(desc(Attendance.date)).limit(limit)
 
             result = await session.execute(query)
             records = result.scalars().all()
@@ -330,9 +398,17 @@ class ShortTermMemory:
         search_query: Optional[str] = None,
         skills_matched: Optional[List[str]] = None,
     ) -> str:
-        """Save a job bookmark. Silently skips if URL already bookmarked."""
+        """
+        Save a job bookmark. Returns "already_saved" if the URL is a duplicate.
+
+        The pre-check is only a fast path. Two concurrent calls for the same URL
+        can both pass it, so the authoritative guard is the unique constraint on
+        (user_id, url) and the IntegrityError it raises — that converts a race
+        into the same "already_saved" outcome instead of a duplicate row.
+        """
         if await self.is_job_bookmarked(user_id, url):
             return "already_saved"
+
         async with self.async_session_maker() as session:
             bookmark = JobBookmark(
                 user_id=user_id,
@@ -345,7 +421,15 @@ class ShortTermMemory:
                 skills_matched=skills_matched or [],
             )
             session.add(bookmark)
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                logger.debug(
+                    "Concurrent bookmark insert for user=%s url=%s resolved as duplicate",
+                    user_id, url,
+                )
+                return "already_saved"
             return str(bookmark.id)
 
     async def is_job_bookmarked(self, user_id: str, url: str) -> bool:
@@ -652,25 +736,74 @@ class ShortTermMemory:
 
     # ── UserProfile Operations ───────────────────────────────────────────────
 
-    # ── Sensitive data keywords — never store these keys or values ────────────
+    # ── Sensitive data detection ──────────────────────────────────────────────
+    # Profile facts are injected verbatim into every agent's system prompt, so
+    # anything stored here reaches an LLM (and any transcript or trace of it).
+    # These checks are defence in depth, not a guarantee — the durable fix is an
+    # allowlist of permitted fact keys (see AUDIT_REPORT.md, M5).
     _SENSITIVE_KEYS = frozenset({
-        "password", "passwd", "pin", "secret", "token", "api_key", "apikey",
-        "credit_card", "card_number", "cvv", "ssn", "social_security",
-        "bank_account", "routing_number", "private_key",
+        "password", "passwd", "pwd", "pass", "passphrase", "pin", "secret",
+        "token", "auth", "credential", "credentials", "api_key", "apikey",
+        "access_key", "secret_key", "private_key", "session_key", "otp", "mfa",
+        "credit_card", "card_number", "cardno", "cvv", "cvc", "ssn",
+        "social_security", "bank_account", "account_number", "routing_number",
+        "iban", "aadhaar", "passport", "license_key",
     })
+
+    # Credential formats matched against the value exactly as given. These all
+    # describe single opaque tokens, so a value containing whitespace can never
+    # match one — that is what keeps ordinary prose facts out of scope.
+    _SENSITIVE_TOKEN_PATTERNS = (
+        re.compile(r"^[A-Za-z0-9_\-\.]{20,}$"),                           # opaque token
+        re.compile(r"^(sk|pk|rk|api|key)[-_][A-Za-z0-9_\-]{10,}$", re.I),  # prefixed API key
+        re.compile(r"^[A-Za-z0-9+/]{24,}={0,2}$"),                        # base64 blob
+        re.compile(r"^eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\."),            # JWT
+    )
+
+    # Numeric identifiers, checked after stripping spaces and hyphens so that
+    # "4111 1111 1111 1111" and "123-45-6789" are still recognised.
+    _SENSITIVE_NUMERIC_PATTERNS = (
+        re.compile(r"^\d{13,19}$"),      # card-like PAN
+        re.compile(r"^\d{9}$"),          # SSN without separators
+    )
+
+    # Substrings that mark a value as a key blob wherever they appear.
+    _SENSITIVE_SUBSTRINGS = (
+        re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    )
 
     def _is_sensitive(self, key: str, value: str) -> bool:
         """Return True if the key or value looks like sensitive credential data."""
-        key_lower = key.lower()
-        if any(s in key_lower for s in self._SENSITIVE_KEYS):
+        # Normalise separators so "user-password" and "My Password" are both
+        # caught by the same substring check as "user_password".
+        key_normalized = re.sub(r"[^a-z0-9]+", "_", (key or "").lower())
+        if any(s in key_normalized for s in self._SENSITIVE_KEYS):
             return True
-        # Crude value heuristic: reject values that look like raw passwords/tokens
-        # (long alphanum strings with no spaces ≥ 20 chars that aren't URLs)
-        if len(value) >= 20 and " " not in value and not value.startswith("http"):
-            # Allow UUIDs, emails, dates — only block opaque credential-shaped strings
-            import re
-            if re.fullmatch(r"[A-Za-z0-9_\-\.]{20,}", value):
+
+        candidate = (value or "").strip()
+        if not candidate:
+            return False
+
+        for pattern in self._SENSITIVE_SUBSTRINGS:
+            if pattern.search(candidate):
                 return True
+
+        # URLs and email addresses are legitimate profile values.
+        if candidate.lower().startswith(("http://", "https://")) or "@" in candidate:
+            return False
+
+        # Only single-token values can be credentials; prose never is.
+        if not re.search(r"\s", candidate):
+            for pattern in self._SENSITIVE_TOKEN_PATTERNS:
+                if pattern.match(candidate):
+                    return True
+
+        digits_only = re.sub(r"[\s\-]", "", candidate)
+        if digits_only.isdigit():
+            for pattern in self._SENSITIVE_NUMERIC_PATTERNS:
+                if pattern.match(digits_only):
+                    return True
+
         return False
 
     async def save_profile_fact(
@@ -687,6 +820,11 @@ class ShortTermMemory:
         Returns the record ID. Blocks sensitive credential data silently.
         """
         if self._is_sensitive(key, value):
+            # Log the key only — never the value that triggered the block.
+            logger.warning(
+                "Rejected profile fact for user=%s key=%s: value looks like credential data",
+                user_id, key,
+            )
             return ""
 
         from sqlalchemy.dialects.postgresql import insert as pg_insert

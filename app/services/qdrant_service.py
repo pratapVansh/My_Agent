@@ -20,9 +20,10 @@ import logging
 from app.config import settings
 from app.services.debug_logger import log_step
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Per-request page size used when walking a collection with the scroll cursor.
+_SCROLL_PAGE_SIZE = 256
 
 
 class QdrantService:
@@ -32,13 +33,24 @@ class QdrantService:
     """
 
     def __init__(self):
-        """Initialize Qdrant client with cloud connection."""
-        self.client = AsyncQdrantClient(
-            url=settings.qdrant_url,
-            api_key=settings.qdrant_api_key,
-            timeout=settings.qdrant_timeout
-        )
+        """Prepare defaults. The Qdrant client itself is built lazily."""
+        self._client: Optional[AsyncQdrantClient] = None
         self.vector_size = settings.cohere_embedding_dimension
+
+    @property
+    def client(self) -> AsyncQdrantClient:
+        """Build the Qdrant client on first use (see GroqService.client)."""
+        if self._client is None:
+            if not (settings.qdrant_url or "").strip():
+                raise RuntimeError(
+                    "QDRANT_URL is not configured. Set it in your .env file."
+                )
+            self._client = AsyncQdrantClient(
+                url=settings.qdrant_url,
+                api_key=settings.qdrant_api_key,
+                timeout=settings.qdrant_timeout
+            )
+        return self._client
 
     async def ensure_collection(
         self,
@@ -196,8 +208,8 @@ class QdrantService:
                     "count": len(results.points),
                 },
             )
-            logger.info(
-                f"Query in '{collection_name}': found {len(results.points)} results"
+            logger.debug(
+                "Query in '%s': found %d results", collection_name, len(results.points)
             )
             return results.points
 
@@ -334,15 +346,20 @@ class QdrantService:
         self,
         collection_name: str,
         filter_conditions: Optional[Dict[str, Any]] = None,
-        limit: int = 100
+        limit: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
-        Scroll through collection points (for migration/export).
+        Walk every matching point in a collection, following the scroll cursor.
+
+        Qdrant's scroll API returns one page plus a continuation offset. Reading
+        only the first page silently truncates results, which matters most for
+        deletion: an erasure request that scrolls a single page leaves the rest
+        of the user's data behind. This follows the cursor to exhaustion.
 
         Args:
             collection_name: Name of the collection
             filter_conditions: Filter by metadata
-            limit: Batch size for scrolling
+            limit: Optional hard cap on points returned. None means "all".
 
         Returns:
             List of points with id and payload
@@ -351,7 +368,6 @@ class QdrantService:
             Exception: If scroll fails
         """
         try:
-            # Build filter
             scroll_filter = None
             if filter_conditions:
                 conditions = [
@@ -363,23 +379,37 @@ class QdrantService:
                 ]
                 scroll_filter = Filter(must=conditions)
 
-            points, _ = await self.client.scroll(
-                collection_name=collection_name,
-                scroll_filter=scroll_filter,
-                limit=limit,
-                with_payload=True,
-                with_vectors=False
-            )
+            collected: List[Dict[str, Any]] = []
+            offset = None
 
-            logger.info(f"Scrolled {len(points)} points from '{collection_name}'")
+            while True:
+                remaining = None if limit is None else limit - len(collected)
+                if remaining is not None and remaining <= 0:
+                    break
 
-            return [
-                {
-                    "id": str(point.id),
-                    "payload": point.payload
-                }
-                for point in points
-            ]
+                page_size = _SCROLL_PAGE_SIZE if remaining is None else min(_SCROLL_PAGE_SIZE, remaining)
+
+                points, next_offset = await self.client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=scroll_filter,
+                    limit=page_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False
+                )
+
+                collected.extend(
+                    {"id": str(point.id), "payload": point.payload}
+                    for point in points
+                )
+
+                # Cursor exhausted, or the server returned a short page.
+                if next_offset is None or not points:
+                    break
+                offset = next_offset
+
+            logger.debug("Scrolled %d points from '%s'", len(collected), collection_name)
+            return collected
 
         except Exception as e:
             logger.error(f"Scroll failed in '{collection_name}': {str(e)}")

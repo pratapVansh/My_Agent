@@ -16,6 +16,7 @@ from app.services.qdrant_service import qdrant_service
 from app.services.voice_service import voice_service
 from app.services.langsmith_service import configure_langsmith
 from app.memory.memory_manager import memory_manager
+from app.middleware.rate_limit import RateLimitMiddleware
 
 
 @asynccontextmanager
@@ -27,6 +28,35 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting %s v%s", settings.app_name, settings.app_version)
     logger.info("Environment: %s | Groq model: %s", settings.environment, settings.groq_model)
+
+    # Fail fast on missing credentials. Services build their clients lazily so
+    # modules stay importable without a .env; this is where a real deployment
+    # is told, once and clearly, that it cannot function.
+    missing = settings.validate_required_keys()
+    if missing:
+        raise RuntimeError(
+            "Missing required configuration: "
+            + ", ".join(missing)
+            + ". Set these in your .env file (see .env.example)."
+        )
+
+    # Auth misconfiguration is fatal: a missing or shared signing secret means
+    # anyone could mint a valid owner token.
+    auth_problems = settings.validate_auth_config()
+    if auth_problems:
+        raise RuntimeError(
+            "Authentication is misconfigured:\n  - "
+            + "\n  - ".join(auth_problems)
+            + "\n\nRun: python scripts/create_owner_password.py"
+        )
+    logger.info(
+        "Auth ready — owner=%s, guest sessions %s, cookies (secure=%s, samesite=%s), CSRF %s",
+        settings.owner_username,
+        "enabled" if settings.guest_sessions_enabled else "disabled",
+        settings.cookie_secure,
+        settings.cookie_samesite,
+        "on" if settings.csrf_protection_enabled else "OFF",
+    )
 
     # Optional observability setup
     if configure_langsmith():
@@ -66,6 +96,23 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Cartesia TTS disabled — no API key")
 
+    if settings.rate_limit_enabled:
+        logger.info(
+            "Rate limiting enabled (llm=%d/min, upload=%d/min, expensive=%d/min, default=%d/min)",
+            settings.rate_limit_llm_per_minute, settings.rate_limit_upload_per_minute,
+            settings.rate_limit_expensive_per_minute, settings.rate_limit_default_per_minute,
+        )
+    else:
+        logger.warning("Rate limiting is DISABLED — not recommended outside local development")
+
+    if not settings.is_development and settings.allowed_origins == [
+        "http://localhost:3000", "http://localhost:3001"
+    ]:
+        logger.warning(
+            "ALLOWED_ORIGINS is still the localhost default in a non-development "
+            "environment — browser requests from your deployed frontend will be blocked."
+        )
+
     # LiveKit WebRTC readiness (Phase 0 — informational only)
     if settings.is_livekit_configured:
         logger.info("LiveKit WebRTC configured (url=%s)", settings.livekit_url)
@@ -91,6 +138,10 @@ app = FastAPI(
     description="Production-ready FastAPI backend with Groq LLM integration",
     lifespan=lifespan
 )
+
+# Rate limiting sits outermost so throttled requests are rejected before any
+# handler, database session, or third-party API call is touched.
+app.add_middleware(RateLimitMiddleware)
 
 # CORS — origins controlled via settings.allowed_origins (set ALLOWED_ORIGINS in .env)
 app.add_middleware(
@@ -131,8 +182,10 @@ async def health_check():
 
 # Include routers
 from app.routes import agent_routes
+from app.routes import auth_routes
 from app.routes import livekit_routes
 
+app.include_router(auth_routes.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(agent_routes.router, prefix="/api/v1/agents", tags=["agents"])
 app.include_router(livekit_routes.router, prefix="/api/v1/voice", tags=["voice"])
 

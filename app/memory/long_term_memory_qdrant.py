@@ -4,6 +4,7 @@ Stores persistent information with Cohere embeddings and text chunking.
 """
 from qdrant_client.models import PointStruct
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
 import asyncio
 import uuid
 import logging
@@ -371,12 +372,17 @@ class LongTermMemoryQdrant:
                 logger.warning("Empty or malformed resume text received; skipping storage")
                 return parent_id
 
-            # Prepare metadata
+            # Prepare metadata.
+            # uploaded_at makes "which resume is newest" an explicit, sortable
+            # fact. Without it retrieval had to guess from Qdrant's scroll order,
+            # which reflects internal storage layout rather than upload recency —
+            # so a partially-failed replacement could serve the stale resume.
             meta = metadata or {}
             meta.update({
                 "user_id": user_id,
                 "type": "resume",
-                "parent_id": parent_id
+                "parent_id": parent_id,
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
             })
 
             # Semantic extraction with guaranteed fallback for robust resume ingestion.
@@ -496,7 +502,6 @@ class LongTermMemoryQdrant:
                 self.qdrant.scroll_collection(
                     collection_name=self.collections["resume"],
                     filter_conditions={"user_id": user_id},
-                    limit=200,
                 ),
                 self.qdrant.scroll_collection(
                     collection_name=self.collections["skills"],
@@ -738,27 +743,41 @@ class LongTermMemoryQdrant:
         try:
             logger.debug("retrieve_resume called for user_id=%s", user_id)
 
-            # Get all resume chunks for user
+            # Walk every resume chunk for this user (scroll cursor followed to
+            # exhaustion) so a large or multi-version resume is never truncated.
             results = await self.qdrant.scroll_collection(
                 collection_name=self.collections["resume"],
                 filter_conditions={"user_id": user_id},
-                limit=100
             )
 
             if not results:
                 return None
 
-            # Group by parent_id and get most recent
-            parent_groups = {}
+            # Group by parent_id; each group is one uploaded resume version.
+            parent_groups: Dict[Any, List[Dict[str, Any]]] = {}
             for point in results:
                 parent_id = point["payload"].get("parent_id")
-                if parent_id not in parent_groups:
-                    parent_groups[parent_id] = []
-                parent_groups[parent_id].append(point)
+                parent_groups.setdefault(parent_id, []).append(point)
 
-            # Get the most recent parent_id (could add timestamp comparison)
-            latest_parent = list(parent_groups.keys())[-1]
+            # Pick the newest version by explicit upload timestamp. Chunks
+            # written before uploaded_at existed sort as empty string, so any
+            # timestamped version correctly wins over legacy data; if none are
+            # timestamped this degrades to stable insertion order.
+            def _group_uploaded_at(points: List[Dict[str, Any]]) -> str:
+                return max(
+                    (str(p["payload"].get("uploaded_at") or "") for p in points),
+                    default="",
+                )
+
+            latest_parent = max(parent_groups, key=lambda pid: _group_uploaded_at(parent_groups[pid]))
             chunks = parent_groups[latest_parent]
+
+            if len(parent_groups) > 1:
+                logger.warning(
+                    "Found %d resume versions for user=%s; serving newest (parent_id=%s). "
+                    "Stale versions suggest a previous replacement did not finish cleanly.",
+                    len(parent_groups), user_id, latest_parent,
+                )
 
             # Sort chunks by index
             sorted_chunks = sorted(

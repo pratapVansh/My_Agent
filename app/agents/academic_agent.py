@@ -6,6 +6,7 @@ from typing import Dict, Any
 from datetime import datetime, date as date_cls, time as time_cls
 from app.agents.base_agent import BaseAgent
 from app.agents.state import make_envelope
+from app.auth.models import Scope
 from app.tools.timetable_tool import timetable_tool, TimetableInput
 from app.memory.memory_manager import memory_manager
 
@@ -297,6 +298,7 @@ Always confirm after storing data."""
                     "Args: day_of_week (int 0–6, optional), low_attendance_threshold (float, default 75)."
                 ),
                 "callable": tool_class_suggestions,
+                "scope": Scope.TIMETABLE_READ.value,
             },
             "add_timetable_entry": {
                 "description": (
@@ -305,6 +307,7 @@ Always confirm after storing data."""
                     "start_time (str e.g. '09:00'), end_time (str), location (str), instructor (str)."
                 ),
                 "callable": tool_add_timetable_entry,
+                "scope": Scope.TIMETABLE_WRITE.value,
             },
             "mark_attendance": {
                 "description": (
@@ -312,10 +315,12 @@ Always confirm after storing data."""
                     "Args: subject (str), status (present|absent|late), date (str e.g. 'today' or '2024-03-15'), notes (str)."
                 ),
                 "callable": tool_mark_attendance,
+                "scope": Scope.ATTENDANCE_WRITE.value,
             },
             "get_attendance_summary": {
                 "description": "Show per-subject attendance percentage and risk level. Args: none.",
                 "callable": tool_get_attendance_summary,
+                "scope": Scope.ATTENDANCE_READ.value,
             },
             "add_exam": {
                 "description": (
@@ -324,10 +329,12 @@ Always confirm after storing data."""
                     "start_time (str, optional), location (str), exam_type (exam|midterm|final|quiz|assignment), notes (str)."
                 ),
                 "callable": tool_add_exam,
+                "scope": Scope.TIMETABLE_WRITE.value,
             },
             "get_upcoming_exams": {
                 "description": "List all upcoming exams sorted by date. Args: none.",
                 "callable": tool_get_upcoming_exams,
+                "scope": Scope.TIMETABLE_READ.value,
             },
             "generate_study_schedule": {
                 "description": (
@@ -335,6 +342,7 @@ Always confirm after storing data."""
                     "timetable, and attendance risk. Args: none."
                 ),
                 "callable": tool_generate_study_schedule,
+                "scope": Scope.TIMETABLE_READ.value,
             },
             "save_plan": {
                 "description": (
@@ -343,6 +351,7 @@ Always confirm after storing data."""
                     "description (str, optional), priority (high|medium|low)."
                 ),
                 "callable": tool_save_plan,
+                "scope": Scope.TIMETABLE_WRITE.value,
             },
             "get_plans": {
                 "description": (
@@ -351,6 +360,7 @@ Always confirm after storing data."""
                     "include_done (bool, default false)."
                 ),
                 "callable": tool_get_plans,
+                "scope": Scope.TIMETABLE_READ.value,
             },
             "mark_plan_done": {
                 "description": (
@@ -358,6 +368,7 @@ Always confirm after storing data."""
                     "Args: plan_id (str — from get_plans response)."
                 ),
                 "callable": tool_mark_plan_done,
+                "scope": Scope.TIMETABLE_WRITE.value,
             },
         }
 

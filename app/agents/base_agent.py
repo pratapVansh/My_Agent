@@ -24,6 +24,28 @@ _MAX_MEMORY_CHARS = 20_000
 _LLM_CALL_TIMEOUT = 30.0   # seconds per Groq call
 _TOOL_CALL_TIMEOUT = 15.0  # seconds per tool call
 
+# Strong references to detached background writes. asyncio only holds a weak
+# reference to a running task, so without this a fire-and-forget task can be
+# garbage-collected mid-execution and its exception never observed.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro, description: str) -> None:
+    """Run a non-critical coroutine detached, keeping it alive and logged."""
+    task = asyncio.create_task(coro, name=description)
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Background task '%s' failed: %s", description, exc)
+
+    task.add_done_callback(_on_done)
+
 
 # ─────────────────────────────────────────────────────────────
 # Pydantic models for structured LLM output validation
@@ -88,6 +110,44 @@ class BaseAgent(ABC):
         )
         raise last_exc
 
+    def _filter_tools_by_scope(
+        self,
+        tools: Dict[str, Dict[str, Any]],
+        state: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Drop tools the caller is not authorized to use.
+
+        This is the authorization layer that route guards cannot provide: a
+        guest and the owner reach the *same* agent through /agents/query, so
+        without this a guest's conversation could still drive send_email or the
+        ERP scraper. Unauthorized tools are removed from the registry entirely
+        rather than refused on call, so the model is never even told they exist
+        and cannot be talked into attempting them.
+
+        A tool with no "scope" key is unrestricted (read-only helpers).
+        """
+        scopes = state.get("scopes")
+        if scopes is None:
+            # No scope context (internal/CLI invocation) — no restriction.
+            return tools
+
+        allowed: Dict[str, Dict[str, Any]] = {}
+        denied: list[str] = []
+        for name, spec in tools.items():
+            required = spec.get("scope")
+            if required is None or required in scopes:
+                allowed[name] = spec
+            else:
+                denied.append(name)
+
+        if denied:
+            logger.info(
+                "Agent '%s': withheld %d tool(s) outside caller scope: %s",
+                self.name, len(denied), ", ".join(sorted(denied)),
+            )
+        return allowed
+
     def inject_memory_context(self, system_prompt: str, state: Dict[str, Any]) -> str:
         """
         Inject memory context into the system prompt.
@@ -151,7 +211,7 @@ class BaseAgent(ABC):
         - Fix 2: Injects reflect_failure_context so retries use a different strategy
         - Fix 3: Retrieves past tool insights before loop; saves successful outcomes after
         """
-        tools = tools or {}
+        tools = self._filter_tools_by_scope(tools or {}, state)
         user_input = state.get("user_input", "")
         detected_intent = state.get("detected_intent", "")
         user_id = state.get("user_id", "")
@@ -304,7 +364,7 @@ Rules:
                             from app.memory.memory_manager import memory_manager as _mm
                             inputs_summary = json.dumps(tool_input, default=str)[:300]
                             key_insight = summarized[:300]
-                            asyncio.create_task(
+                            _spawn_background(
                                 _mm.save_tool_outcome(
                                     user_id=user_id,
                                     agent_name=self.name,
@@ -312,7 +372,8 @@ Rules:
                                     inputs_summary=inputs_summary,
                                     outcome_quality="good",
                                     key_insight=key_insight,
-                                )
+                                ),
+                                f"save-tool-outcome-{self.name}-{tool_name}",
                             )
                         except Exception as _e:
                             logger.debug("Tool memory save skipped: %s", _e)

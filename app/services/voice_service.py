@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from typing import Any, AsyncGenerator, Dict, Optional
 import asyncio
 
@@ -14,6 +15,24 @@ import httpx
 from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+# Deepgram streaming input format. The single source of truth for the rate the
+# STT socket is opened with; the audio pipeline reads it so the two can never
+# disagree (mismatched rates transcribe as gibberish, not as an error).
+_STT_SAMPLE_RATE = 16000
+STT_SAMPLE_RATE = _STT_SAMPLE_RATE
+STT_CHANNELS = 1
+
+
+class TTSUnavailable(RuntimeError):
+    """Raised when speech synthesis cannot produce audio.
+
+    Distinct from a generic error so the voice worker can tell the user that
+    it *replied* but could not speak, instead of appearing to ignore them.
+    """
 
 
 class VoiceService:
@@ -123,12 +142,20 @@ class VoiceService:
             language="en",
             smart_format=True,
             punctuate=True,
-            interim_results=settings.deepgram_interim_results,
+            # UtteranceEnd and interim results are coupled: Deepgram only emits
+            # UtteranceEnd when interim_results is on, so this is forced rather
+            # than configurable. Turning it off silently disabled turn-taking.
+            interim_results=True,
             utterance_end_ms=str(settings.deepgram_utterance_end_ms),
             vad_events=settings.deepgram_vad_events,
+            # Endpointing makes Deepgram mark a final result `speech_final`
+            # after this much trailing silence. It is the fast path for turn
+            # detection: utterance_end_ms cannot go below 1000 ms, so relying on
+            # UtteranceEnd alone put a hard ~1 s floor on every single reply.
+            endpointing=settings.deepgram_endpointing_ms,
             encoding="linear16",
-            sample_rate=16000,
-            channels=1
+            sample_rate=_STT_SAMPLE_RATE,
+            channels=1,
         )
 
         return dg_connection, options
@@ -205,13 +232,23 @@ class VoiceService:
         voice_id: Optional[str] = None,
     ) -> AsyncGenerator[bytes, None]:
         """
-        Stream raw PCM S16LE audio chunks from Cartesia (24kHz mono).
+        Stream raw PCM S16LE audio chunks from Cartesia at ``cartesia_sample_rate``.
 
-        Yields bytes chunks as they arrive from Cartesia instead of waiting for
-        the full response — reduces time-to-first-audio from ~1-2s to ~200-400ms.
+        Yields bytes as they arrive rather than waiting for the full response,
+        which is what keeps time-to-first-audio in the few-hundred-millisecond
+        range instead of seconds.
+
+        Raises:
+            TTSUnavailable: TTS is not configured, or the provider call failed.
+                This is raised rather than swallowed because yielding nothing
+                is indistinguishable from the assistant having nothing to say —
+                the caller needs to be able to tell the user that voice output
+                broke instead of leaving them listening to silence.
         """
         if not settings.cartesia_api_key or settings.cartesia_api_key == "your_cartesia_api_key_here":
-            return
+            raise TTSUnavailable(
+                "Text-to-speech is not configured (set CARTESIA_API_KEY)."
+            )
 
         if not text or not text.strip():
             return
@@ -240,14 +277,24 @@ class VoiceService:
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=httpx.Timeout(5.0, read=30.0),
+                timeout=httpx.Timeout(3.0, read=20.0),
             ) as response:
-                response.raise_for_status()
-                async for chunk in response.aiter_bytes(chunk_size=8192):
+                if response.status_code >= 400:
+                    detail = (await response.aread())[:300].decode("utf-8", "replace")
+                    raise TTSUnavailable(
+                        f"Cartesia returned {response.status_code}: {detail}"
+                    )
+                # No chunk_size: hand every network packet straight through.
+                # Buffering to a fixed size (it was 8 KiB) held back ~170 ms of
+                # audio at 24 kHz before the first frame could ever be played.
+                async for chunk in response.aiter_bytes():
                     if chunk:
                         yield chunk
+        except (TTSUnavailable, asyncio.CancelledError):
+            raise
         except Exception as e:
-            print(f"[TTS Stream] Cartesia streaming failed: {e}")
+            logger.error("Cartesia TTS streaming failed: %s", e, exc_info=True)
+            raise TTSUnavailable(f"Cartesia synthesis failed: {e}") from e
 
     async def close(self):
         await self._client.aclose()

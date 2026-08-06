@@ -5,6 +5,7 @@ Returns a TaskEnvelope for structured coordination.
 from typing import Dict, Any
 from app.agents.base_agent import BaseAgent
 from app.agents.state import make_envelope
+from app.auth.models import Scope
 from app.tools.email_draft_tool import email_draft_tool
 from app.memory.memory_manager import memory_manager
 from app.services.email_sender_service import email_sender_service
@@ -193,6 +194,7 @@ class EmailAgent(BaseAgent):
                     "Args: query (str), tone (str: professional/casual/formal), recipient_name (str)."
                 ),
                 "callable": tool_email_draft,
+                "scope": Scope.EMAIL_DRAFT.value,
             },
             "send_email": {
                 "description": (
@@ -202,6 +204,8 @@ class EmailAgent(BaseAgent):
                     "subject (str), body (str), draft_id (str, optional), cc (str, optional)."
                 ),
                 "callable": tool_send_email,
+                # Delivers real mail from the owner's account — owner only.
+                "scope": Scope.EMAIL_SEND.value,
             },
             "save_draft": {
                 "description": (
@@ -210,10 +214,12 @@ class EmailAgent(BaseAgent):
                     "greeting (str), closing (str), signature (str), context (dict)."
                 ),
                 "callable": tool_save_draft,
+                "scope": Scope.EMAIL_DRAFT.value,
             },
             "list_drafts": {
                 "description": "List previously saved email drafts. Args: limit (int, default 5).",
                 "callable": tool_list_drafts,
+                "scope": Scope.EMAIL_DRAFT.value,
             },
             "save_template": {
                 "description": (
@@ -222,10 +228,12 @@ class EmailAgent(BaseAgent):
                     "tone (str), placeholders (list of str)."
                 ),
                 "callable": tool_save_template,
+                "scope": Scope.EMAIL_DRAFT.value,
             },
             "list_templates": {
                 "description": "List saved email templates. Args: name (str, optional filter).",
                 "callable": tool_list_templates,
+                "scope": Scope.EMAIL_DRAFT.value,
             },
         }
 

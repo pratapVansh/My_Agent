@@ -2,7 +2,7 @@
 PostgreSQL Database Models for Short-term Memory.
 Stores chat history, attendance, timetable, email drafts/templates, and exams.
 """
-from sqlalchemy import Column, String, DateTime, Integer, Text, Boolean, Date, Time, Float, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, Integer, Text, Boolean, Date, Time, Float, UniqueConstraint, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
@@ -14,6 +14,11 @@ Base = declarative_base()
 class ChatHistory(Base):
     """Chat conversation history."""
     __tablename__ = "chat_history"
+    # Every read filters on user_id + session_id and orders by created_at;
+    # a composite index matches that access pattern directly.
+    __table_args__ = (
+        Index("ix_chat_history_user_session_time", "user_id", "session_id", "created_at"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(String(255), nullable=False, index=True)
@@ -27,6 +32,12 @@ class ChatHistory(Base):
 class Attendance(Base):
     """Attendance records."""
     __tablename__ = "attendance"
+    # One record per (user, day, subject). Re-running a scrape must update the
+    # existing row rather than append a duplicate — duplicates inflate the
+    # denominator and corrupt the attendance-percentage risk calculation.
+    __table_args__ = (
+        UniqueConstraint("user_id", "date", "subject", name="uq_attendance_user_date_subject"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(String(255), nullable=False, index=True)
@@ -57,6 +68,11 @@ class Timetable(Base):
 class JobBookmark(Base):
     """Saved/bookmarked job listings per user."""
     __tablename__ = "job_bookmarks"
+    # Makes "already bookmarked" a database invariant instead of a
+    # check-then-insert race between concurrent tool calls.
+    __table_args__ = (
+        UniqueConstraint("user_id", "url", name="uq_job_bookmark_user_url"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(String(255), nullable=False, index=True)

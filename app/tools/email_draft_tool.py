@@ -4,6 +4,7 @@ Generates personalized email drafts and never sends them.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List
 import logging
 
@@ -66,8 +67,10 @@ class EmailDraftTool:
             )
             raw_output = response.get("content", "")
             parsed = self._safe_parse_json(raw_output, fallback=parsed)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(
+                "Email draft generation failed for user=%s: %s", user_id, e, exc_info=True
+            )
 
         return {
             "tool": "email_draft",
@@ -83,29 +86,41 @@ class EmailDraftTool:
         }
 
     async def _retrieve_rag_context(self, user_id: str, query: str) -> str:
-        """Retrieve and format long-term memory context as plain text for prompting."""
+        """Retrieve and format memory context as plain text for prompting."""
         try:
-            logger.info("Email RAG retrieval started for user_id=%s", user_id)
+            logger.debug("Email RAG retrieval started for user_id=%s", user_id)
 
-            long_term = await memory_manager.long_term.search_all(
-                user_id=user_id,
-                query=query,
-                limit=5,
+            # Profile facts are fetched alongside vector context: they hold the
+            # user's name and explicit preferences (e.g. preferred_tone), which
+            # are exactly what a personalised draft needs and were previously
+            # hardcoded out of this prompt.
+            long_term, profile_facts = await asyncio.gather(
+                memory_manager.search_long_term(user_id=user_id, query=query, limit=5),
+                memory_manager.get_profile_facts(user_id=user_id),
+                return_exceptions=True,
             )
+
+            if isinstance(long_term, BaseException):
+                logger.warning("Email RAG vector lookup failed for user=%s: %s", user_id, long_term)
+                long_term = {}
+            if isinstance(profile_facts, BaseException):
+                logger.warning("Email RAG profile lookup failed for user=%s: %s", user_id, profile_facts)
+                profile_facts = []
 
             context_text = memory_manager.format_context_for_prompt(
                 {
                     "chat_history": [],
                     "preferences": [],
+                    "profile_facts": profile_facts,
                     "long_term": long_term,
                 }
             ).strip()
 
             if not context_text:
-                logger.info("Email RAG retrieval completed with empty context for user_id=%s", user_id)
+                logger.debug("Email RAG retrieval completed with empty context for user_id=%s", user_id)
                 return ""
 
-            logger.info(
+            logger.debug(
                 "Email RAG retrieval completed for user_id=%s with %s chars",
                 user_id,
                 len(context_text),

@@ -54,9 +54,9 @@ class SmartMemory:
         # Initialize mem0
         try:
             self.memory = Memory.from_config(config)
-            print("✓ Smart memory initialized with Cohere embeddings")
+            logger.info("Smart memory initialized (mem0 + Qdrant)")
         except Exception as e:
-            print(f"WARNING: Smart memory initialization warning: {str(e)}")
+            logger.warning("Smart memory initialization failed, disabling mem0: %s", e)
             # Disable smart memory if mem0 setup fails. Avoid default mem0 fallback,
             # which can instantiate OpenAI embeddings and require OPENAI_API_KEY.
             self.memory = None
@@ -113,7 +113,13 @@ class SmartMemory:
             )
             return point_id
         except Exception as e:
-            print(f"Smart memory upsert error: {str(e)}")
+            # Surfaced at error level (not swallowed silently): a failure here
+            # means this turn is permanently absent from semantic memory while
+            # the Postgres copy succeeded, so operators need to see the drift.
+            logger.error(
+                "Smart memory upsert failed for user=%s (%d chars): %s",
+                user_id, len(text), e, exc_info=True,
+            )
             return None
 
     async def extract_and_store(
@@ -150,8 +156,10 @@ class SmartMemory:
             return memory_ids
 
         except Exception as e:
-            # Silent fail for memory extraction errors
-            print(f"Smart memory extraction error: {str(e)}")
+            # Non-fatal for the turn, but must stay visible in logs.
+            logger.error(
+                "Smart memory extraction failed for user=%s: %s", user_id, e, exc_info=True
+            )
             return []
 
     async def add_preference(
@@ -179,7 +187,7 @@ class SmartMemory:
             )
 
         except Exception as e:
-            print(f"Smart memory add error: {str(e)}")
+            logger.error("Smart memory add failed for user=%s: %s", user_id, e, exc_info=True)
             return None
 
     async def retrieve_preferences(
@@ -244,7 +252,9 @@ class SmartMemory:
             ]
 
         except Exception as e:
-            print(f"Smart memory retrieval error: {str(e)}")
+            logger.error(
+                "Smart memory retrieval failed for user=%s: %s", user_id, e, exc_info=True
+            )
             return []
 
     async def get_summary(self, user_id: str) -> str:
@@ -274,7 +284,7 @@ class SmartMemory:
             return "\n".join(summary_parts) if summary_parts else ""
 
         except Exception as e:
-            print(f"Smart memory summary error: {str(e)}")
+            logger.error("Smart memory summary failed for user=%s: %s", user_id, e, exc_info=True)
             return ""
 
     async def delete_memory(self, user_id: str, memory_id: str) -> bool:
@@ -291,10 +301,12 @@ class SmartMemory:
         try:
             # Scroll all points for this user and check ownership before deleting.
             # This prevents one user from deleting another user's memories.
+            # Ownership check walks every point for this user (the scroll cursor
+            # is followed to exhaustion), so a memory beyond the first page is
+            # still recognised as owned rather than reported "not found".
             points = await self.qdrant.scroll_collection(
                 collection_name=self.collection_name,
                 filter_conditions={"user_id": user_id},
-                limit=1000,
             )
             owned_ids = {p["id"] for p in points}
             if memory_id not in owned_ids:
@@ -324,27 +336,18 @@ class SmartMemory:
             True if all points deleted (or none existed), False on error
         """
         try:
-            points = await self.qdrant.scroll_collection(
+            # Delete server-side by filter rather than scroll-then-delete-by-id.
+            # A scroll-based erasure is bounded by however many points one walk
+            # returns, which can silently leave data behind on a right-to-erasure
+            # request; a filtered delete has no such ceiling.
+            await self.qdrant.delete_by_filter(
                 collection_name=self.collection_name,
                 filter_conditions={"user_id": user_id},
-                limit=1000,
             )
-            if not points:
-                logger.info("reset_user_memories: no memories found for user=%s", user_id)
-                return True
-
-            point_ids = [p["id"] for p in points]
-            await self.qdrant.delete_points(
-                collection_name=self.collection_name,
-                point_ids=point_ids,
-            )
-            logger.info(
-                "reset_user_memories: deleted %d memory points for user=%s",
-                len(point_ids), user_id,
-            )
+            logger.info("reset_user_memories: erased all memory points for user=%s", user_id)
             return True
         except Exception as e:
-            logger.error("Smart memory reset error for user=%s: %s", user_id, e)
+            logger.error("Smart memory reset error for user=%s: %s", user_id, e, exc_info=True)
             return False
 
 

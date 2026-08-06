@@ -2,7 +2,7 @@
 State schema for LangGraph workflow.
 Defines the structure of data flowing through the multi-agent system.
 """
-from typing import TypedDict, Optional, List, Dict, Any
+from typing import TypedDict, Optional, List, Dict, Any, FrozenSet
 import uuid
 
 
@@ -59,6 +59,12 @@ class AgentState(TypedDict):
     user_id: Optional[str]
     session_id: Optional[str]
     output_mode: Optional[str]
+
+    # Authorization: capabilities of the authenticated caller, propagated from
+    # the verified JWT. Specialist agents filter their tool registries against
+    # this, so a restricted caller cannot reach privileged tools through
+    # conversation. None means "unrestricted" (internal/CLI invocation).
+    scopes: Optional[FrozenSet[str]]
 
     # Memory context
     memory_context: Optional[Dict[str, Any]]

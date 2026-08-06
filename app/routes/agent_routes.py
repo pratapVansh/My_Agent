@@ -3,10 +3,13 @@ API routes for multi-agent system.
 REST handles normal operations, while WebSocket is reserved for response streaming.
 """
 import asyncio
+import logging
 import re
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Query
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+from app.config import settings
 from app.agents.workflow import run_workflow
 from app.agents.streaming_workflow import run_streaming_workflow
 from app.tools.job_search_tool import job_search_tool
@@ -15,69 +18,79 @@ from app.tools.attendance_tool import attendance_tool
 from app.tools.timetable_tool import timetable_tool, TimetableInput
 from app.tools.timetable_pdf_parser import timetable_pdf_parser
 from app.memory.memory_manager import memory_manager
+from app.services.url_guard import UnsafeURLError
+from app.auth.dependencies import (
+    authenticate_websocket,
+    require_owner,
+    require_scope,
+    resolve_user_id,
+)
+from app.auth.models import Principal, Scope
 from PyPDF2 import PdfReader
 import io
 
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
-# ── Fix 9: User Data Isolation ───────────────────────────────────────────────
-# Validates and normalizes any user_id before it reaches memory or Qdrant.
-# Without this, a client could pass another user's id and read their data.
-
-_SAFE_USER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_\-\.]{1,126}[a-z0-9]$")
-
-
-def _sanitize_user_id(raw: str) -> str:
+def internal_error(message: str, exc: Exception, **context) -> HTTPException:
     """
-    Normalize user_id to lowercase and strip whitespace.
-    Returns the sanitized string; callers must still call _assert_safe_user_id.
+    Log an exception server-side and return a safe 500 for the client.
+
+    Raw exception text can carry connection strings, hostnames, file paths, and
+    library internals, so it is logged rather than returned. An error_id ties
+    the client-visible response back to the log line.
     """
-    return (raw or "").strip().lower()
+    error_id = uuid.uuid4().hex[:12]
+    logger.error(
+        "%s [error_id=%s]%s: %s",
+        message,
+        error_id,
+        "".join(f" {k}={v}" for k, v in context.items()),
+        exc,
+        exc_info=True,
+    )
+    detail: Dict[str, Any] = {"message": message, "error_id": error_id}
+    if settings.is_development:
+        detail["debug"] = str(exc)
+    return HTTPException(status_code=500, detail=detail)
 
 
-def _assert_safe_user_id(user_id: str) -> str:
+async def read_upload_within_limit(file: UploadFile) -> bytes:
     """
-    Validate a normalized user_id against a strict allowlist pattern.
-    Rejects:
-      - Empty strings
-      - Strings shorter than 3 chars (too easy to enumerate)
-      - Strings longer than 128 chars
-      - Any character outside [a-z0-9_\\-.] (prevents path traversal, SQL fragments, etc.)
-      - Double dots or slashes (explicit traversal guard)
-    Raises HTTP 400 on invalid input — NOT 403, because it's a bad request,
-    not an authorization failure (no auth system exists yet).
+    Read an uploaded file, aborting once it exceeds the configured cap.
+
+    Streams in chunks rather than calling file.read() outright: an unbounded
+    read pulls the whole body into memory before any size check can reject it.
     """
-    if not user_id or len(user_id) < 3:
-        raise HTTPException(
-            status_code=400,
-            detail="user_id must be at least 3 characters.",
-        )
-    if len(user_id) > 128:
-        raise HTTPException(
-            status_code=400,
-            detail="user_id must not exceed 128 characters.",
-        )
-    if ".." in user_id or "/" in user_id or "\\" in user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="user_id contains invalid characters.",
-        )
-    if not _SAFE_USER_ID_RE.match(user_id):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "user_id may only contain lowercase letters, digits, "
-                "hyphens, underscores, and dots."
-            ),
-        )
-    return user_id
+    max_bytes = settings.max_upload_bytes
+    chunks: List[bytes] = []
+    total = 0
+
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File is too large. Maximum upload size is "
+                    f"{max_bytes // (1024 * 1024)} MB."
+                ),
+            )
+        chunks.append(chunk)
+
+    return b"".join(chunks)
 
 
-def safe_user_id(raw_id: str) -> str:
-    """Convenience: sanitize then assert. Returns the clean user_id or raises HTTP 400."""
-    return _assert_safe_user_id(_sanitize_user_id(raw_id))
+# User isolation is now enforced by authentication, not by string validation:
+# identity comes from the verified JWT (app/auth/dependencies.resolve_user_id),
+# and the only operator-supplied identity — OWNER_USER_ID — is format-checked
+# at startup by Settings.validate_auth_config().
 
 
 class Message(BaseModel):
@@ -88,8 +101,13 @@ class Message(BaseModel):
 
 class AgentRequest(BaseModel):
     """Request model for agent query."""
-    query: str = Field(..., description="User's query", min_length=1)
-    user_id: str = Field(..., min_length=1, description="Stable user identifier")
+    query: str = Field(..., description="User's query", min_length=1, max_length=8000)
+    # Retained for wire compatibility only. Identity comes from the verified
+    # access token; supplying a different value here is rejected with 403.
+    user_id: Optional[str] = Field(
+        default=None,
+        description="Deprecated and ignored — identity is taken from your session.",
+    )
     session_id: Optional[str] = Field(
         default=None,
         description="Session identifier (generated if not provided)"
@@ -115,22 +133,22 @@ class AgentResponse(BaseModel):
 
 
 class JobSearchRequest(BaseModel):
-    user_id: str = Field(..., description="User identifier")
-    query: str = Field(..., min_length=1, description="Job search query")
+    user_id: Optional[str] = Field(default=None, description="Deprecated and ignored")
+    query: str = Field(..., min_length=1, max_length=2000, description="Job search query")
     location: Optional[str] = Field(default=None, description="Optional location")
     max_results: int = Field(default=10, ge=1, le=25)
     min_score: float = Field(default=0.2, ge=0.0, le=1.0)
 
 
 class EmailDraftRequest(BaseModel):
-    user_id: str = Field(..., description="User identifier")
-    query: str = Field(..., min_length=1, description="Email draft request")
+    user_id: Optional[str] = Field(default=None, description="Deprecated and ignored")
+    query: str = Field(..., min_length=1, max_length=4000, description="Email draft request")
     tone: str = Field(default="professional", description="Email tone")
     recipient_name: Optional[str] = Field(default="", description="Recipient name")
 
 
 class AttendanceScrapeRequest(BaseModel):
-    user_id: str = Field(..., description="User identifier")
+    user_id: Optional[str] = Field(default=None, description="Deprecated and ignored")
     erp_url: str = Field(..., min_length=1, description="ERP login URL")
     username: str = Field(..., min_length=1, description="ERP username")
     password: str = Field(..., min_length=1, description="ERP password")
@@ -151,41 +169,21 @@ class TimetableEntryRequest(BaseModel):
 
 
 class TimetableStoreRequest(BaseModel):
-    user_id: str = Field(..., description="User identifier")
-    entries: List[TimetableEntryRequest] = Field(..., min_length=1)
+    user_id: Optional[str] = Field(default=None, description="Deprecated and ignored")
+    entries: List[TimetableEntryRequest] = Field(..., min_length=1, max_length=500)
 
 
 class TimetableSuggestRequest(BaseModel):
-    user_id: str = Field(..., description="User identifier")
+    user_id: Optional[str] = Field(default=None, description="Deprecated and ignored")
     day_of_week: Optional[int] = Field(default=None, ge=0, le=6)
     low_attendance_threshold: float = Field(default=75.0, ge=0.0, le=100.0)
 
 
-def _chunk_text(text: str, chunk_size: int = 140) -> List[str]:
-    """Split long responses into chunks for low-latency WebSocket delivery."""
-    if not text:
-        return []
-
-    words = text.split()
-    chunks: List[str] = []
-    current: List[str] = []
-
-    for word in words:
-        tentative = " ".join(current + [word])
-        if len(tentative) > chunk_size and current:
-            chunks.append(" ".join(current))
-            current = [word]
-        else:
-            current.append(word)
-
-    if current:
-        chunks.append(" ".join(current))
-
-    return chunks
-
-
 @router.post("/query", response_model=AgentResponse)
-async def agent_query(request: AgentRequest):
+async def agent_query(
+    request: AgentRequest,
+    principal: Principal = Depends(require_scope(Scope.CHAT)),
+):
     """
     Process a user query through the multi-agent system with memory.
 
@@ -199,8 +197,11 @@ async def agent_query(request: AgentRequest):
     Returns structured response with display and speech versions.
     """
     try:
-        user_id = safe_user_id(request.user_id)
-        print("QUERY user_id:", user_id)
+        # Identity comes from the verified token; a conflicting body value 403s.
+        user_id = resolve_user_id(principal, request.user_id)
+        logger.info(
+            "Agent query received for user=%s role=%s", user_id, principal.role.value
+        )
 
         # Convert conversation history to dict format
         history = None
@@ -210,13 +211,16 @@ async def agent_query(request: AgentRequest):
                 for msg in request.conversation_history
             ]
 
-        # Run workflow with memory integration
+        # Run workflow with memory integration. Scopes travel with the request
+        # so specialist agents can filter their own tools — without this a
+        # guest's chat could still reach owner-only tools such as send_email.
         result = await run_workflow(
             user_input=request.query,
             user_id=user_id,
             session_id=request.session_id,
             conversation_history=history,
-            output_mode=request.output_mode
+            output_mode=request.output_mode,
+            scopes=principal.scopes,
         )
 
         # Extract response
@@ -243,11 +247,10 @@ async def agent_query(request: AgentRequest):
             metadata=metadata
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agent execution failed: {str(e)}"
-        )
+        raise internal_error("Agent execution failed", e, user_id=principal.user_id)
 
 
 @router.get("/agents")
@@ -295,54 +298,85 @@ async def list_agents():
 
 
 @router.post("/tools/job-search")
-async def job_search(request: JobSearchRequest):
+async def job_search(
+    request: JobSearchRequest,
+    principal: Principal = Depends(require_scope(Scope.JOBS_SEARCH)),
+):
     """Search jobs using Tavily, then filter/rank with memory personalization."""
     try:
         result = await job_search_tool.search_jobs(
-            user_id=request.user_id,
+            user_id=resolve_user_id(principal, request.user_id),
             query=request.query,
             location=request.location,
             max_results=request.max_results,
             min_score=request.min_score,
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Job search failed: {str(e)}")
+        raise internal_error("Job search failed", e, user_id=principal.user_id)
 
 
 @router.post("/tools/email-draft")
-async def email_draft(request: EmailDraftRequest):
+async def email_draft(
+    request: EmailDraftRequest,
+    principal: Principal = Depends(require_scope(Scope.EMAIL_DRAFT)),
+):
     """Create a personalized email draft with RAG context. Draft only, never sent."""
     try:
         result = await email_draft_tool.draft_email(
-            user_id=request.user_id,
+            user_id=resolve_user_id(principal, request.user_id),
             query=request.query,
             tone=request.tone,
             recipient_name=request.recipient_name or "",
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Email draft failed: {str(e)}")
+        raise internal_error("Email draft failed", e, user_id=principal.user_id)
 
 
 @router.post("/tools/attendance/scrape")
-async def scrape_attendance(request: AttendanceScrapeRequest):
-    """Scrape attendance from ERP with Playwright and store in PostgreSQL."""
+async def scrape_attendance(
+    request: AttendanceScrapeRequest,
+    principal: Principal = Depends(require_scope(Scope.TOOLS_SCRAPE)),
+):
+    """
+    Scrape attendance from an ERP portal with Playwright and store in PostgreSQL.
+
+    The target URL is validated against the SSRF guard before any request is
+    made, so this endpoint cannot be used to reach internal services or cloud
+    metadata endpoints on the server's behalf.
+    """
+    user_id = resolve_user_id(principal, request.user_id)
     try:
         result = await attendance_tool.scrape_and_store(
-            user_id=request.user_id,
+            user_id=user_id,
             erp_url=request.erp_url,
             username=request.username,
             password=request.password,
             selectors=request.selectors,
         )
         return result
+    except UnsafeURLError as e:
+        # Client error, not a server fault — and the message is safe to return.
+        logger.warning("Blocked attendance scrape for user=%s: %s", user_id, e)
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Attendance scrape failed: {str(e)}")
+        # Never interpolate the exception here: this call site holds ERP
+        # credentials, and a driver error can echo request context back.
+        raise internal_error("Attendance scrape failed", e, user_id=user_id)
 
 
 @router.post("/tools/timetable/store")
-async def store_timetable(request: TimetableStoreRequest):
+async def store_timetable(
+    request: TimetableStoreRequest,
+    principal: Principal = Depends(require_scope(Scope.TIMETABLE_WRITE)),
+):
     """Store user-input timetable entries in PostgreSQL."""
     try:
         entries = [
@@ -357,34 +391,44 @@ async def store_timetable(request: TimetableStoreRequest):
             )
             for e in request.entries
         ]
-        result = await timetable_tool.store_timetable(user_id=request.user_id, entries=entries)
+        result = await timetable_tool.store_timetable(
+            user_id=resolve_user_id(principal, request.user_id), entries=entries
+        )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Timetable store failed: {str(e)}")
+        raise internal_error("Timetable store failed", e, user_id=principal.user_id)
 
 
 @router.post("/tools/timetable/suggest")
-async def suggest_classes(request: TimetableSuggestRequest):
+async def suggest_classes(
+    request: TimetableSuggestRequest,
+    principal: Principal = Depends(require_scope(Scope.TIMETABLE_READ)),
+):
     """Suggest classes prioritized by low attendance and timetable schedule."""
     try:
         result = await timetable_tool.suggest_classes(
-            user_id=request.user_id,
+            user_id=resolve_user_id(principal, request.user_id),
             day_of_week=request.day_of_week,
             low_attendance_threshold=request.low_attendance_threshold,
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Timetable suggestion failed: {str(e)}")
+        raise internal_error("Timetable suggestion failed", e, user_id=principal.user_id)
 
 
 @router.post("/tools/timetable/upload-pdf")
 async def upload_timetable_pdf(
-    user_id: str = Form(..., description="Your user identifier"),
+    user_id: Optional[str] = Form(default=None, description="Deprecated and ignored"),
     clear_existing: bool = Form(
         default=True,
         description="If true, deactivates your old timetable before storing the new one"
     ),
     file: UploadFile = File(..., description="PDF file of your semester timetable"),
+    principal: Principal = Depends(require_scope(Scope.TIMETABLE_WRITE)),
 ):
     """
     Upload a PDF timetable for the current semester.
@@ -399,11 +443,11 @@ async def upload_timetable_pdf(
     Upload a new PDF any time your timetable changes — the old one is safely
     soft-deleted (not permanently removed) before the new one is stored.
     """
-    if not file.filename.lower().endswith(".pdf"):
+    if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    user_id = safe_user_id(user_id)
-    pdf_bytes = await file.read()
+    user_id = resolve_user_id(principal, user_id)
+    pdf_bytes = await read_upload_within_limit(file)
 
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
@@ -453,9 +497,10 @@ async def upload_timetable_pdf(
 
 @router.post("/memory/upload-pdf")
 async def upload_pdf_document(
-    user_id: str = Form(...),
+    user_id: Optional[str] = Form(default=None, description="Deprecated and ignored"),
     document_type: str = Form(default="general"),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_scope(Scope.MEMORY_WRITE)),
 ):
     """
     Upload a PDF document to user's long-term memory.
@@ -472,15 +517,15 @@ async def upload_pdf_document(
         Document ID and storage confirmation
     """
     try:
-        user_id = safe_user_id(user_id)
-        print("UPLOAD user_id:", user_id)
+        user_id = resolve_user_id(principal, user_id)
+        logger.info("Document upload started for user=%s file=%s", user_id, file.filename)
 
         # Validate file type
-        if not file.filename.lower().endswith('.pdf'):
+        if not (file.filename or "").lower().endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-        # Read PDF content
-        content = await file.read()
+        # Read PDF content, rejecting oversized uploads before buffering them
+        content = await read_upload_within_limit(file)
 
         # Extract text from PDF
         try:
@@ -497,8 +542,14 @@ async def upload_pdf_document(
             if not full_text.strip():
                 raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
 
+        except HTTPException:
+            raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to extract text from PDF: {str(e)}")
+            logger.warning("PDF text extraction failed for user=%s: %s", user_id, e)
+            raise HTTPException(
+                status_code=400,
+                detail="Could not read this PDF. It may be encrypted, corrupted, or image-only.",
+            )
 
         # Store in long-term memory
         metadata = {
@@ -527,15 +578,16 @@ async def upload_pdf_document(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF upload failed: {str(e)}")
+        raise internal_error("PDF upload failed", e, user_id=user_id)
 
 
 @router.post("/memory/upload-text")
 async def upload_text_document(
-    user_id: str = Form(...),
+    user_id: Optional[str] = Form(default=None, description="Deprecated and ignored"),
     document_type: str = Form(default="general"),
     text_content: str = Form(...),
-    document_name: str = Form(default="untitled")
+    document_name: str = Form(default="untitled"),
+    principal: Principal = Depends(require_scope(Scope.MEMORY_WRITE)),
 ):
     """
     Upload plain text to user's long-term memory.
@@ -552,11 +604,20 @@ async def upload_text_document(
         Document ID and storage confirmation
     """
     try:
-        user_id = safe_user_id(user_id)
-        print("UPLOAD user_id:", user_id)
+        user_id = resolve_user_id(principal, user_id)
+        logger.info("Text upload started for user=%s name=%s", user_id, document_name)
 
         if not text_content.strip():
             raise HTTPException(status_code=400, detail="Text content cannot be empty")
+
+        if len(text_content) > settings.max_text_upload_chars:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Text is too long. Maximum is "
+                    f"{settings.max_text_upload_chars:,} characters."
+                ),
+            )
 
         metadata = {
             "document_name": document_name,
@@ -582,34 +643,59 @@ async def upload_text_document(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Text upload failed: {str(e)}")
+        raise internal_error("Text upload failed", e, user_id=user_id)
 
 
 class ProfileFactRequest(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    key: str = Field(..., min_length=1, description="Fact key, e.g. 'preferred_tone'")
-    value: str = Field(..., min_length=1)
+    user_id: Optional[str] = Field(default=None, description="Deprecated and ignored")
+    key: str = Field(..., min_length=1, max_length=255, description="Fact key, e.g. 'preferred_tone'")
+    value: str = Field(..., min_length=1, max_length=4000)
     source: str = Field(default="explicit", description="explicit | inferred")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     consent_level: str = Field(default="explicit")
 
 
 @router.get("/memory/profile/{user_id}")
-async def list_profile_facts(user_id: str, key: Optional[str] = None):
-    """List all profile facts for a user, optionally filtered by key."""
+async def list_profile_facts(
+    user_id: str,
+    key: Optional[str] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_scope(Scope.PROFILE_READ)),
+):
+    """
+    List profile facts for the authenticated user. Paginated.
+
+    The path segment is kept for URL compatibility but is not an identity
+    source — requesting someone else's id returns 403.
+    """
     try:
-        user_id = safe_user_id(user_id)
+        user_id = resolve_user_id(principal, user_id)
         facts = await memory_manager.get_profile_facts(user_id=user_id, key=key)
-        return {"success": True, "user_id": user_id, "count": len(facts), "facts": facts}
+        page = facts[offset:offset + limit]
+        return {
+            "success": True,
+            "user_id": user_id,
+            "count": len(page),
+            "total": len(facts),
+            "limit": limit,
+            "offset": offset,
+            "facts": page,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error("Could not load profile facts", e, user_id=user_id)
 
 
 @router.post("/memory/profile")
-async def save_profile_fact(request: ProfileFactRequest):
+async def save_profile_fact(
+    request: ProfileFactRequest,
+    principal: Principal = Depends(require_scope(Scope.PROFILE_WRITE)),
+):
     """Save or update a user profile fact (upserts on key)."""
     try:
-        user_id = safe_user_id(request.user_id)
+        user_id = resolve_user_id(principal, request.user_id)
         record_id = await memory_manager.save_profile_fact(
             user_id=user_id,
             key=request.key.strip().lower(),
@@ -618,16 +704,30 @@ async def save_profile_fact(request: ProfileFactRequest):
             confidence=request.confidence,
             consent_level=request.consent_level,
         )
+        if not record_id:
+            # save_profile_fact returns "" when the value is rejected as
+            # credential-shaped or fails the inferred-confidence policy.
+            return {
+                "success": False,
+                "key": request.key,
+                "message": "This value was not stored (it looks like sensitive credential data).",
+            }
         return {"success": True, "id": record_id, "key": request.key, "value": request.value}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error("Could not save profile fact", e, user_id=principal.user_id)
 
 
 @router.delete("/memory/profile/{user_id}/{key}")
-async def forget_profile_fact(user_id: str, key: str):
+async def forget_profile_fact(
+    user_id: str,
+    key: str,
+    principal: Principal = Depends(require_scope(Scope.PROFILE_WRITE)),
+):
     """Delete a single profile fact by key."""
     try:
-        user_id = safe_user_id(user_id)
+        user_id = resolve_user_id(principal, user_id)
         deleted = await memory_manager.forget_profile_fact(user_id=user_id, key=key)
         if not deleted:
             raise HTTPException(status_code=404, detail=f"No profile fact found for key '{key}'")
@@ -635,29 +735,47 @@ async def forget_profile_fact(user_id: str, key: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error("Could not delete profile fact", e, user_id=user_id, key=key)
 
 
 @router.delete("/memory/profile/{user_id}")
-async def forget_all_profile(user_id: str):
+async def forget_all_profile(
+    user_id: str,
+    principal: Principal = Depends(require_scope(Scope.PROFILE_WRITE)),
+):
     """Delete ALL profile facts for a user."""
     try:
-        user_id = safe_user_id(user_id)
+        user_id = resolve_user_id(principal, user_id)
         count = await memory_manager.forget_all_profile(user_id=user_id)
+        logger.info("Erased all profile facts for user=%s (count=%d)", user_id, count)
         return {"success": True, "deleted_count": count}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error("Could not delete profile facts", e, user_id=user_id)
 
 
 @router.get("/memory/episodes/{user_id}")
-async def get_episodes(user_id: str, limit: int = 10):
-    """Return recent episodic memory entries for a user."""
+async def get_episodes(
+    user_id: str,
+    limit: int = Query(default=10, ge=1, le=100),
+    principal: Principal = Depends(require_scope(Scope.PROFILE_READ)),
+):
+    """Return recent episodic memory entries for the authenticated user."""
     try:
-        user_id = safe_user_id(user_id)
+        user_id = resolve_user_id(principal, user_id)
         episodes = await memory_manager.get_recent_episodes(user_id=user_id, limit=limit)
-        return {"success": True, "user_id": user_id, "count": len(episodes), "episodes": episodes}
+        return {
+            "success": True,
+            "user_id": user_id,
+            "count": len(episodes),
+            "limit": limit,
+            "episodes": episodes,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error("Could not load episodes", e, user_id=user_id)
 
 
 # ── M5: Agent Playbook endpoints ────────────────────────────────────────────
@@ -671,8 +789,16 @@ class PlaybookSaveRequest(BaseModel):
 
 
 @router.post("/memory/playbooks")
-async def save_playbook(request: PlaybookSaveRequest):
-    """Save a versioned system prompt for an agent (M5)."""
+async def save_playbook(
+    request: PlaybookSaveRequest,
+    principal: Principal = Depends(require_owner),
+):
+    """
+    Save a versioned system prompt for an agent (M5).
+
+    Playbooks are global rather than per-user — they change how the assistant
+    behaves for everyone — so this is restricted to the owner.
+    """
     try:
         playbook_id = await memory_manager.save_playbook(
             agent_name=request.agent_name.strip().lower(),
@@ -688,22 +814,40 @@ async def save_playbook(request: PlaybookSaveRequest):
             "version": request.version,
             "is_active": request.set_active,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error("Could not save playbook", e, agent_name=request.agent_name)
 
 
 @router.get("/memory/playbooks")
-async def list_playbooks(agent_name: Optional[str] = None):
-    """List all playbook versions, optionally filtered by agent name."""
+async def list_playbooks(
+    agent_name: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_owner),
+):
+    """List playbook versions, optionally filtered by agent name. Paginated."""
     try:
         playbooks = await memory_manager.list_playbooks(agent_name=agent_name)
-        return {"success": True, "count": len(playbooks), "playbooks": playbooks}
+        page = playbooks[offset:offset + limit]
+        return {
+            "success": True,
+            "count": len(page),
+            "total": len(playbooks),
+            "limit": limit,
+            "offset": offset,
+            "playbooks": page,
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error("Could not list playbooks", e, agent_name=agent_name)
 
 
 @router.get("/memory/playbooks/{agent_name}/active")
-async def get_active_playbook(agent_name: str):
+async def get_active_playbook(
+    agent_name: str,
+    principal: Principal = Depends(require_owner),
+):
     """Return the currently active prompt for a given agent."""
     try:
         playbook = await memory_manager.get_active_playbook(agent_name=agent_name.strip().lower())
@@ -711,7 +855,7 @@ async def get_active_playbook(agent_name: str):
             return {"success": True, "found": False, "message": f"No active playbook for '{agent_name}'. Agent uses its default hard-coded prompt."}
         return {"success": True, "found": True, "playbook": playbook}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error("Could not load playbook", e, agent_name=agent_name)
 
 
 @router.websocket("/stream")
@@ -739,6 +883,26 @@ async def stream_response(websocket: WebSocket):
       {"type": "display_chunk", "index": N, "text": "<token>"}  ← live, many frames
       {"type": "final",         "display_text": "...", "speech_text": "...", "success": bool}
     """
+    # CORS middleware does not apply to WebSocket upgrades, so the Origin check
+    # has to happen here or any site could open this socket from a browser.
+    # It also serves as this endpoint's CSRF defence, since a WebSocket cannot
+    # carry a custom header from the browser.
+    origin = websocket.headers.get("origin")
+    if origin and origin not in settings.allowed_origins:
+        logger.warning("Rejected WebSocket connection from disallowed origin: %s", origin)
+        await websocket.close(code=1008, reason="Origin not allowed")
+        return
+
+    # Authenticate during the handshake so an unauthenticated socket is never
+    # accepted in the first place.
+    principal = await authenticate_websocket(websocket)
+    if principal is None:
+        await websocket.close(code=1008, reason="Authentication required")
+        return
+    if not principal.has_scope(Scope.CHAT):
+        await websocket.close(code=1008, reason="Insufficient permissions")
+        return
+
     await websocket.accept()
 
     try:
@@ -755,9 +919,27 @@ async def stream_response(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "query is required"})
                 continue
 
-            if not payload.get("user_id"):
-                await websocket.send_json({"type": "error", "message": "user_id is required"})
+            if len(query) > settings.max_query_chars:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Query is too long (maximum {settings.max_query_chars:,} characters).",
+                })
                 continue
+
+            # Identity is fixed by the handshake token for the whole socket
+            # lifetime; anything the client sends in the frame is ignored.
+            claimed = payload.get("user_id")
+            if claimed and claimed.strip().lower() != principal.user_id.lower():
+                logger.warning(
+                    "WebSocket user_id mismatch: authenticated=%s claimed=%s",
+                    principal.user_id, claimed,
+                )
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "You cannot access another user's data.",
+                })
+                continue
+            ws_user_id = principal.user_id
 
             await websocket.send_json({"type": "ack", "success": True})
 
@@ -769,10 +951,11 @@ async def stream_response(websocket: WebSocket):
             try:
                 async for chunk in run_streaming_workflow(
                     user_input=query,
-                    user_id=payload["user_id"],
+                    user_id=ws_user_id,
                     session_id=payload.get("session_id"),
                     conversation_history=history,
                     output_mode=payload.get("output_mode", "user"),
+                    scopes=principal.scopes,
                 ):
                     chunk_type = chunk.get("type")
 
@@ -808,12 +991,20 @@ async def stream_response(websocket: WebSocket):
                         })
 
             except Exception as stream_err:
-                await websocket.send_json({"type": "error", "message": str(stream_err)})
+                logger.error("Streaming workflow failed: %s", stream_err, exc_info=True)
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Something went wrong while generating a response.",
+                })
 
     except WebSocketDisconnect:
         return
     except Exception as e:
+        logger.error("WebSocket session failed: %s", e, exc_info=True)
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.send_json({
+                "type": "error",
+                "message": "The connection encountered an error.",
+            })
         except Exception:
             pass

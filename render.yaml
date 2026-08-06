@@ -13,6 +13,30 @@ services:
         value: "10000"
       - key: ENVIRONMENT
         value: production
+      # Comma-separated list of origins allowed to call this API from a browser.
+      # Must be set to the deployed frontend URL — otherwise CORS falls back to
+      # the localhost defaults and blocks the real frontend.
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # ── Authentication (all required) ──────────────────────────────────
+      # Generate with: python scripts/create_owner_password.py
+      # JWT secrets must be different from each other and 32+ chars.
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: OWNER_USERNAME
+        sync: false
+      - key: OWNER_PASSWORD_HASH
+        sync: false
+      - key: OWNER_USER_ID
+        value: vansh
+      # Frontend is served from a different host, so cookies must be
+      # SameSite=None, which browsers only accept alongside Secure.
+      - key: AUTH_COOKIE_SECURE
+        value: "true"
+      - key: AUTH_COOKIE_SAMESITE
+        value: none
       - key: POSTGRES_HOST
         fromDatabase:
           name: my-agent-postgres
