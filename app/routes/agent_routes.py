@@ -18,6 +18,7 @@ from app.tools.attendance_tool import attendance_tool
 from app.tools.timetable_tool import timetable_tool, TimetableInput
 from app.tools.timetable_pdf_parser import timetable_pdf_parser
 from app.memory.memory_manager import memory_manager
+from app.domain.academic import academic_repository
 from app.services.url_guard import UnsafeURLError
 from app.auth.dependencies import (
     authenticate_websocket,
@@ -214,13 +215,24 @@ async def agent_query(
         # Run workflow with memory integration. Scopes travel with the request
         # so specialist agents can filter their own tools — without this a
         # guest's chat could still reach owner-only tools such as send_email.
+        # A guest reads the owner's *public* memory rather than their own empty
+        # partition — the fix for the recruiter view being unable to discuss
+        # the very work it exists to present.
+        from app.memory.scope import resolve_retrieval_scope
+
+        scope = resolve_retrieval_scope(principal)
+
         result = await run_workflow(
             user_input=request.query,
+            # The caller always writes under their *own* identity. Only reads
+            # are redirected: a guest must never write into the owner's memory.
             user_id=user_id,
             session_id=request.session_id,
             conversation_history=history,
             output_mode=request.output_mode,
             scopes=principal.scopes,
+            memory_owner_id=scope.owner_id,
+            memory_visibilities=scope.visibilities,
         )
 
         # Extract response
@@ -472,7 +484,7 @@ async def upload_timetable_pdf(
     # Clear old timetable if requested
     cleared_count = 0
     if clear_existing:
-        cleared_count = await memory_manager.clear_timetable(user_id=user_id)
+        cleared_count = await academic_repository.clear_timetable(user_id=user_id)
 
     # Store all parsed entries
     entries = parse_result["entries"]
@@ -778,84 +790,405 @@ async def get_episodes(
         raise internal_error("Could not load episodes", e, user_id=user_id)
 
 
-# ── M5: Agent Playbook endpoints ────────────────────────────────────────────
+# ── Memory control plane (Phase 6) ──────────────────────────────────────────
+#
+# Browse, inspect, correct, and erase what the assistant remembers. A system
+# that forms memories automatically is only trustworthy if the user can see
+# what it concluded and overrule it — extraction is an LLM, and a wrong memory
+# is worse than a missing one.
+#
+# Reads are visibility-scoped through `resolve_retrieval_scope`, so a guest
+# reads the *owner's* public records rather than their own empty partition.
+# Every mutation is owner-only.
 
-class PlaybookSaveRequest(BaseModel):
-    agent_name: str = Field(..., description="Agent identifier: job|email|academic|profile|planner|response")
-    version: str = Field(..., min_length=1, description="Version label, e.g. 'v2' or '2024-04-01'")
-    prompt: str = Field(..., min_length=1, description="Full system prompt text")
-    notes: Optional[str] = Field(default=None, description="Changelog note")
-    set_active: bool = Field(default=True, description="Activate this version immediately")
+
+class MemoryRecordPatch(BaseModel):
+    """Fields the owner may correct on a stored memory."""
+
+    content: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    importance: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    pinned: Optional[bool] = Field(
+        default=None, description="Pinned memories never decay and are never dropped for budget."
+    )
+    visibility: Optional[str] = Field(
+        default=None, pattern="^(private|shared|public)$",
+        description="Marking a record public makes it readable in the recruiter view.",
+    )
 
 
-@router.post("/memory/playbooks")
-async def save_playbook(
-    request: PlaybookSaveRequest,
-    principal: Principal = Depends(require_owner),
+def _record_payload(record, *, include_owner: bool = False) -> Dict[str, Any]:
+    payload = {
+        "id": str(record.id),
+        "kind": record.kind.value,
+        "content": record.content,
+        "structured": record.structured,
+        "importance": record.importance,
+        "confidence": record.confidence,
+        "pinned": record.pinned,
+        "visibility": record.visibility.value,
+        "status": record.status.value,
+        "version": record.version,
+        "source_type": record.source_type.value,
+        "source_ref": record.source_ref,
+        "derived_from": [str(x) for x in record.derived_from],
+        "occurred_at": record.occurred_at.isoformat() if record.occurred_at else None,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+        "access_count": record.access_count,
+    }
+    if include_owner:
+        payload["owner_id"] = record.owner_id
+    return payload
+
+
+@router.get("/memory/records")
+async def list_memory_records(
+    kind: Optional[str] = None,
+    status: str = Query(default="active", pattern="^(active|superseded|archived)$"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_scope(Scope.PROFILE_READ)),
 ):
     """
-    Save a versioned system prompt for an agent (M5).
+    Browse remembered records.
 
-    Playbooks are global rather than per-user — they change how the assistant
-    behaves for everyone — so this is restricted to the owner.
+    The owner sees everything of theirs; a guest sees the owner's public
+    records. The visibility filter is applied in the query, so a private record
+    is never loaded in a request serving a guest.
     """
     try:
-        playbook_id = await memory_manager.save_playbook(
-            agent_name=request.agent_name.strip().lower(),
-            version=request.version.strip(),
-            prompt=request.prompt,
-            notes=request.notes,
-            set_active=request.set_active,
+        from app.memory.kinds import MemoryKind, RecordStatus
+        from app.memory.scope import resolve_retrieval_scope
+        from app.memory.stores import postgres_record_store
+
+        scope = resolve_retrieval_scope(principal)
+
+        kinds = None
+        if kind:
+            try:
+                kinds = [MemoryKind(kind.strip().lower())]
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Unknown memory kind '{kind}'")
+
+        records = await postgres_record_store.list(
+            scope.owner_id,
+            kinds=kinds,
+            statuses=[RecordStatus(status)],
+            visibilities=scope.visibilities,
+            limit=limit,
+            offset=offset,
         )
         return {
             "success": True,
-            "id": playbook_id,
-            "agent_name": request.agent_name,
-            "version": request.version,
-            "is_active": request.set_active,
+            "scope": scope.describe(),
+            "count": len(records),
+            "limit": limit,
+            "offset": offset,
+            "records": [_record_payload(r) for r in records],
         }
     except HTTPException:
         raise
     except Exception as e:
-        raise internal_error("Could not save playbook", e, agent_name=request.agent_name)
+        raise internal_error("Could not list memories", e, user_id=principal.user_id)
 
 
-@router.get("/memory/playbooks")
-async def list_playbooks(
-    agent_name: Optional[str] = None,
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
-    principal: Principal = Depends(require_owner),
+@router.get("/memory/records/{record_id}")
+async def get_memory_record(
+    record_id: str,
+    principal: Principal = Depends(require_scope(Scope.PROFILE_READ)),
 ):
-    """List playbook versions, optionally filtered by agent name. Paginated."""
+    """
+    Inspect one memory and where it came from — "why do you know this?".
+
+    Provenance is the feature that makes automatic memory formation
+    accountable: the user can trace a conclusion back to the material it was
+    distilled from, and correct it when the extractor got it wrong.
+    """
     try:
-        playbooks = await memory_manager.list_playbooks(agent_name=agent_name)
-        page = playbooks[offset:offset + limit]
+        from uuid import UUID as _UUID
+
+        from app.memory.kinds import Visibility
+        from app.memory.scope import resolve_retrieval_scope
+        from app.memory.stores import postgres_record_store
+
+        scope = resolve_retrieval_scope(principal)
+        try:
+            parsed = _UUID(record_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid memory id")
+
+        record = await postgres_record_store.get(scope.owner_id, parsed)
+        # A record outside the caller's visibility is reported as absent, not
+        # forbidden — a 403 would confirm that the id exists.
+        if record is None or (
+            scope.visibilities is not None and record.visibility not in scope.visibilities
+        ):
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        sources = []
+        for source_id in record.derived_from:
+            source = await postgres_record_store.get(scope.owner_id, source_id)
+            if source is not None:
+                sources.append(_record_payload(source))
+
         return {
             "success": True,
-            "count": len(page),
-            "total": len(playbooks),
-            "limit": limit,
-            "offset": offset,
-            "playbooks": page,
+            "record": _record_payload(record),
+            "derived_from_records": sources,
+            "supersedes": str(record.supersedes_id) if record.supersedes_id else None,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise internal_error("Could not list playbooks", e, agent_name=agent_name)
+        raise internal_error("Could not load memory", e, user_id=principal.user_id)
 
 
-@router.get("/memory/playbooks/{agent_name}/active")
-async def get_active_playbook(
-    agent_name: str,
+@router.patch("/memory/records/{record_id}")
+async def update_memory_record(
+    record_id: str,
+    patch: MemoryRecordPatch,
     principal: Principal = Depends(require_owner),
 ):
-    """Return the currently active prompt for a given agent."""
+    """
+    Correct a memory.
+
+    Editing content creates a new version rather than mutating in place, so the
+    correction itself is auditable and the original remains recoverable —
+    consistent with how conflicts are handled everywhere else.
+    """
     try:
-        playbook = await memory_manager.get_active_playbook(agent_name=agent_name.strip().lower())
-        if not playbook:
-            return {"success": True, "found": False, "message": f"No active playbook for '{agent_name}'. Agent uses its default hard-coded prompt."}
-        return {"success": True, "found": True, "playbook": playbook}
+        from uuid import UUID as _UUID
+
+        from app.memory.kinds import Visibility
+        from app.memory.stores import postgres_record_store
+
+        try:
+            parsed = _UUID(record_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid memory id")
+
+        # Validate the payload before touching the database: an empty patch is
+        # a client error regardless of whether the record exists, and there is
+        # no reason to pay for a lookup to discover that.
+        changes: Dict[str, Any] = {}
+        if patch.content is not None:
+            changes["content"] = patch.content
+        if patch.importance is not None:
+            changes["importance"] = patch.importance
+        if patch.pinned is not None:
+            changes["pinned"] = patch.pinned
+        if patch.visibility is not None:
+            changes["visibility"] = Visibility(patch.visibility)
+
+        if not changes:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        record = await postgres_record_store.get(principal.user_id, parsed)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        updated = record.superseding(**changes)
+        stored = await postgres_record_store.supersede(record, updated)
+
+        return {
+            "success": True,
+            "record": _record_payload(stored),
+            "previous_version": record.version,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise internal_error("Could not load playbook", e, agent_name=agent_name)
+        raise internal_error("Could not update memory", e, user_id=principal.user_id)
+
+
+@router.delete("/memory/records/{record_id}")
+async def forget_memory_record(
+    record_id: str,
+    principal: Principal = Depends(require_owner),
+):
+    """
+    Erase a memory permanently, along with anything distilled from it.
+
+    Irreversible and cascading by design. A consolidated memory derived from a
+    fact the user asked to delete would otherwise outlive that deletion — the
+    fact gone from the store yet still reachable through the summary of it.
+    """
+    try:
+        from uuid import UUID as _UUID
+
+        from app.memory.cognition.maintenance import memory_maintenance
+        from app.memory.stores import postgres_record_store
+
+        try:
+            parsed = _UUID(record_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid memory id")
+
+        if await postgres_record_store.get(principal.user_id, parsed) is None:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        deleted = await memory_maintenance.forget_record(principal.user_id, parsed)
+        logger.info(
+            "Erased memory %s for user=%s (%d records including derived)",
+            record_id, principal.user_id, deleted,
+        )
+        return {"success": True, "deleted_count": deleted, "cascaded": deleted > 1}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise internal_error("Could not erase memory", e, user_id=principal.user_id)
+
+
+@router.get("/memory/export")
+async def export_memory(
+    principal: Principal = Depends(require_owner),
+):
+    """
+    Export everything the assistant remembers, as JSON.
+
+    Owner-only and unfiltered by status: an export that silently omitted
+    archived or superseded records would misrepresent what is actually held.
+    """
+    try:
+        from app.memory.kinds import RecordStatus
+        from app.memory.stores import postgres_record_store
+
+        every_status = [
+            RecordStatus.ACTIVE, RecordStatus.SUPERSEDED,
+            RecordStatus.ARCHIVED, RecordStatus.DELETED,
+        ]
+        records: List[Any] = []
+        offset = 0
+        while True:
+            batch = await postgres_record_store.list(
+                principal.user_id, statuses=every_status, limit=500, offset=offset
+            )
+            if not batch:
+                break
+            records.extend(batch)
+            offset += len(batch)
+            if len(batch) < 500:
+                break
+
+        return {
+            "success": True,
+            "owner_id": principal.user_id,
+            "count": len(records),
+            "records": [_record_payload(r, include_owner=True) for r in records],
+        }
+    except Exception as e:
+        raise internal_error("Could not export memory", e, user_id=principal.user_id)
+
+
+# ── Conversations (Phase 4) ─────────────────────────────────────────────────
+#
+# A conversation is addressable and resumable. The browser persists its id, so
+# a refresh reopens the same thread instead of silently starting a new one —
+# which is what used to happen, because the session id was regenerated on every
+# page load and chat history was filtered by exactly that id.
+
+
+@router.get("/conversations")
+async def list_conversations(
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    status: str = Query(default="active", pattern="^(active|archived)$"),
+    principal: Principal = Depends(require_scope(Scope.CHAT)),
+):
+    """List the caller's conversation threads, most recently active first."""
+    try:
+        from app.memory.conversations import conversation_repository
+
+        conversations = await conversation_repository.list_for_owner(
+            principal.user_id, limit=limit, offset=offset, status=status
+        )
+        return {
+            "success": True,
+            "count": len(conversations),
+            "limit": limit,
+            "offset": offset,
+            "conversations": [c.summary_dict() for c in conversations],
+        }
+    except Exception as e:
+        raise internal_error("Could not list conversations", e, user_id=principal.user_id)
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    principal: Principal = Depends(require_scope(Scope.CHAT)),
+):
+    """
+    Fetch a thread and its recent turns, for rehydrating the UI after a reload.
+
+    Scoped to the authenticated owner: an id alone must never read someone
+    else's conversation, so an unknown-or-not-yours thread is a flat 404 rather
+    than a 403 that would confirm the id exists.
+    """
+    try:
+        from app.memory.conversations import conversation_repository
+
+        conversation = await conversation_repository.get(
+            conversation_id, principal.user_id
+        )
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        turns = await conversation_repository.recent_turns(
+            conversation_id, principal.user_id, limit=limit
+        )
+        return {
+            "success": True,
+            "conversation": conversation.summary_dict(),
+            "turns": [
+                {
+                    "sequence": t.sequence,
+                    "role": t.role,
+                    "content": t.content,
+                    "modality": t.modality,
+                    "agent": t.agent,
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                }
+                for t in turns
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise internal_error(
+            "Could not load conversation", e,
+            user_id=principal.user_id, conversation_id=conversation_id,
+        )
+
+
+@router.delete("/conversations/{conversation_id}")
+async def archive_conversation(
+    conversation_id: str,
+    principal: Principal = Depends(require_scope(Scope.CHAT)),
+):
+    """
+    Archive a thread.
+
+    Archived, not deleted: the turns remain, and the memories already extracted
+    from them stay valid. Hard erasure is a separate, explicit action (Phase 6).
+    """
+    try:
+        from app.memory.conversations import conversation_repository
+
+        archived = await conversation_repository.archive(
+            conversation_id, principal.user_id
+        )
+        if not archived:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        return {"success": True, "conversation_id": conversation_id, "status": "archived"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise internal_error(
+            "Could not archive conversation", e,
+            user_id=principal.user_id, conversation_id=conversation_id,
+        )
 
 
 @router.websocket("/stream")

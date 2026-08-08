@@ -2,7 +2,9 @@
 FastAPI main application entry point.
 Configures async FastAPI server with Groq integration and hybrid memory system.
 """
+import asyncio
 import logging
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -119,10 +121,46 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("LiveKit WebRTC not configured — WebSocket transport active")
 
+    # Background memory worker: extracts durable memories from queued turns and
+    # embeds pending records. In-process is correct for a single instance; when
+    # running more than one, disable it here and run
+    # scripts/run_memory_worker.py as a separate process instead, so several
+    # replicas do not each poll the same queue.
+    worker_stop: Optional[asyncio.Event] = None
+    worker_task: Optional[asyncio.Task] = None
+    if settings.memory_worker_enabled:
+        from app.memory.cognition.worker import memory_worker
+
+        worker_stop = asyncio.Event()
+        worker_task = asyncio.create_task(
+            memory_worker.run_forever(worker_stop), name="memory-worker"
+        )
+        logger.info(
+            "Memory worker enabled (batch=%d turns, idle flush=%.0fs, poll=%.0fs)",
+            settings.memory_extraction_batch_size,
+            settings.memory_extraction_idle_flush_seconds,
+            settings.memory_worker_poll_seconds,
+        )
+    else:
+        logger.info("Memory worker disabled — run scripts/run_memory_worker.py separately")
+
     yield
 
     # Shutdown
     logger.info("Shutting down %s", settings.app_name)
+
+    # Stop the worker before disposing the engine it is using, otherwise its
+    # next query runs against a closed pool.
+    if worker_task is not None and worker_stop is not None:
+        worker_stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+            await asyncio.gather(worker_task, return_exceptions=True)
+        except Exception as e:
+            logger.warning("Memory worker shutdown error: %s", e)
+
     try:
         await memory_manager.cleanup()
         await voice_service.close()

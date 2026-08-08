@@ -8,7 +8,11 @@ Usage:
 import asyncio
 import argparse
 import sys
-from app.memory.memory_manager import memory_manager
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.memory.memory_manager import memory_manager  # noqa: E402
 
 
 PASS = "[PASS]"
@@ -52,7 +56,7 @@ async def run_smoke_test(user_id: str):
     # --- Test 3: Skills retrieval ---
     print("\nTest 3: Skills retrieval")
     skills = await lt.retrieve_skills(user_id, query="technical skills programming")
-    if skills == "NO_DATA" or not skills:
+    if not skills:
         # Try fallback
         fallback = await lt._fallback_resume_search(user_id, "technical skills programming", "skills", 5)
         if fallback:
@@ -69,7 +73,7 @@ async def run_smoke_test(user_id: str):
     # --- Test 4: Projects retrieval ---
     print("\nTest 4: Projects retrieval")
     projects = await lt.retrieve_projects(user_id, query="projects built developed")
-    if projects == "NO_DATA" or not projects:
+    if not projects:
         # Try fallback
         fallback = await lt._fallback_resume_search(user_id, "projects built developed", "projects", 5)
         if fallback:

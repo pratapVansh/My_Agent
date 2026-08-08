@@ -32,10 +32,23 @@ Your capabilities:
 2. **get_skills** — retrieve the user's technical skills and proficiency levels.
 3. **get_projects** — retrieve the user's projects with descriptions and technologies.
 4. **get_resume** — retrieve the user's full resume text.
-5. **get_strengths** — analyze the user's profile and identify their top strengths.
-6. **remember_preference** — save a user preference or fact (e.g. "I prefer concise answers").
-7. **forget_preference** — delete a stored preference by key.
-8. **list_my_memories** — show all stored preferences and profile facts.
+5. **get_experience** — work experience and internships: companies, roles, dates.
+6. **get_education** — college, degree, branch, CGPA.
+7. **get_achievements** — awards, certifications, scholarships.
+8. **get_strengths** — analyze the user's profile and identify their top strengths.
+9. **remember_preference** — save a user preference or fact (e.g. "I prefer concise answers").
+10. **forget_preference** — delete a stored preference by key.
+11. **list_my_memories** — show all stored preferences and profile facts.
+
+Question → tool (retrieve first, always):
+- name, "who am I"                          → get_profile_summary
+- college, university, CGPA, branch, degree → get_education
+- internship, "where did I intern",
+  "what company did I intern at", experience → get_experience
+- projects, portfolio                        → get_projects (pass `query` when
+                                               asking about one project)
+- skills, technologies, languages, tools     → get_skills
+- achievements, awards, certifications       → get_achievements
 
 Response templates (use these formats for common queries):
 
@@ -66,25 +79,60 @@ For "forget my preference for X" or "don't remember X":
 For "what do you know about me" or "show my preferences":
   Call list_my_memories, then present as a clean list.
 
+Where information lives (check in this order, and never ask the user to
+disambiguate a question about themselves):
+1. **This conversation** — the memory context above already contains recent
+   turns. If the user told you something earlier ("I have an Economics class
+   tomorrow"), answer from that directly; no tool call is needed.
+2. **Profile memory** — name, college, branch, CGPA, saved preferences.
+   list_my_memories and get_profile_summary read this.
+3. **Resume/document memory** — skills, projects, experience, education,
+   technologies. get_skills, get_projects, get_resume, get_strengths read this.
+
+A question like "what is my name" is a retrieval task, never an ambiguous one:
+retrieve it and answer. Do not reply asking which name, which college, or which
+of anything the user obviously means about themselves.
+
+Answer first, clarify last:
+- ALWAYS call the matching tool before saying you don't have something. Never
+  report information as missing without having looked for it.
+- Retrieval returning nothing does NOT mean the question was unclear. "Where did
+  I intern?" is perfectly clear. If nothing comes back, say "I couldn't find any
+  internship details in your resume" — never "which internship do you mean?".
+- Partial results are answers. Report what you found and note only what was
+  missing; do not withhold a partial answer behind a question.
+- If the user points at a source — "I think it was in my resume", "check my
+  profile", "you should have that" — that is an instruction to search again, not
+  a new ambiguous question. Re-run the relevant retrieval, and try a related
+  section too: internship details live under experience, CGPA under education.
+- Only ask which item the user means when a tool actually returned SEVERAL and
+  the conversation cannot single one out. With exactly one internship, answer it.
+- For a follow-up naming something from earlier ("tell me more about TRACE"),
+  resolve the name against the conversation above and retrieve that item —
+  get_projects accepts a `query` for exactly this. Never ask the user to repeat
+  a name they just used.
+
 Rules:
-- Use ONLY information from tool results. Do NOT invent or hallucinate.
-- If a specific piece of information is not found, say "I don't have that information in your profile."
-- Always call at least one tool before answering profile questions.
+- Use ONLY information from tool results and the conversation context above.
+  Do NOT invent or hallucinate.
+- If a specific piece of information is not found, say plainly that you don't
+  have it — e.g. "I don't have your class 10 GPA on file." Never guess a value,
+  and never ask a clarifying question in place of saying you don't have it.
+- Your tools read ONLY the signed-in user's own memory. If asked about another
+  named person's data ("what's in Mary's resume"), say you don't have access to
+  that person's resume. Never answer such a question from the user's own resume,
+  and never present the user's data as though it were someone else's.
+- Always call at least one tool before answering profile questions, unless the
+  answer is already in this conversation's context.
 - For general (non-profile) questions, answer directly without tools."""
 
         # ── Tool implementations ───────────────────────────────────────────
 
-        def _safe_list(data) -> list:
-            """Normalize retrieve_* results — handle 'NO_DATA' string sentinel."""
-            if not data or data == "NO_DATA":
-                return []
-            return data if isinstance(data, list) else []
-
         async def tool_get_profile_summary(tool_input: Dict[str, Any]):
             """Fetch all profile sections and return a structured summary."""
             resume_data = await long_term_memory_qdrant.retrieve_resume(user_id=user_id)
-            skills_data = _safe_list(await long_term_memory_qdrant.retrieve_skills(user_id=user_id, limit=10))
-            projects_data = _safe_list(await long_term_memory_qdrant.retrieve_projects(user_id=user_id, limit=5))
+            skills_data = list(await long_term_memory_qdrant.retrieve_skills(user_id=user_id, limit=10))
+            projects_data = list(await long_term_memory_qdrant.retrieve_projects(user_id=user_id, limit=5))
 
             name = None
             resume_snippet = ""
@@ -114,7 +162,7 @@ Rules:
         async def tool_get_skills(tool_input: Dict[str, Any]):
             """Retrieve user's skills from vector memory."""
             limit = int(tool_input.get("limit", 15))
-            skills_data = _safe_list(await long_term_memory_qdrant.retrieve_skills(user_id=user_id, limit=limit))
+            skills_data = list(await long_term_memory_qdrant.retrieve_skills(user_id=user_id, limit=limit))
             if not skills_data:
                 return {"success": True, "count": 0, "skills": [], "message": "No skills found in your profile."}
             skills = [s.get("content", "") for s in skills_data if s.get("content")]
@@ -123,11 +171,21 @@ Rules:
         async def tool_get_projects(tool_input: Dict[str, Any]):
             """Retrieve user's projects from vector memory."""
             limit = int(tool_input.get("limit", 10))
-            projects_data = _safe_list(await long_term_memory_qdrant.retrieve_projects(user_id=user_id, limit=limit))
+            # Passing the query through lets one project be retrieved instead of
+            # all of them. Without it, "tell me about TRACE" listed the whole
+            # portfolio and left the model to find the right one.
+            query = str(tool_input.get("query", "") or "").strip() or None
+            projects_data = list(await long_term_memory_qdrant.retrieve_projects(
+                user_id=user_id, query=query, limit=limit
+            ))
             if not projects_data:
                 return {"success": True, "count": 0, "projects": [], "message": "No projects found in your profile."}
             projects = [
-                {"content": p.get("content", ""), "metadata": p.get("metadata", {})}
+                {
+                    "title": p.get("title", ""),
+                    "content": p.get("content", ""),
+                    "metadata": p.get("metadata", {}),
+                }
                 for p in projects_data if p.get("content")
             ]
             return {"success": True, "count": len(projects), "projects": projects}
@@ -144,10 +202,60 @@ Rules:
                 "content": resume_data.get("content", "")[:1500],
             }
 
+        async def _section(section: str, empty_message: str):
+            """
+            Retrieve one typed résumé section.
+
+            These sections exist in memory but had no tool: internships lived in
+            an `experience` chunk and CGPA/college in an `education` chunk, and
+            the only way to reach either was the first 1500 characters of
+            get_resume. "I don't have information about the company where you
+            interned" was therefore an honest answer from an agent with no way
+            to look — a missing capability, not a retrieval failure.
+            """
+            result = await long_term_memory_qdrant.retrieve_section(
+                user_id=user_id, section=section
+            )
+            entries = [item["content"] for item in result if item.get("content")]
+            if not entries:
+                # ERROR and NO_DATA are reported differently: claiming nothing is
+                # stored when the lookup failed is a false statement, and it is
+                # exactly the state in which a model invents a plausible answer.
+                if getattr(result.status, "value", "") == "ERROR":
+                    return {
+                        "success": False,
+                        "found": False,
+                        "message": f"Could not read your {section} right now — "
+                                   f"treat it as unknown rather than absent.",
+                    }
+                return {"success": True, "found": False, "count": 0, "message": empty_message}
+            return {"success": True, "found": True, "count": len(entries), section: entries}
+
+        async def tool_get_experience(tool_input: Dict[str, Any]):
+            """Retrieve work experience and internships from the resume."""
+            return await _section(
+                "experience",
+                "I don't have any work experience or internships on file from your resume.",
+            )
+
+        async def tool_get_education(tool_input: Dict[str, Any]):
+            """Retrieve education: college, degree, branch, CGPA."""
+            return await _section(
+                "education",
+                "I don't have your education details on file from your resume.",
+            )
+
+        async def tool_get_achievements(tool_input: Dict[str, Any]):
+            """Retrieve achievements, awards and certifications."""
+            return await _section(
+                "achievements",
+                "I don't have any achievements on file from your resume.",
+            )
+
         async def tool_get_strengths(tool_input: Dict[str, Any]):
             """Analyze profile and identify key strengths using LLM."""
-            skills_data = _safe_list(await long_term_memory_qdrant.retrieve_skills(user_id=user_id, limit=15))
-            projects_data = _safe_list(await long_term_memory_qdrant.retrieve_projects(user_id=user_id, limit=5))
+            skills_data = list(await long_term_memory_qdrant.retrieve_skills(user_id=user_id, limit=15))
+            projects_data = list(await long_term_memory_qdrant.retrieve_projects(user_id=user_id, limit=5))
             resume_data = await long_term_memory_qdrant.retrieve_resume(user_id=user_id)
 
             skills_text = "\n".join(
@@ -239,7 +347,10 @@ Rules:
             "get_projects": {
                 "description": (
                     "Retrieve the user's projects with descriptions. "
-                    "Use for 'what projects have I worked on', 'show my portfolio'. Args: limit (int, default 10)."
+                    "Use for 'what projects have I worked on', 'show my portfolio'. "
+                    "Args: limit (int, default 10), query (str, optional) — pass the "
+                    "subject of the question when asking about one project, e.g. "
+                    "'voice assistant', so the most relevant project ranks first."
                 ),
                 "callable": tool_get_projects,
                 "scope": Scope.PROFILE_READ.value,
@@ -250,6 +361,34 @@ Rules:
                     "Use for 'show my resume', 'what's in my resume'. Args: none."
                 ),
                 "callable": tool_get_resume,
+                "scope": Scope.PROFILE_READ.value,
+            },
+            "get_experience": {
+                "description": (
+                    "Retrieve the user's work experience and internships — companies, "
+                    "roles, dates, what they did. Use for 'where did I intern', "
+                    "'what company did I intern at', 'tell me about my experience', "
+                    "'what companies have I worked with'. Args: none."
+                ),
+                "callable": tool_get_experience,
+                "scope": Scope.PROFILE_READ.value,
+            },
+            "get_education": {
+                "description": (
+                    "Retrieve the user's education — college, degree, branch, CGPA, "
+                    "dates. Use for 'which college do I attend', 'what is my CGPA', "
+                    "'what branch am I in', 'what degree am I pursuing'. Args: none."
+                ),
+                "callable": tool_get_education,
+                "scope": Scope.PROFILE_READ.value,
+            },
+            "get_achievements": {
+                "description": (
+                    "Retrieve the user's achievements, awards, certifications and "
+                    "scholarships. Use for 'what are my achievements', 'what awards "
+                    "have I won'. Args: none."
+                ),
+                "callable": tool_get_achievements,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_strengths": {

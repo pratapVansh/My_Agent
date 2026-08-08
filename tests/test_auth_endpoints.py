@@ -62,7 +62,9 @@ PROTECTED_ENDPOINTS = [
     ("delete", "/api/v1/agents/memory/profile/vansh", None),
     ("delete", "/api/v1/agents/memory/profile/vansh/somekey", None),
     ("get", "/api/v1/agents/memory/episodes/vansh", None),
-    ("get", "/api/v1/agents/memory/playbooks", None),
+    ("get", "/api/v1/agents/conversations", None),
+    ("get", "/api/v1/agents/conversations/session_abc", None),
+    ("delete", "/api/v1/agents/conversations/session_abc", None),
     ("post", "/api/v1/voice/token", {}),
 ]
 
@@ -84,7 +86,6 @@ GUEST_FORBIDDEN = [
     ("post", "/api/v1/agents/tools/timetable/suggest", {}),
     ("post", "/api/v1/agents/memory/profile", {"key": "k", "value": "v"}),
     ("delete", "/api/v1/agents/memory/profile/guest-abc", None),
-    ("get", "/api/v1/agents/memory/playbooks", None),
     ("post", "/api/v1/agents/memory/upload-text", None),
 ]
 

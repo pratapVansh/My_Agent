@@ -150,11 +150,44 @@ Confidence scoring:
 - 0.6–0.69: Could be planned differently
 - Below 0.6: Set needs_clarification=true
 
+Question categories — use these to pick the agent and to score confidence:
+
+- PROFILE (agent "profile"): anything about who the user is, stored about them,
+  or on their resume. Name, college, branch, CGPA, saved preferences, skills,
+  projects, work experience, technologies, education, achievements.
+  Examples: "what is my name", "what college do I attend", "what is my CGPA",
+  "what are my skills", "tell me about my projects", "what experience do I have".
+- CONVERSATIONAL MEMORY (agent "profile"): what was said earlier in this or a
+  previous conversation. "what did I just tell you", "what did we discuss",
+  "what class did I say I have tomorrow".
+- ACADEMIC (agent "academic"): timetable, attendance, exams, schedule, classes.
+- JOB (agent "job"), EMAIL (agent "email"): as described above.
+- GENERAL/RESEARCH: explanations and outside information. Route to "profile"
+  unless another agent clearly owns it.
+
+Clarification — the narrow rule:
+- Set needs_clarification ONLY when a required *parameter* is missing and cannot
+  be recovered from memory or context. "Email him about it" — who, about what.
+  "Apply to that one" — which one.
+- A question about the user is NEVER ambiguous just because you cannot see the
+  answer. You do not hold the user's memory; the profile agent retrieves it.
+  "What is my name?" is a high-confidence profile retrieval, not a question
+  about which name is meant. The same applies to their college, branch, CGPA,
+  skills, projects and anything else about them.
+- If retrieval might answer it, route to the agent and let it report honestly
+  when nothing is stored. A wrong "which one do you mean?" is worse than an
+  accurate "I don't have that".
+- Questions about *another named person* ("Mary's resume") are not clarification
+  cases either — route to profile, which will report that it has no such data.
+
 Additional rules:
 - If needs_clarification is true, write a short natural clarifying question.
 - If needs_clarification is false, clarification_question must be "".
 - Default to "profile" for general personal questions.
 - Respond ONLY with valid JSON, no other text.
+
+Example — personal fact, no clarification:
+{{"intent": "recall the user's name", "agent": "profile", "confidence": 0.95, "needs_clarification": false, "clarification_question": "", "execution_plan": [{{"step": 1, "agent": "profile", "goal": "Retrieve the user's name from profile and resume memory"}}]}}
 
 Example — single step:
 {{"intent": "find software jobs", "agent": "job", "confidence": 0.95, "needs_clarification": false, "clarification_question": "", "execution_plan": [{{"step": 1, "agent": "job", "goal": "Search for software engineering job listings"}}]}}

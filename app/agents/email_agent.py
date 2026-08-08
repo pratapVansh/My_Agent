@@ -8,6 +8,7 @@ from app.agents.state import make_envelope
 from app.auth.models import Scope
 from app.tools.email_draft_tool import email_draft_tool
 from app.memory.memory_manager import memory_manager
+from app.domain.email import email_repository
 from app.services.email_sender_service import email_sender_service
 
 
@@ -82,7 +83,7 @@ class EmailAgent(BaseAgent):
             # Auto-save the draft
             draft = result.get("draft", {})
             try:
-                draft_id = await memory_manager.save_email_draft(
+                draft_id = await email_repository.save_draft(
                     user_id=user_id,
                     subject=draft.get("subject", ""),
                     body=draft.get("body", ""),
@@ -100,7 +101,7 @@ class EmailAgent(BaseAgent):
             return result
 
         async def tool_save_draft(tool_input: Dict[str, Any]):
-            draft_id = await memory_manager.save_email_draft(
+            draft_id = await email_repository.save_draft(
                 user_id=user_id,
                 subject=str(tool_input.get("subject", "")),
                 body=str(tool_input.get("body", "")),
@@ -115,7 +116,7 @@ class EmailAgent(BaseAgent):
 
         async def tool_list_drafts(tool_input: Dict[str, Any]):
             limit = int(tool_input.get("limit", 5))
-            drafts = await memory_manager.get_email_drafts(user_id=user_id, limit=limit)
+            drafts = await email_repository.get_drafts(user_id=user_id, limit=limit)
             if not drafts:
                 return {"success": True, "count": 0, "drafts": [], "message": "No saved drafts."}
             return {"success": True, "count": len(drafts), "drafts": drafts}
@@ -126,7 +127,7 @@ class EmailAgent(BaseAgent):
             body_template = str(tool_input.get("body_template", ""))
             tone = str(tool_input.get("tone", "professional"))
             placeholders = tool_input.get("placeholders", [])
-            tmpl_id = await memory_manager.save_email_template(
+            tmpl_id = await email_repository.save_template(
                 user_id=user_id,
                 name=name,
                 subject_template=subject_template,
@@ -152,7 +153,7 @@ class EmailAgent(BaseAgent):
 
             # If draft_id supplied but body/subject are missing, load from saved draft
             if draft_id and (not subject or not body):
-                drafts = await memory_manager.get_email_drafts(
+                drafts = await email_repository.get_drafts(
                     user_id=user_id, limit=50, status="draft"
                 )
                 match = next((d for d in drafts if d["id"] == draft_id), None)
@@ -175,13 +176,13 @@ class EmailAgent(BaseAgent):
 
             # Mark the draft as sent in the database
             if result.get("success") and draft_id:
-                await memory_manager.mark_email_sent(draft_id, user_id, to_email)
+                await email_repository.mark_draft_sent(draft_id, user_id, to_email)
 
             return result
 
         async def tool_list_templates(tool_input: Dict[str, Any]):
             name_filter = tool_input.get("name")
-            templates = await memory_manager.get_email_templates(user_id=user_id, name=name_filter)
+            templates = await email_repository.get_templates(user_id=user_id, name=name_filter)
             if not templates:
                 return {"success": True, "count": 0, "templates": [], "message": "No templates saved yet."}
             return {"success": True, "count": len(templates), "templates": templates}

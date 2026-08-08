@@ -14,6 +14,8 @@ from app.tools.job_search_tool import job_search_tool
 from app.tools.email_draft_tool import email_draft_tool
 from app.memory.short_term_memory import short_term_memory
 from app.memory.memory_manager import memory_manager
+from app.domain.email import email_repository
+from app.domain.jobs import jobs_repository
 
 
 class JobAgent(BaseAgent):
@@ -68,7 +70,7 @@ For career advice (no tool needed): give practical guidance based on the user's 
             url = str(tool_input.get("url", ""))
             if not url:
                 return {"success": False, "reason": "url is required"}
-            result = await short_term_memory.save_job_bookmark(
+            result = await jobs_repository.save_bookmark(
                 user_id=user_id,
                 title=title,
                 url=url,
@@ -84,7 +86,7 @@ For career advice (no tool needed): give practical guidance based on the user's 
 
         async def tool_get_bookmarks(tool_input: Dict[str, Any]):
             limit = int(tool_input.get("limit", 10))
-            bookmarks = await short_term_memory.get_job_bookmarks(user_id=user_id, limit=limit)
+            bookmarks = await jobs_repository.get_bookmarks(user_id=user_id, limit=limit)
             if not bookmarks:
                 return {"success": True, "count": 0, "bookmarks": [], "message": "No saved jobs yet."}
             return {"success": True, "count": len(bookmarks), "bookmarks": bookmarks}
@@ -110,7 +112,7 @@ For career advice (no tool needed): give practical guidance based on the user's 
             # Auto-save the draft to PostgreSQL
             draft = draft_result.get("draft", {})
             try:
-                draft_id = await memory_manager.save_email_draft(
+                draft_id = await email_repository.save_draft(
                     user_id=user_id,
                     subject=draft.get("subject", f"Application for {job_title}"),
                     body=draft.get("body", ""),

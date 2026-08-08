@@ -25,6 +25,13 @@ class LiveKitTokenRequest(BaseModel):
     # the identity and the room are derived from the authenticated session.
     user_id: Optional[str] = Field(default=None, description="Deprecated and ignored")
     room_name: Optional[str] = Field(default=None, description="Deprecated and ignored")
+    # The browser's conversation id. Voice turns join the thread the user can
+    # see rather than a parallel one keyed by room — without this, speaking and
+    # typing produce two different conversations and a page reload restores the
+    # empty one.
+    conversation_id: Optional[str] = Field(
+        default=None, description="Conversation thread to attach voice turns to"
+    )
 
 
 class LiveKitTokenResponse(BaseModel):
@@ -36,6 +43,23 @@ class LiveKitTokenResponse(BaseModel):
 # Room -> worker task. Process-local; see AUDIT_REPORT.md (M15) for the
 # shared-state requirement before running more than one instance.
 active_workers: Dict[str, asyncio.Task] = {}
+
+# (room_name, identity) -> conversation_id the caller is currently viewing.
+#
+# Written here at token time and read by the voice worker when it builds a
+# participant's state. A registry rather than a worker argument because the
+# worker outlives a single connection: the same room is reused when the user
+# reconnects, and the conversation they are looking at may have changed (New
+# Chat) since the worker started.
+voice_conversation_bindings: Dict[tuple, str] = {}
+
+
+def bind_voice_conversation(room_name: str, identity: str, conversation_id: str) -> None:
+    voice_conversation_bindings[(room_name, identity)] = conversation_id
+
+
+def resolve_voice_conversation(room_name: str, identity: str) -> Optional[str]:
+    return voice_conversation_bindings.get((room_name, identity))
 
 
 def room_name_for(principal: Principal) -> str:
@@ -81,6 +105,15 @@ async def generate_livekit_token(
     if request.user_id and request.user_id.strip().lower() != principal.user_id.lower():
         raise HTTPException(
             status_code=403, detail="You cannot access another user's data."
+        )
+
+    # Bind before the worker starts, so the first spoken turn already lands in
+    # the right thread. Ownership is enforced on write by append_turn, which
+    # scopes every turn to the authenticated owner — a caller cannot bind their
+    # voice to somebody else's conversation.
+    if request.conversation_id and request.conversation_id.strip():
+        bind_voice_conversation(
+            room_name, principal.user_id, request.conversation_id.strip()
         )
 
     try:

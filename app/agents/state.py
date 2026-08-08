@@ -59,6 +59,14 @@ class AgentState(TypedDict):
     user_id: Optional[str]
     session_id: Optional[str]
     output_mode: Optional[str]
+    # Whose long-term memory to *read*. Defaults to the caller. A guest
+    # reads the owner's memory while still writing under its own id —
+    # conflating the two would let recruiter chatter pollute the owner.
+    memory_owner_id: Optional[str]
+    # Visibility filter for memory retrieval. None = the caller's own
+    # memory, every visibility. A guest carries [PUBLIC], which is what
+    # lets the recruiter view read the owner's public records.
+    memory_visibilities: Optional[list]
 
     # Authorization: capabilities of the authenticated caller, propagated from
     # the verified JWT. Specialist agents filter their tool registries against

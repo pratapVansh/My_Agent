@@ -14,7 +14,42 @@ logger = logging.getLogger(__name__)
 from app.memory.short_term_memory import short_term_memory
 from app.memory.smart_memory import smart_memory
 from app.memory.memory_cache import memory_cache
+from app.memory.retrieval_result import RetrievalResult
+from app.memory.writer import memory_writer
+from app.config import settings
 from app.services.debug_logger import log_step
+
+
+# Strong references to detached shadow tasks. asyncio holds only a weak
+# reference to a running task, so without this a fire-and-forget task can be
+# garbage-collected mid-execution and its exception never observed.
+_shadow_tasks: set = set()
+
+
+def _spawn_shadow(coro, description: str) -> None:
+    """Run a non-critical coroutine detached, keeping it alive and logged."""
+    task = asyncio.create_task(coro, name=description)
+    _shadow_tasks.add(task)
+
+    def _done(finished: asyncio.Task) -> None:
+        _shadow_tasks.discard(finished)
+        try:
+            finished.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Shadow task '%s' failed: %s", description, exc)
+
+    task.add_done_callback(_done)
+
+
+def _count_tokens(text: str) -> int:
+    """Token count for comparison logging; never worth failing a turn over."""
+    try:
+        from app.services.chunking_service import chunking_service
+        return chunking_service.count_tokens(text)
+    except Exception:
+        return max(0, len(text) // 4)
 
 
 class MemoryManager:
@@ -34,10 +69,19 @@ class MemoryManager:
         self.smart = smart_memory
 
     async def initialize(self):
-        """Initialize database connections."""
+        """Initialize database connections and vector collections."""
         await self.short_term.init_db()
         await self.long_term.initialize()
         await self.smart.initialize()
+
+        # The unified memory collection. Created here so the API process never
+        # has to create it lazily mid-request; the worker also ensures it
+        # itself, since it can run without ever touching this code path.
+        try:
+            from app.memory.stores.qdrant_vector_store import qdrant_vector_store
+            await qdrant_vector_store.initialize()
+        except Exception as exc:
+            logger.warning("Could not ensure the memory_records collection: %s", exc)
 
     async def on_user_input(
         self,
@@ -62,6 +106,12 @@ class MemoryManager:
             role="user",
             content=user_message,
             metadata=metadata
+        )
+
+        # Phase 4: mirror into the conversation thread. `session_id` is the
+        # conversation's key, so voice and text land in the same thread.
+        await self._append_turn(
+            user_id, session_id, "user", user_message, metadata
         )
 
         # Extract preferences/interests to smart memory (async, non-blocking)
@@ -98,14 +148,31 @@ class MemoryManager:
             metadata=metadata
         )
 
-        # Persist assistant response as vector memory after every response.
+        # Phase 4: mirror into the conversation thread.
+        await self._append_turn(
+            user_id, session_id, "assistant", agent_response, metadata
+        )
+
+        # Phase 3: enqueue the exchange for asynchronous extraction. This is
+        # the write that matters going forward — a worker decides what was
+        # worth remembering, rather than the whole utterance being embedded
+        # verbatim.
+        await self._enqueue_turn(user_id, session_id, agent_response, metadata)
+
+        # Legacy per-utterance vector write.
         #
-        # These are two independent stores with no shared transaction. The
-        # Postgres write above is authoritative for conversation history; if the
-        # vector write below fails, that turn is missing from semantic recall
-        # while chat history still has it. store_memory() returns None on
-        # failure (and logs), so surface the divergence here too rather than
-        # letting it pass silently.
+        # Still on by default because `retrieve_context` reads this data for
+        # the "User Preferences & Interests" section of the *served* prompt.
+        # Disabling it before the Phase 6 read cutover would remove a live
+        # signal while its replacement is still only running in shadow.
+        if settings.memory_v2_replace_raw_embedding:
+            return
+
+        # Two independent stores with no shared transaction. The Postgres write
+        # above is authoritative for conversation history; if the vector write
+        # fails, that turn is missing from semantic recall while chat history
+        # still has it. store_memory() returns None on failure (and logs), so
+        # surface the divergence here too rather than letting it pass silently.
         point_id = await self.smart.store_memory(
             user_id=user_id,
             text=agent_response,
@@ -121,6 +188,100 @@ class MemoryManager:
             log_step(
                 "MEMORY UPSERT",
                 {"user_id": user_id, "type": "memory", "chars": len(agent_response)},
+            )
+
+    async def _append_turn(
+        self,
+        user_id: str,
+        session_id: str,
+        role: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Mirror a message into its conversation thread.
+
+        Best-effort, like every other Phase 1–4 mirror: `chat_history` remains
+        the authoritative read path until the Phase 6 cutover, so a failure
+        here costs thread continuity, never the turn itself.
+
+        Modality is derived from metadata rather than the transport: the voice
+        worker and the text API both reach this method, and a thread that mixes
+        them is a feature — one conversation across devices, not one per
+        transport.
+        """
+        if not settings.memory_v2_dual_write:
+            return
+
+        meta = metadata or {}
+        modality = "voice" if meta.get("streaming") or meta.get("voice") else "text"
+
+        try:
+            from app.memory.conversations import conversation_repository
+
+            await conversation_repository.append_turn(
+                conversation_id=session_id,
+                owner_id=user_id,
+                role=role,
+                content=content,
+                modality=modality,
+                agent=meta.get("agent"),
+                intent=meta.get("intent"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not append turn to conversation=%s for user=%s: %s",
+                session_id, user_id, exc,
+            )
+
+    async def _enqueue_turn(
+        self,
+        user_id: str,
+        session_id: str,
+        agent_response: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record one exchange in the extraction outbox.
+
+        The user's message for this turn is read back from chat history rather
+        than threaded through, so the event carries the full exchange even when
+        the two halves were written by different code paths (streaming, voice,
+        and the tool-calling workflow all differ here).
+
+        Enqueueing is best-effort by design: an outbox failure must not fail a
+        turn the user already received an answer to.
+        """
+        if not settings.memory_v2_dual_write:
+            return
+
+        try:
+            recent = await self.short_term.get_recent_context(
+                user_id=user_id, session_id=session_id, last_n=2
+            )
+            user_text = next(
+                (m["content"] for m in reversed(recent) if m.get("role") == "user"),
+                "",
+            )
+
+            from app.memory.events import EventType, MemoryEvent
+            from app.memory.stores.postgres_event_queue import postgres_event_queue
+
+            await postgres_event_queue.enqueue(MemoryEvent(
+                owner_id=user_id,
+                event_type=EventType.TURN,
+                group_key=session_id,
+                payload={
+                    "user": user_text,
+                    "assistant": agent_response,
+                    "agent": (metadata or {}).get("agent"),
+                    "intent": (metadata or {}).get("intent"),
+                },
+            ))
+        except Exception as exc:
+            logger.warning(
+                "Could not enqueue memory event for user=%s session=%s: %s",
+                user_id, session_id, exc,
             )
 
     async def retrieve_context(
@@ -205,6 +366,84 @@ class MemoryManager:
 
         return context
 
+    async def build_memory_prompt(
+        self,
+        user_id: str,
+        session_id: str,
+        query: Optional[str] = None,
+        memory_owner_id: Optional[str] = None,
+        visibilities=None,
+    ) -> tuple[Dict[str, Any], str]:
+        """
+        Retrieve memory and render it into a prompt block.
+
+        The single entry point for building memory context. Both workflow paths
+        previously called `retrieve_context` and `format_context_for_prompt`
+        separately, which meant two places to keep in step and no single point
+        at which the v2 engine could be compared against v1.
+
+        Returns (context, prompt) so callers keep access to the raw context.
+        """
+        context = await self.retrieve_context(
+            user_id=user_id, session_id=session_id, query=query
+        )
+        prompt = self.format_context_for_prompt(context)
+
+        if settings.memory_v2_shadow_read:
+            # Detached deliberately. Shadow retrieval exists to gather
+            # comparison data, and it must never add latency to a turn or be
+            # able to fail one — especially a spoken turn, where the cost of an
+            # extra round trip is audible.
+            _spawn_shadow(
+                self._shadow_compare(
+                    user_id, query or "", prompt, session_id,
+                    visibilities, memory_owner_id,
+                ),
+                f"memory-shadow-{user_id}",
+            )
+
+        return context, prompt
+
+    async def _shadow_compare(
+        self,
+        user_id: str,
+        query: str,
+        legacy_prompt: str,
+        conversation_id: str = "",
+        visibilities=None,
+        memory_owner_id: Optional[str] = None,
+    ) -> None:
+        """Run v2 retrieval and log how it differs from what was served."""
+        from app.memory.retrieval_v2 import retrieve_and_assemble
+
+        # Records come from the scoped owner; the conversation window stays
+        # the caller's own thread.
+        assembled, trace = await retrieve_and_assemble(
+            user_id=memory_owner_id or user_id,
+            query=query,
+            conversation_id=conversation_id,
+            conversation_owner_id=user_id,
+            visibilities=visibilities,
+        )
+        legacy_tokens = _count_tokens(legacy_prompt)
+
+        log_step("MEMORY SHADOW", {
+            "user_id": user_id,
+            "legacy_chars": len(legacy_prompt),
+            "legacy_tokens": legacy_tokens,
+            "v2_chars": len(assembled.text),
+            "v2_tokens": assembled.used_tokens,
+            **trace.summary(),
+        })
+        logger.info(
+            "Memory shadow: legacy=%d tok, v2=%d tok (%d records, %s), "
+            "channels=%s, degraded=%s",
+            legacy_tokens, assembled.used_tokens, len(assembled.selected),
+            trace.selected_by_kind(),
+            {c.name: c.candidates for c in trace.channels},
+            trace.degraded,
+        )
+
     def format_context_for_prompt(self, context: Dict[str, Any]) -> str:
         """
         Format memory context into a clean prompt injection.
@@ -219,7 +458,7 @@ class MemoryManager:
           1. Profile Facts   — explicit user preferences; tiny, critical
           2. Recent Episodes — cross-session context; small, critical
           3. Recent Chat     — in-session continuity; budgeted at 1200 chars
-          4. Smart Prefs     — inferred interests from mem0; medium
+          4. Smart Prefs     — recalled conversational turns; medium
           5. Skills          — semantic retrieval; medium
           6. Projects        — semantic retrieval; medium
           7. Resume          — large blob; useful but survives partial loss
@@ -265,7 +504,9 @@ class MemoryManager:
         # ── 5–7. Long-term Vector Memory (skills, projects, resume) ──────────
         long_term = context.get("long_term", {})
 
-        # Skills — guard against "NO_DATA" sentinel string
+        # Skills. The isinstance guard is retained because a cached context
+        # dictionary written before RetrievalResult existed may still carry the
+        # bare "NO_DATA" string in this slot.
         skills = long_term.get("skills", [])
         if not isinstance(skills, list):
             skills = []
@@ -274,7 +515,7 @@ class MemoryManager:
             if skill_list:
                 parts.append("User Skills:\n" + "\n".join([f"- {s}" for s in skill_list if s]))
 
-        # Projects — guard against "NO_DATA" sentinel string
+        # Projects — same legacy-cache guard as skills above.
         projects = long_term.get("projects", [])
         if not isinstance(projects, list):
             projects = []
@@ -283,14 +524,28 @@ class MemoryManager:
             if project_list:
                 parts.append("User Projects:\n" + "\n".join([f"- {p[:200]}" for p in project_list if p]))
 
-        # Retrieval status hints (must stay with skills/projects for coherence)
+        # Retrieval status hints (must stay with skills/projects for coherence).
+        #
+        # NO_DATA and ERROR are reported differently on purpose. NO_DATA is a
+        # fact — nothing is stored — and can be stated plainly. ERROR means the
+        # lookup failed, so asserting "no skills data found" would be false;
+        # the model is told the state is unknown instead. Both cases arm the
+        # refusal policy, because both are states in which a model left to its
+        # own devices invents an answer.
         skills_status = long_term.get("skills_status")
         projects_status = long_term.get("projects_status")
         if skills_status == "NO_DATA":
             parts.append("Retrieval Status: No skills data found in vector memory.")
         if projects_status == "NO_DATA":
             parts.append("Retrieval Status: No projects data found in vector memory.")
-        if skills_status == "NO_DATA" and projects_status == "NO_DATA":
+        if skills_status == "ERROR":
+            parts.append("Retrieval Status: Skills lookup failed — treat skills as unknown, not absent.")
+        if projects_status == "ERROR":
+            parts.append("Retrieval Status: Projects lookup failed — treat projects as unknown, not absent.")
+
+        both_absent = skills_status == "NO_DATA" and projects_status == "NO_DATA"
+        any_failed = "ERROR" in (skills_status, projects_status)
+        if both_absent or any_failed:
             parts.append(
                 "Policy: If the user asks about unavailable personal attributes "
                 "(for example hobbies or unknown profile facts), reply with: "
@@ -369,13 +624,13 @@ class MemoryManager:
 
     async def retrieve_skills(
         self, user_id: str, query: Optional[str] = None, limit: int = 10
-    ) -> Any:
+    ) -> RetrievalResult:
         """Retrieve stored skills from long-term vector memory."""
         return await self.long_term.retrieve_skills(user_id=user_id, query=query, limit=limit)
 
     async def retrieve_projects(
         self, user_id: str, query: Optional[str] = None, limit: int = 10
-    ) -> Any:
+    ) -> RetrievalResult:
         """Retrieve stored projects from long-term vector memory."""
         return await self.long_term.retrieve_projects(user_id=user_id, query=query, limit=limit)
 
@@ -398,94 +653,25 @@ class MemoryManager:
         """Store project in long-term memory."""
         return await self.long_term.store_project(user_id, project_name, description, technologies, metadata)
 
-    # Short-term operations (pass-through)
-    async def store_attendance(
-        self,
-        user_id: str,
-        date: date,
-        subject: str,
-        status: str,
-        notes: Optional[str] = None
-    ) -> str:
-        """
-        Store an attendance record.
-
-        Idempotent on (user_id, date, subject) — recording the same class twice
-        updates the existing row rather than creating a duplicate.
-        """
-        return await self.short_term.store_attendance(user_id, date, subject, status, notes)
-
-    async def retrieve_attendance(
-        self,
-        user_id: str,
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None,
-        subject: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Retrieve attendance records (bounded to the most recent entries)."""
-        return await self.short_term.retrieve_attendance(user_id, start_date, end_date, subject)
-
-    async def store_timetable_entry(
-        self,
-        user_id: str,
-        day_of_week: int,
-        start_time: time,
-        end_time: time,
-        subject: str,
-        location: Optional[str] = None,
-        instructor: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Store timetable entry."""
-        return await self.short_term.store_timetable_entry(
-            user_id, day_of_week, start_time, end_time, subject, location, instructor, metadata
-        )
-
-    async def retrieve_timetable(
-        self,
-        user_id: str,
-        day_of_week: Optional[int] = None
-    ) -> List[Dict[str, Any]]:
-        """Retrieve timetable entries."""
-        return await self.short_term.retrieve_timetable(user_id, day_of_week)
-
-    async def clear_timetable(self, user_id: str) -> int:
-        """Soft-delete all active timetable entries. Returns count cleared."""
-        return await self.short_term.clear_timetable(user_id)
-
-    # Email draft pass-throughs
-    async def save_email_draft(self, user_id: str, subject: str, body: str, **kwargs) -> str:
-        return await self.short_term.save_email_draft(user_id, subject, body, **kwargs)
-
-    async def get_email_drafts(self, user_id: str, limit: int = 10, status: str = "draft") -> List[Dict[str, Any]]:
-        return await self.short_term.get_email_drafts(user_id, limit, status)
-
-    async def mark_email_sent(self, draft_id: str, user_id: str, sent_to: str) -> bool:
-        return await self.short_term.mark_draft_sent(draft_id, user_id, sent_to)
-
-    # Email template pass-throughs
-    async def save_email_template(self, user_id: str, name: str, subject_template: str, body_template: str, **kwargs) -> str:
-        return await self.short_term.save_email_template(user_id, name, subject_template, body_template, **kwargs)
-
-    async def get_email_templates(self, user_id: str, name: Optional[str] = None) -> List[Dict[str, Any]]:
-        return await self.short_term.get_email_templates(user_id, name)
-
-    # Exam pass-throughs
-    async def store_exam(self, user_id: str, subject: str, exam_date, **kwargs) -> str:
-        return await self.short_term.store_exam(user_id, subject, exam_date, **kwargs)
-
-    async def retrieve_exams(self, user_id: str, upcoming_only: bool = True) -> List[Dict[str, Any]]:
-        return await self.short_term.retrieve_exams(user_id, upcoming_only)
-
-    # Plan pass-throughs
-    async def store_plan(self, user_id: str, plan_date, title: str, **kwargs) -> str:
-        return await self.short_term.store_plan(user_id, plan_date, title, **kwargs)
-
-    async def retrieve_plans(self, user_id: str, plan_date=None, include_done: bool = False) -> List[Dict[str, Any]]:
-        return await self.short_term.retrieve_plans(user_id, plan_date, include_done)
-
-    async def mark_plan_done(self, plan_id: str, user_id: str) -> bool:
-        return await self.short_term.mark_plan_done(plan_id, user_id)
+    # ── Phase 1 dual-write ──────────────────────────────────────────────
+    #
+    # Structured writes are mirrored into the unified `memory_records` table
+    # while the legacy tables remain authoritative for every read. Mirroring is
+    # strictly additive, so a failure here must never surface to the caller:
+    # the primary write has already succeeded and the turn must not fail
+    # because a shadow copy did. The backfill migration is idempotent and can
+    # repair anything lost this way.
+    async def _mirror(self, description: str, coro) -> None:
+        if not settings.memory_v2_dual_write:
+            return
+        try:
+            await coro
+        except Exception as exc:
+            logger.warning(
+                "Memory v2 dual-write failed (%s): %s — legacy write is unaffected; "
+                "re-run scripts/migrate_memory_v2.py to reconcile.",
+                description, exc,
+            )
 
     # UserProfile pass-throughs
     async def save_profile_fact(
@@ -495,7 +681,20 @@ class MemoryManager:
         # M3 write policy: only persist inferred facts when confidence >= 0.8
         if source == "inferred" and confidence < 0.8:
             return ""
-        return await self.short_term.save_profile_fact(user_id, key, value, source, confidence, consent_level)
+        record_id = await self.short_term.save_profile_fact(
+            user_id, key, value, source, confidence, consent_level
+        )
+        # An empty id means the value was rejected as credential-shaped. Never
+        # mirror what the sensitivity filter just refused.
+        if record_id:
+            await self._mirror(
+                f"profile_fact:{key}",
+                memory_writer.record_profile_fact(
+                    owner_id=user_id, key=key, value=value,
+                    source=source, confidence=confidence,
+                ),
+            )
+        return record_id
 
     async def get_profile_facts(self, user_id: str, key: Optional[str] = None) -> List[Dict[str, Any]]:
         return await self.short_term.get_profile_facts(user_id, key)
@@ -510,19 +709,6 @@ class MemoryManager:
     async def get_session_turn_count(self, user_id: str, session_id: str) -> int:
         return await self.short_term.get_session_turn_count(user_id, session_id)
 
-    # M5: Agent Playbook pass-throughs
-    async def save_playbook(
-        self, agent_name: str, version: str, prompt: str,
-        notes: Optional[str] = None, set_active: bool = True
-    ) -> str:
-        return await self.short_term.save_playbook(agent_name, version, prompt, notes, set_active)
-
-    async def get_active_playbook(self, agent_name: str) -> Optional[Dict]:
-        return await self.short_term.get_active_playbook(agent_name)
-
-    async def list_playbooks(self, agent_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        return await self.short_term.list_playbooks(agent_name)
-
     # Tool Memory pass-throughs (Fix 3: Cross-Session Tool Learning)
     async def save_tool_outcome(
         self,
@@ -534,9 +720,20 @@ class MemoryManager:
         key_insight: str,
     ) -> str:
         """Persist a tool-use outcome for future hint retrieval."""
-        return await self.short_term.save_tool_memory(
+        record_id = await self.short_term.save_tool_memory(
             user_id, agent_name, tool_name, inputs_summary, outcome_quality, key_insight
         )
+        # Only successful strategies become procedural memory — a failed
+        # approach is not knowledge worth reusing.
+        if outcome_quality == "good":
+            await self._mirror(
+                f"tool_outcome:{agent_name}:{tool_name}",
+                memory_writer.record_tool_outcome(
+                    owner_id=user_id, agent_name=agent_name, tool_name=tool_name,
+                    inputs_summary=inputs_summary, key_insight=key_insight,
+                ),
+            )
+        return record_id
 
     async def get_tool_insights(
         self,
@@ -555,9 +752,18 @@ class MemoryManager:
         agent_used: Optional[str] = None, intent: Optional[str] = None,
         outcome: str = "success",
     ) -> str:
-        return await self.short_term.store_episode(
+        record_id = await self.short_term.store_episode(
             user_id, session_id, user_summary, agent_summary, agent_used, intent, outcome
         )
+        await self._mirror(
+            f"episode:{session_id}",
+            memory_writer.record_episode(
+                owner_id=user_id, session_id=session_id,
+                user_summary=user_summary, agent_summary=agent_summary,
+                agent_used=agent_used, intent=intent, outcome=outcome,
+            ),
+        )
+        return record_id
 
     async def get_recent_episodes(self, user_id: str, limit: int = 5) -> List[Dict[str, Any]]:
         return await self.short_term.get_recent_episodes(user_id, limit)

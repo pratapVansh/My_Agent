@@ -6,9 +6,12 @@ import asyncio
 import sys
 from pathlib import Path
 import argparse
-from PyPDF2 import PdfReader
-from app.memory.memory_manager import memory_manager
-from app.services.chunking_service import chunking_service
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from PyPDF2 import PdfReader  # noqa: E402
+from app.memory.memory_manager import memory_manager  # noqa: E402
+from app.services.chunking_service import chunking_service  # noqa: E402
 
 
 async def extract_text_from_pdf(pdf_path: str) -> str:

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from app.config import settings
 from app.memory.memory_manager import memory_manager
+from app.domain.jobs import jobs_repository
 from app.memory.short_term_memory import short_term_memory
 from app.services.langsmith_service import traceable
 
@@ -45,7 +46,7 @@ class JobSearchTool:
         search_query = self._build_search_query(query=query, location=location, skills=user_skills)
 
         # Fetch already-seen URLs for deduplication
-        seen_urls = await short_term_memory.get_bookmarked_urls(user_id)
+        seen_urls = await jobs_repository.get_bookmarked_urls(user_id)
 
         # Search Tavily
         raw_results = await self._search_with_tavily(search_query=search_query, max_results=max_results * 2)
@@ -92,7 +93,7 @@ class JobSearchTool:
                 query="technical skills programming languages tools frameworks",
                 limit=5,
             )
-            if not skills_data or skills_data == "NO_DATA":
+            if not skills_data:
                 return []
 
             skill_tokens: List[str] = []

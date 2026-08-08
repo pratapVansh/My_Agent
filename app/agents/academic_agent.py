@@ -9,6 +9,7 @@ from app.agents.state import make_envelope
 from app.auth.models import Scope
 from app.tools.timetable_tool import timetable_tool, TimetableInput
 from app.memory.memory_manager import memory_manager
+from app.domain.academic import academic_repository
 
 
 class AcademicAgent(BaseAgent):
@@ -120,7 +121,7 @@ Always confirm after storing data."""
                 status = "present"
             rec_date = _parse_date_str(str(tool_input.get("date", "today")))
             notes = tool_input.get("notes")
-            rec_id = await memory_manager.store_attendance(
+            rec_id = await academic_repository.store_attendance(
                 user_id=user_id,
                 date=rec_date,
                 subject=subject,
@@ -134,7 +135,7 @@ Always confirm after storing data."""
             }
 
         async def tool_get_attendance_summary(tool_input: Dict[str, Any]):
-            records = await memory_manager.retrieve_attendance(user_id=user_id)
+            records = await academic_repository.retrieve_attendance(user_id=user_id)
             if not records:
                 return {"success": True, "summary": [], "message": "No attendance records found."}
             from collections import defaultdict
@@ -167,7 +168,7 @@ Always confirm after storing data."""
             exam_date = _parse_date_str(str(tool_input.get("exam_date", "")))
             start_t_str = tool_input.get("start_time")
             start_t = _parse_time_str(str(start_t_str)) if start_t_str else None
-            exam_id = await memory_manager.store_exam(
+            exam_id = await academic_repository.store_exam(
                 user_id=user_id,
                 subject=subject,
                 exam_date=exam_date,
@@ -183,16 +184,16 @@ Always confirm after storing data."""
             }
 
         async def tool_get_upcoming_exams(tool_input: Dict[str, Any]):
-            exams = await memory_manager.retrieve_exams(user_id=user_id, upcoming_only=True)
+            exams = await academic_repository.retrieve_exams(user_id=user_id, upcoming_only=True)
             if not exams:
                 return {"success": True, "count": 0, "exams": [], "message": "No upcoming exams."}
             return {"success": True, "count": len(exams), "exams": exams}
 
         async def tool_generate_study_schedule(tool_input: Dict[str, Any]):
             """LLM-based study plan from exams + timetable context."""
-            exams = await memory_manager.retrieve_exams(user_id=user_id, upcoming_only=True)
-            timetable = await memory_manager.retrieve_timetable(user_id=user_id)
-            attendance_records = await memory_manager.retrieve_attendance(user_id=user_id)
+            exams = await academic_repository.retrieve_exams(user_id=user_id, upcoming_only=True)
+            timetable = await academic_repository.retrieve_timetable(user_id=user_id)
+            attendance_records = await academic_repository.retrieve_attendance(user_id=user_id)
 
             # Build attendance risk map
             from collections import defaultdict
@@ -251,7 +252,7 @@ Always confirm after storing data."""
             priority = str(tool_input.get("priority", "medium")).lower()
             if priority not in ("high", "medium", "low"):
                 priority = "medium"
-            plan_id = await memory_manager.store_plan(
+            plan_id = await academic_repository.store_plan(
                 user_id=user_id,
                 plan_date=plan_date,
                 title=title,
@@ -271,7 +272,7 @@ Always confirm after storing data."""
                 plan_date = _parse_date_str(date_str)
             else:
                 plan_date = None  # returns all upcoming
-            plans = await memory_manager.retrieve_plans(
+            plans = await academic_repository.retrieve_plans(
                 user_id=user_id,
                 plan_date=plan_date,
                 include_done=include_done,
@@ -285,7 +286,7 @@ Always confirm after storing data."""
             plan_id = str(tool_input.get("plan_id", "")).strip()
             if not plan_id:
                 return {"success": False, "reason": "plan_id is required"}
-            updated = await memory_manager.mark_plan_done(plan_id=plan_id, user_id=user_id)
+            updated = await academic_repository.mark_plan_done(plan_id=plan_id, user_id=user_id)
             return {
                 "success": updated,
                 "message": "Marked as done." if updated else "Plan not found.",

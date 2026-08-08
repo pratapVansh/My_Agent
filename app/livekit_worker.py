@@ -649,9 +649,20 @@ async def main(
     def get_or_create_state(identity: str) -> ParticipantState:
         state = participants.get(identity)
         if state is None:
-            state = ParticipantState(
-                identity=identity, session_id=f"lk_{room_name}_{identity}"
+            # Attach to the conversation the browser is showing, so speaking and
+            # typing continue one thread. Falling back to a room-derived id keeps
+            # voice working when the client is older than this field or storage
+            # was unavailable — a separate thread is worse than none.
+            from app.routes.livekit_routes import resolve_voice_conversation
+
+            conversation_id = (
+                resolve_voice_conversation(room_name, identity)
+                or f"lk_{room_name}_{identity}"
             )
+            logger.info(
+                "Voice participant %s attached to conversation %s", identity, conversation_id
+            )
+            state = ParticipantState(identity=identity, session_id=conversation_id)
             participants[identity] = state
         return state
 

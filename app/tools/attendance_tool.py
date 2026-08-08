@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.memory.memory_manager import memory_manager
+from app.domain.academic import academic_repository
 from app.services.langsmith_service import traceable
 from app.services.url_guard import UnsafeURLError, assert_safe_outbound_url
 
@@ -76,7 +77,7 @@ class AttendanceTool:
             # Idempotent on (user_id, date, subject): re-running a scrape
             # updates existing rows instead of duplicating them, which would
             # inflate the totals used for attendance-percentage warnings.
-            rec_id = await memory_manager.store_attendance(
+            rec_id = await academic_repository.store_attendance(
                 user_id=user_id,
                 date=row_date,
                 subject=subject,

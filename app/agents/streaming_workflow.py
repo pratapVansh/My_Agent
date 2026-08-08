@@ -69,6 +69,8 @@ async def run_streaming_workflow(
     conversation_history: list = None,
     output_mode: str = "user",
     scopes: Optional[FrozenSet[str]] = None,
+    memory_owner_id: Optional[str] = None,
+    memory_visibilities: Optional[list] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     Run workflow with true LLM token streaming for low-latency voice/UI.
@@ -94,6 +96,8 @@ async def run_streaming_workflow(
         "conversation_history": conversation_history or [],
         "output_mode": output_mode,
         "scopes": scopes,
+        "memory_owner_id": memory_owner_id,
+        "memory_visibilities": memory_visibilities,
         "memory_context": None,
         "memory_prompt": None,
         "detected_intent": None,

@@ -46,9 +46,6 @@ class Scope(str, Enum):
 
     VOICE = "voice"                     # mint a LiveKit room token
 
-    PLAYBOOKS_READ = "playbooks:read"
-    PLAYBOOKS_WRITE = "playbooks:write"
-
 
 # The owner is the account the assistant belongs to: full capability.
 OWNER_SCOPES: FrozenSet[str] = frozenset(scope.value for scope in Scope)

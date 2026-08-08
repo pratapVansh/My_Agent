@@ -3,9 +3,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
+  archiveConversation,
   askWithVoice,
   ChatMessage,
   ChatMode,
+  fetchConversation,
   fetchProfileFacts,
   forgetProfileFact,
   getLiveKitToken,
@@ -41,6 +43,46 @@ function createConversationSessionId() {
     return `session_${crypto.randomUUID()}`;
   }
   return `session_${uid()}_${Date.now()}`;
+}
+
+// The conversation id is persisted so a refresh, a browser restart, or a
+// navigation away and back resumes the same thread. Previously it was minted
+// fresh on every mount and never stored, so the server — which scopes chat
+// history by exactly this id — saw each page load as a brand-new conversation
+// and the thread was silently lost.
+//
+// Scoped per mode so the owner and recruiter views keep separate threads.
+function conversationStorageKey(mode: ChatMode) {
+  return `my_agent.conversation_id.${mode}`;
+}
+
+function loadStoredConversationId(mode: ChatMode): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(conversationStorageKey(mode));
+  } catch {
+    // Private browsing and some embedded webviews deny storage access. A
+    // non-resumable session is a degraded experience, not a broken one.
+    return null;
+  }
+}
+
+function storeConversationId(mode: ChatMode, conversationId: string) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(conversationStorageKey(mode), conversationId);
+  } catch {
+    /* storage unavailable — continue without persistence */
+  }
+}
+
+function clearStoredConversationId(mode: ChatMode) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(conversationStorageKey(mode));
+  } catch {
+    /* storage unavailable */
+  }
 }
 
 export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
@@ -138,7 +180,48 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
         }
 
         setIdentity(session);
-        setSessionId(createConversationSessionId());
+
+        // Resume the stored thread. A refresh must never start a new
+        // conversation, so the stored id is kept whatever the server says:
+        //
+        //  - turns returned      → rehydrate the transcript;
+        //  - 404 (no turns yet)  → keep the id; the thread is created by the
+        //                          first turn, and a brand-new id here would
+        //                          orphan a conversation the user is mid-way
+        //                          through;
+        //  - network/API failure → keep the id and leave the view empty rather
+        //                          than silently forking the thread. Minting a
+        //                          fresh id on a transient error is how a
+        //                          refresh came to look like Clear Chat.
+        //
+        // Only the genuine absence of a stored id creates one.
+        const stored = loadStoredConversationId(mode);
+
+        if (stored) {
+          setSessionId(stored);
+          try {
+            const existing = await fetchConversation(stored);
+            if (cancelled) return;
+            if (existing) {
+              setMessages(
+                existing.turns.map((turn) => ({
+                  id: `${stored}_${turn.sequence}`,
+                  role: turn.role,
+                  text: turn.content,
+                  createdAt: turn.created_at ? Date.parse(turn.created_at) : Date.now(),
+                  agentName: turn.agent ?? undefined,
+                }))
+              );
+            }
+          } catch (e) {
+            console.warn("Could not resume the previous conversation", e);
+          }
+        } else {
+          const fresh = createConversationSessionId();
+          storeConversationId(mode, fresh);
+          setSessionId(fresh);
+        }
+
         setAuthState("ready");
       } catch (e) {
         if (cancelled) return;
@@ -237,8 +320,32 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   const ensureConversationId = () => {
     if (sessionId) return sessionId;
     const fresh = createConversationSessionId();
+    storeConversationId(mode, fresh);
     setSessionId(fresh);
     return fresh;
+  };
+
+  // Start a new thread. Three operations are deliberately distinct here:
+  //
+  //   Refresh   — same conversation, rehydrated (handled at mount; never calls this)
+  //   New Chat  — new conversation, previous one left active and listable
+  //   Clear     — new conversation, previous one archived
+  //
+  // Only an explicit user action reaches this function. A reload must never
+  // create a conversation, which is the bug this separation exists to prevent.
+  const startNewConversation = async ({ archivePrevious }: { archivePrevious: boolean }) => {
+    const previous = sessionId;
+    const fresh = createConversationSessionId();
+    storeConversationId(mode, fresh);
+    setSessionId(fresh);
+    setMessages([]);
+    if (previous && archivePrevious) {
+      try {
+        await archiveConversation(previous);
+      } catch (e) {
+        console.warn("Could not archive the previous conversation", e);
+      }
+    }
   };
 
   
@@ -388,7 +495,7 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
     try {
       // The room is derived server-side from the authenticated identity, so
       // there is nothing for the client to choose (or spoof) here.
-      const { token, url, room_name: roomName } = await getLiveKitToken();
+      const { token, url, room_name: roomName } = await getLiveKitToken(ensureConversationId());
 
       const room = new Room({
         // Echo cancellation is what stops the assistant's own voice being
@@ -601,14 +708,27 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   };
 
   const handleClearChat = () => {
-    setMessages([]);
     setShowClearModal(false);
     setInput("");
     setInterimTranscript("");
-    setSessionId(createConversationSessionId());
     endTurn();
     setIsListening(false);
     void livekitRoomRef.current?.localParticipant.setMicrophoneEnabled(false);
+    // Starts a genuinely new persisted thread and archives the old one, rather
+    // than only emptying the view — otherwise the next reload would resume the
+    // conversation the user just asked to clear.
+    void startNewConversation({ archivePrevious: true });
+  };
+
+  // New Chat keeps the previous thread active and listable — it is a way to
+  // start a second conversation, not a way to discard the first.
+  const handleNewChat = () => {
+    setInput("");
+    setInterimTranscript("");
+    endTurn();
+    setIsListening(false);
+    void livekitRoomRef.current?.localParticipant.setMicrophoneEnabled(false);
+    void startNewConversation({ archivePrevious: false });
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -723,6 +843,15 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
                   </svg>
                 </button>
                 )}
+                <button
+                  onClick={handleNewChat}
+                  className="p-2.5 rounded-xl glass hover:glass-strong transition-all duration-200 text-white/80 hover:text-white group"
+                  title="New chat"
+                >
+                  <svg className="w-5 h-5 group-hover:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  </svg>
+                </button>
                 <button
                   onClick={() => setShowClearModal(true)}
                   className="p-2.5 rounded-xl glass hover:glass-strong transition-all duration-200 text-white/80 hover:text-white group"

@@ -63,11 +63,11 @@ HEADER_KEYWORDS = {
 
 async def clear_erp_records(user_id: str) -> int:
     """Delete all attendance records with 'ERP import' in notes for this user."""
-    from app.memory.short_term_memory import short_term_memory
+    from app.db.session import async_session_maker
     from sqlalchemy import delete, and_
-    from app.memory.models import Attendance
+    from app.domain.models import Attendance
 
-    async with short_term_memory.async_session_maker() as session:
+    async with async_session_maker() as session:
         result = await session.execute(
             delete(Attendance).where(
                 and_(
@@ -91,14 +91,14 @@ async def store_subject_attendance(
     All records use today's date with note 'ERP import'.
     Returns count of records stored.
     """
-    from app.memory.memory_manager import memory_manager
+    from app.domain.academic import academic_repository
 
     today = date.today()
     absent = total - attended
     stored = 0
 
     for i in range(attended):
-        await memory_manager.store_attendance(
+        await academic_repository.store_attendance(
             user_id=user_id,
             date=today,
             subject=subject,
@@ -108,7 +108,7 @@ async def store_subject_attendance(
         stored += 1
 
     for i in range(absent):
-        await memory_manager.store_attendance(
+        await academic_repository.store_attendance(
             user_id=user_id,
             date=today,
             subject=subject,

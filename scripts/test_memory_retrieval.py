@@ -3,7 +3,12 @@ Test memory retrieval from Qdrant.
 Verify that uploaded profile data can be retrieved.
 """
 import asyncio
-from app.memory.memory_manager import memory_manager
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.memory.memory_manager import memory_manager  # noqa: E402
 
 
 async def test_retrieval():

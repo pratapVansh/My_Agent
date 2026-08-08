@@ -29,18 +29,12 @@ class Settings(BaseSettings):
     port: int = 10000
 
     # Memory Configuration
-    # ChromaDB - Long-term memory
-    chroma_persist_dir: str = "./data/chroma"
-
-    # PostgreSQL - Short-term memory
+    # PostgreSQL — relational memory and application records
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_db: str = "my_agent_db"
     postgres_user: str = "postgres"
     postgres_password: str = ""
-
-    # mem0 - Smart memory
-    mem0_api_key: Optional[str] = None
 
     # Cohere Configuration (REQUIRED at runtime — see validate_required_keys())
     cohere_api_key: Optional[str] = None
@@ -61,6 +55,73 @@ class Settings(BaseSettings):
     postgres_max_overflow: int = 20
     postgres_pool_timeout: int = 30
     postgres_pool_recycle: int = 1800
+
+    # ── Memory redesign rollout ──────────────────────────────────────────
+    # Phase 1 mirrors structured writes into the unified `memory_records`
+    # table while the legacy tables continue to serve every read. Mirroring is
+    # additive and failure-tolerant, so it defaults on; the flag exists to kill
+    # it instantly without a deploy if it ever misbehaves in production.
+    # See docs/MEMORY_ARCHITECTURE.md §6.
+    memory_v2_dual_write: bool = True
+
+    # Phase 2 runs the new retrieval engine alongside the legacy path, logging
+    # a comparison while the legacy result is always what gets served. It runs
+    # in the background so it adds no turn latency.
+    #
+    # Defaults OFF, unlike dual-write: comparing against a store that has not
+    # been backfilled yet produces noise, not signal. Enable after running
+    # scripts/migrate_memory_v2.py --apply.
+    memory_v2_shadow_read: bool = False
+
+    # Token budget for the assembled memory block. Allocated across tiers
+    # before rendering — see docs/MEMORY_ARCHITECTURE.md §3.7.
+    memory_v2_budget_tokens: int = 6000
+
+    # ── Phase 3: asynchronous extraction ─────────────────────────────────
+    # Turns are extracted in batches rather than one at a time: roughly 5x
+    # cheaper, and a multi-turn window yields better memories because a single
+    # turn frequently lacks the context to state a self-contained fact.
+    memory_extraction_batch_size: int = 5
+    # A short conversation must not sit unextracted forever waiting to reach
+    # the batch size, so a group also flushes once it has been idle this long.
+    memory_extraction_idle_flush_seconds: float = 180.0
+
+    # The background worker drains the outbox and embeds pending records.
+    # In-process is correct for a single-instance deployment; run
+    # scripts/run_memory_worker.py instead when scaling out.
+    memory_worker_enabled: bool = True
+    memory_worker_poll_seconds: float = 30.0
+    memory_embedding_batch_size: int = 32
+
+    # Turns off the legacy per-utterance vector write. Kept ON by default
+    # because the *legacy* prompt still reads that data — flipping this before
+    # the Phase 6 read cutover would remove a served signal without its
+    # replacement being served yet. See docs/MEMORY_ARCHITECTURE.md §6.
+    memory_v2_replace_raw_embedding: bool = False
+
+    # ── Phase 5: lifecycle ───────────────────────────────────────────────
+    # Maintenance runs far less often than extraction — these are sweeps over
+    # the whole store, not per-turn work.
+    memory_maintenance_enabled: bool = True
+    memory_maintenance_interval_seconds: float = 3600.0
+
+    # A record is archived when importance × recency falls below this. Archived
+    # records leave default retrieval but remain searchable on demand and are
+    # never deleted, so the threshold errs generous.
+    memory_decay_threshold: float = 0.15
+    # Nothing is archived before this age regardless of score: a brand-new
+    # low-importance memory has not had a chance to prove useful yet.
+    memory_decay_min_age_days: float = 30.0
+
+    # Cosine similarity above which two same-kind memories are treated as
+    # near-duplicates and merged. Deliberately high — wrongly merging two
+    # distinct facts destroys information, while missing a duplicate only
+    # wastes a row.
+    memory_dedup_similarity_threshold: float = 0.92
+
+    # Anonymous recruiter sessions accumulate a permanent partition each. They
+    # are purged after this long with no activity.
+    memory_guest_retention_days: int = 30
 
     # Text Chunking Configuration
     chunk_size: int = 400

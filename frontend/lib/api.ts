@@ -173,18 +173,83 @@ export async function uploadTimetablePdf(file: File): Promise<{
   return resp.json();
 }
 
+export type ConversationSummary = {
+  id: string;
+  title: string;
+  status: string;
+  modality: string;
+  turn_count: number;
+  started_at: string | null;
+  last_active_at: string | null;
+};
+
+export type ConversationTurn = {
+  sequence: number;
+  role: "user" | "assistant";
+  content: string;
+  modality: string;
+  agent?: string | null;
+  created_at: string | null;
+};
+
+/** List the signed-in user's conversation threads, most recent first. */
+export async function fetchConversations(): Promise<ConversationSummary[]> {
+  const resp = await authFetch(`/api/v1/agents/conversations`, { method: "GET" });
+  if (!resp.ok) {
+    throw new Error(await readError(resp, `Could not load conversations (${resp.status})`));
+  }
+  const data = await resp.json();
+  return (data.conversations ?? []) as ConversationSummary[];
+}
+
+/**
+ * Fetch one thread and its turns.
+ *
+ * Returns null for 404 rather than throwing: a stored conversation id that no
+ * longer exists (cleared server-side, or belonging to a previous account on
+ * this browser) is an expected condition, and the caller simply starts fresh.
+ */
+export async function fetchConversation(
+  conversationId: string
+): Promise<{ conversation: ConversationSummary; turns: ConversationTurn[] } | null> {
+  const resp = await authFetch(
+    `/api/v1/agents/conversations/${encodeURIComponent(conversationId)}`,
+    { method: "GET" }
+  );
+  if (resp.status === 404) return null;
+  if (!resp.ok) {
+    throw new Error(await readError(resp, `Could not load conversation (${resp.status})`));
+  }
+  const data = await resp.json();
+  return { conversation: data.conversation, turns: data.turns ?? [] };
+}
+
+/** Archive a thread. Turns are retained; extracted memories stay valid. */
+export async function archiveConversation(conversationId: string): Promise<void> {
+  const resp = await authFetch(
+    `/api/v1/agents/conversations/${encodeURIComponent(conversationId)}`,
+    { method: "DELETE" }
+  );
+  if (!resp.ok && resp.status !== 404) {
+    throw new Error(await readError(resp, `Could not archive conversation (${resp.status})`));
+  }
+}
+
 /**
  * Request a LiveKit token for this session's own voice room.
  * The room is derived server-side from the authenticated identity.
  */
-export async function getLiveKitToken(): Promise<{
+export async function getLiveKitToken(conversationId?: string): Promise<{
   token: string;
   url: string;
   room_name: string;
 }> {
   const resp = await authFetch(`/api/v1/voice/token`, {
     method: "POST",
-    body: JSON.stringify({}),
+    // Voice turns join the conversation on screen. Without this the worker
+    // derives its own thread from the room name, and everything said out loud
+    // is persisted somewhere the UI never reads.
+    body: JSON.stringify(conversationId ? { conversation_id: conversationId } : {}),
   });
 
   if (!resp.ok) {

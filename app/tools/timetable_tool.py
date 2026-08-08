@@ -9,6 +9,7 @@ from datetime import datetime, time
 from typing import Any, Dict, List, Optional
 
 from app.memory.memory_manager import memory_manager
+from app.domain.academic import academic_repository
 from app.services.langsmith_service import traceable
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ class TimetableTool:
                 })
                 continue
 
-            rec_id = await memory_manager.store_timetable_entry(
+            rec_id = await academic_repository.store_timetable_entry(
                 user_id=user_id,
                 day_of_week=entry.day_of_week,
                 start_time=start_t,
@@ -94,8 +95,8 @@ class TimetableTool:
         day_of_week: Optional[int] = None,
         low_attendance_threshold: float = 75.0,
     ) -> Dict[str, Any]:
-        attendance_records = await memory_manager.retrieve_attendance(user_id=user_id)
-        timetable_entries = await memory_manager.retrieve_timetable(user_id=user_id, day_of_week=day_of_week)
+        attendance_records = await academic_repository.retrieve_attendance(user_id=user_id)
+        timetable_entries = await academic_repository.retrieve_timetable(user_id=user_id, day_of_week=day_of_week)
 
         attendance_map = self._attendance_percentage_by_subject(attendance_records)
 

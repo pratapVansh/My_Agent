@@ -5,16 +5,20 @@ Creates PostgreSQL database and tables for short-term memory.
 import asyncio
 import sys
 import os
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import text
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 
 # Fix Windows console encoding
 if sys.platform == "win32":
     os.system('')  # Enable ANSI escape codes
     sys.stdout.reconfigure(encoding='utf-8')
 
-from app.config import settings
-from app.memory.models import Base
+from app.config import settings  # noqa: E402
+from app.db import Base  # noqa: E402
 
 
 async def create_database():

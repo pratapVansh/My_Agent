@@ -1,17 +1,25 @@
 """
-mem0 Smart Memory Implementation.
-Extracts and stores user preferences, interests, and behavioral patterns.
+Conversational vector memory.
 
-Note: mem0 embedding provider support varies by version. If Cohere is not supported,
-the system will gracefully disable smart memory (non-blocking).
+Stores user messages and assistant responses as embedded points in Qdrant so
+past turns can be recalled semantically.
+
+Historical note: this module was originally built around mem0, which is why it
+is still named "smart memory". The mem0 object was constructed but never called
+— every read and write went directly to Qdrant + Cohere, and mem0's own
+configured embedder (MiniLM, 384-dim) never matched the vectors actually stored
+(Cohere, 1024-dim). The dead integration was removed rather than left to mislead
+readers about where embeddings come from.
+
+This class is superseded by the extraction pipeline described in
+docs/MEMORY_ARCHITECTURE.md §3.5: writing every raw utterance is a noise
+amplifier that degrades retrieval as history grows. It remains in place until
+Phase 3 replaces it.
 """
-from mem0 import Memory
 from typing import List, Dict, Any, Optional
 import logging
 import uuid
 from qdrant_client.models import PointStruct
-from app.config import settings
-from app.services.groq_service import groq_service
 from app.services.qdrant_service import qdrant_service
 from app.services.cohere_service import cohere_service
 from app.services.debug_logger import log_step
@@ -20,46 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 class SmartMemory:
-    """
-    Smart memory using mem0.
-    Automatically extracts and maintains user preferences and interests.
-    """
+    """Semantic store for conversational turns, backed by Qdrant + Cohere."""
 
     def __init__(self):
-        """Initialize mem0 with Groq LLM and Cohere embeddings."""
-        self.memory = None
         self.qdrant = qdrant_service
         self.cohere = cohere_service
         self.collection_name = "smart_memory_chunks"
-
-        # Configure mem0 to use Groq LLM and HuggingFace embeddings (free, no API key)
-        config = {
-            "llm": {
-                "provider": "groq",
-                "config": {
-                    "model": settings.groq_model,
-                    "temperature": 0.7,
-                    "api_key": settings.groq_api_key
-                }
-            },
-            "embedder": {
-                "provider": "huggingface",
-                "config": {
-                    "model": "sentence-transformers/all-MiniLM-L6-v2"
-                }
-            },
-            "version": "v1.1"
-        }
-
-        # Initialize mem0
-        try:
-            self.memory = Memory.from_config(config)
-            logger.info("Smart memory initialized (mem0 + Qdrant)")
-        except Exception as e:
-            logger.warning("Smart memory initialization failed, disabling mem0: %s", e)
-            # Disable smart memory if mem0 setup fails. Avoid default mem0 fallback,
-            # which can instantiate OpenAI embeddings and require OPENAI_API_KEY.
-            self.memory = None
 
     async def initialize(self):
         """Initialize smart memory collection in Qdrant."""

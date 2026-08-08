@@ -5,6 +5,7 @@ LangGraph workflow with Phase 1 upgrades:
 - Structured TaskEnvelope flowing through all agents
 """
 import logging
+import re
 import uuid
 from typing import Dict, Any, FrozenSet, Literal, Optional
 import asyncio
@@ -12,6 +13,7 @@ import asyncio
 from langgraph.graph import StateGraph, END
 
 logger = logging.getLogger(__name__)
+from app.agents import profile_intent
 from app.agents.state import AgentState
 from app.agents.planner_agent import planner_agent
 from app.agents.job_agent import job_agent
@@ -46,11 +48,13 @@ async def memory_node(state: AgentState) -> AgentState:
         await memory_manager.on_user_input(
             user_id=user_id, session_id=session_id, user_message=user_input
         )
-        memory_context = await memory_manager.retrieve_context(
-            user_id=user_id, session_id=session_id, query=user_input
+        memory_context, memory_prompt = await memory_manager.build_memory_prompt(
+            user_id=user_id, session_id=session_id, query=user_input,
+            memory_owner_id=state.get("memory_owner_id"),
+            visibilities=state.get("memory_visibilities"),
         )
         state["memory_context"] = memory_context
-        state["memory_prompt"] = memory_manager.format_context_for_prompt(memory_context)
+        state["memory_prompt"] = memory_prompt
     except Exception as e:
         logger.error("Memory retrieval error: %s", e)
         state["memory_context"] = {}
@@ -85,10 +89,11 @@ async def parallel_init_node(state: AgentState) -> AgentState:
                 await memory_manager.on_user_input(
                     user_id=user_id, session_id=session_id, user_message=user_input
                 )
-                ctx = await memory_manager.retrieve_context(
-                    user_id=user_id, session_id=session_id, query=user_input
+                return await memory_manager.build_memory_prompt(
+                    user_id=user_id, session_id=session_id, query=user_input,
+                    memory_owner_id=state.get("memory_owner_id"),
+                    visibilities=state.get("memory_visibilities"),
                 )
-                return ctx, memory_manager.format_context_for_prompt(ctx)
             except Exception as e:
                 logger.error("Memory retrieval error: %s", e)
                 return {}, ""
@@ -312,16 +317,104 @@ async def reflect_node(state: AgentState) -> AgentState:
 # ─────────────────────────────────────────────
 # Routing functions
 # ─────────────────────────────────────────────
+def _is_self_referential(query: str) -> bool:
+    """
+    Whether the query asks about the user themselves or this conversation.
+
+    Delegates to the deterministic classifier so the workflow and the profile
+    agent agree on what counts as a personal question.
+    """
+    return profile_intent.is_self_referential(query)
+
+
+def _has_conversation_context(state: AgentState) -> bool:
+    """Whether earlier turns exist for a follow-up to refer back to."""
+    context = state.get("memory_context") or {}
+    if isinstance(context, dict) and context.get("chat_history"):
+        return True
+    return bool(state.get("conversation_history"))
+
+
+# The keys `MemoryManager.retrieve_context` actually returns. Kept in one place
+# so a rename cannot silently turn this check into "no memory, always clarify".
+_MEMORY_CONTEXT_KEYS = ("profile_facts", "episodes", "chat_history", "long_term", "preferences")
+
+
+def _has_memory_signal(state: AgentState) -> bool:
+    """Whether any memory source returned material for this turn."""
+    context = state.get("memory_context") or {}
+    if not isinstance(context, dict):
+        return bool(context)
+    for key in _MEMORY_CONTEXT_KEYS:
+        value = context.get(key)
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif value:
+            return True
+    # The assembled prompt is the ground truth about what the agent will see —
+    # if anything reached it, the turn is answerable from memory.
+    return bool((state.get("memory_prompt") or "").strip())
+
+
 def route_after_init(state: AgentState) -> Literal["clarification", "job", "email", "academic", "profile", "response"]:
-    """Route from parallel_init: clarify OR dispatch to specialist."""
+    """
+    Route from parallel_init: clarify OR dispatch to specialist.
+
+    Clarification is the last resort, not the first. The planner scores intent
+    from the query text alone — memory is fetched concurrently, for speed — so
+    it cannot know whether an answer already exists, and it read "What is my
+    name?" as ambiguous and asked which name was meant while the name sat in
+    profile memory.
+
+    Retrieval is therefore attempted before the user is asked anything, whenever
+    the question is about the user and any memory source has material. If the
+    specialist genuinely finds nothing it says so, which is the honest answer;
+    asking the user to disambiguate their own name never was.
+    """
     if state.get("error"):
         return "response"
-    if state.get("needs_clarification"):
-        return "clarification"
+
     selected = state.get("selected_agent", "profile")
-    if selected in ("job", "email", "academic", "profile"):
+    if selected not in ("job", "email", "academic", "profile"):
+        selected = "profile"
+
+    query = state.get("user_input", "")
+    intent = profile_intent.classify(query, has_context=_has_conversation_context(state))
+
+    # Answer-first guard. A personal question is routed to retrieval whatever
+    # the planner concluded, because the planner cannot see the store it would
+    # be asking the user to substitute for.
+    #
+    # Note this does not require a memory signal: an empty store is not a reason
+    # to interrogate the user about their own name. Retrieval runs, and if it
+    # finds nothing the agent says so — "I couldn't find it" is the honest
+    # answer, "which one do you mean?" never was.
+    if intent is not None:
+        state["profile_intent"] = intent
+        if state.get("needs_clarification"):
+            log_step("CLARIFICATION SUPPRESSED", {
+                "reason": "personal-information query",
+                "intent": intent,
+                "agent": selected,
+                "confidence": state.get("planner_confidence", 0.0),
+            })
+            state["needs_clarification"] = False
+            state["clarification_question"] = ""
+        # Academic questions keep their agent — timetable and attendance live
+        # there — but anything else about the user belongs to profile, which
+        # owns résumé and profile retrieval.
+        if selected != "academic":
+            return "profile"
         return selected
-    return "profile"
+
+    if state.get("needs_clarification"):
+        # Not a personal question. Clarification survives for genuinely
+        # incomplete operational requests: "send this to him", "schedule a
+        # meeting" — a missing parameter no store can supply.
+        return "clarification"
+
+    return selected
 
 
 def route_after_reflect(state: AgentState) -> Literal["job", "email", "academic", "profile", "response"]:
@@ -428,6 +521,8 @@ async def run_workflow(
     conversation_history: list = None,
     output_mode: str = "user",
     scopes: Optional[FrozenSet[str]] = None,
+    memory_owner_id: Optional[str] = None,
+    memory_visibilities: Optional[list] = None,
 ) -> Dict[str, Any]:
     """
     Execute the multi-agent workflow.
@@ -457,6 +552,8 @@ async def run_workflow(
         "session_id": session_id,
         "output_mode": output_mode,
         "scopes": scopes,
+        "memory_owner_id": memory_owner_id,
+        "memory_visibilities": memory_visibilities,
         "conversation_history": conversation_history or [],
         "memory_context": None,
         "memory_prompt": None,

@@ -1,9 +1,13 @@
 """
 Comprehensive system test for RAG backend.
-Tests all components: Groq, Cohere, Qdrant, PostgreSQL, mem0
+Tests all components: Groq, Cohere, Qdrant, PostgreSQL
 """
 import asyncio
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 
 async def test_system():
     print("=" * 70)

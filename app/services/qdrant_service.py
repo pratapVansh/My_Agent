@@ -52,10 +52,16 @@ class QdrantService:
             )
         return self._client
 
+    # Payload fields the legacy collections filter on. New collections pass
+    # their own set — filtering on an unindexed field is not slow in Qdrant,
+    # it is a hard 400, so this list must match how the collection is queried.
+    DEFAULT_INDEX_FIELDS = ("user_id", "type", "semantic_type")
+
     async def ensure_collection(
         self,
         collection_name: str,
-        vector_size: Optional[int] = None
+        vector_size: Optional[int] = None,
+        index_fields: Optional[List[str]] = None,
     ) -> bool:
         """
         Create collection if it doesn't exist, and ensure user_id index.
@@ -90,8 +96,11 @@ class QdrantService:
                     f"{vector_size or self.vector_size} dimensions"
                 )
 
-            # Create payload indexes required for filtering.
-            for field_name in ["user_id", "type", "semantic_type"]:
+            # Create payload indexes required for filtering. Qdrant rejects a
+            # filter on an unindexed field with a 400 rather than falling back
+            # to a scan, so these must cover every field the collection is
+            # actually queried by.
+            for field_name in (index_fields or self.DEFAULT_INDEX_FIELDS):
                 try:
                     await self.client.create_payload_index(
                         collection_name=collection_name,
