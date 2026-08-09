@@ -14,7 +14,9 @@ logger = logging.getLogger(__name__)
 from app.memory.short_term_memory import short_term_memory
 from app.memory.smart_memory import smart_memory
 from app.memory.memory_cache import memory_cache
+from app.memory import write_policy
 from app.memory.retrieval_result import RetrievalResult
+from app.memory.sources import QueryCategory
 from app.memory.writer import memory_writer
 from app.config import settings
 from app.services.debug_logger import log_step
@@ -114,12 +116,35 @@ class MemoryManager:
             user_id, session_id, "user", user_message, metadata
         )
 
-        # Extract preferences/interests to smart memory (async, non-blocking)
+        # Extract preferences/interests to smart memory (async, non-blocking).
+        #
+        # Gated. Every user utterance used to be embedded verbatim, so "Okay.",
+        # "You are fool." and "Once in a million chat." became long-term
+        # memories ranked alongside the user's degree. The cost is not storage,
+        # it is recall: each fragment is a competing neighbour in embedding
+        # space, so retrieval for real questions degrades as history grows.
+        #
+        # The gate is deterministic and errs towards *not* storing: a durable
+        # fact missed today is usually restated, while a store full of "okay"
+        # cannot be cleaned up by any later pass.
+        decision = write_policy.should_store(user_message, role="user")
+        log_step("memory_write", {
+            "user_id": user_id,
+            "chars": len(user_message or ""),
+            **decision.summary(),
+        })
+        if not decision.store:
+            return
+
         try:
             await self.smart.extract_and_store(
                 user_id=user_id,
                 messages=[{"role": "user", "content": user_message}],
-                metadata=metadata
+                metadata={
+                    **(metadata or {}),
+                    "importance": decision.importance,
+                    "explicit": decision.explicit,
+                },
             )
         except Exception as e:
             logger.warning("Smart memory extraction failed: %s", e)
@@ -157,7 +182,10 @@ class MemoryManager:
         # the write that matters going forward — a worker decides what was
         # worth remembering, rather than the whole utterance being embedded
         # verbatim.
-        await self._enqueue_turn(user_id, session_id, agent_response, metadata)
+        user_text = await self._last_user_message(user_id, session_id)
+        await self._enqueue_turn(
+            user_id, session_id, agent_response, metadata, user_text=user_text
+        )
 
         # Legacy per-utterance vector write.
         #
@@ -166,6 +194,19 @@ class MemoryManager:
         # Disabling it before the Phase 6 read cutover would remove a live
         # signal while its replacement is still only running in shadow.
         if settings.memory_v2_replace_raw_embedding:
+            return
+
+        # Gated by what the *user* contributed, not by the reply's length.
+        # Storing the assistant's own prose after "okay" or "you are fool"
+        # closes a loop where the model's guesses become the evidence for its
+        # next guess — the reply is recalled later as though the user had said
+        # it. Substantive exchanges still reach the legacy path unchanged.
+        turn_decision = write_policy.should_store_turn(user_text, agent_response)
+        if not turn_decision.store:
+            log_step("memory_write", {
+                "user_id": user_id, "target": "legacy_vector",
+                **turn_decision.summary(),
+            })
             return
 
         # Two independent stores with no shared transaction. The Postgres write
@@ -234,20 +275,45 @@ class MemoryManager:
                 session_id, user_id, exc,
             )
 
+    async def _last_user_message(self, user_id: str, session_id: str) -> str:
+        """
+        The user's half of the turn just answered.
+
+        Read back from chat history rather than threaded through, because the
+        two halves are written by different code paths — streaming, voice and
+        the tool-calling workflow all differ here — and only the store has both.
+        """
+        try:
+            recent = await self.short_term.get_recent_context(
+                user_id=user_id, session_id=session_id, last_n=2
+            )
+            return next(
+                (m["content"] for m in reversed(recent) if m.get("role") == "user"),
+                "",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read back the user turn for user=%s session=%s: %s",
+                user_id, session_id, exc,
+            )
+            return ""
+
     async def _enqueue_turn(
         self,
         user_id: str,
         session_id: str,
         agent_response: str,
         metadata: Optional[Dict[str, Any]] = None,
+        user_text: Optional[str] = None,
     ) -> None:
         """
         Record one exchange in the extraction outbox.
 
-        The user's message for this turn is read back from chat history rather
-        than threaded through, so the event carries the full exchange even when
-        the two halves were written by different code paths (streaming, voice,
-        and the tool-calling workflow all differ here).
+        Filler exchanges are dropped here rather than queued: the extractor is
+        an LLM call per batch, and a batch of "okay"/"thanks" costs a request to
+        be told, correctly, that there is nothing to extract. The gate is looser
+        than the one on the request path — the extractor can read nuance the
+        pattern matcher cannot, so anything substantive still reaches it.
 
         Enqueueing is best-effort by design: an outbox failure must not fail a
         turn the user already received an answer to.
@@ -256,13 +322,11 @@ class MemoryManager:
             return
 
         try:
-            recent = await self.short_term.get_recent_context(
-                user_id=user_id, session_id=session_id, last_n=2
-            )
-            user_text = next(
-                (m["content"] for m in reversed(recent) if m.get("role") == "user"),
-                "",
-            )
+            if user_text is None:
+                user_text = await self._last_user_message(user_id, session_id)
+
+            if not write_policy.should_store_turn(user_text, agent_response).store:
+                return
 
             from app.memory.events import EventType, MemoryEvent
             from app.memory.stores.postgres_event_queue import postgres_event_queue
@@ -303,7 +367,9 @@ class MemoryManager:
         Returns:
             Dictionary with all relevant memories
         """
-        # Try cache first
+        # Try cache first. `get` returns a copy, so overwriting the volatile
+        # sections below cannot corrupt the entry for the next reader — it used
+        # to hand back its own storage, and every hit mutated it.
         cached = memory_cache.get(user_id, query)
         if cached:
             # Always fetch fresh chat history and profile facts — never stale
@@ -373,6 +439,7 @@ class MemoryManager:
         query: Optional[str] = None,
         memory_owner_id: Optional[str] = None,
         visibilities=None,
+        category: Optional[str] = None,
     ) -> tuple[Dict[str, Any], str]:
         """
         Retrieve memory and render it into a prompt block.
@@ -382,12 +449,16 @@ class MemoryManager:
         separately, which meant two places to keep in step and no single point
         at which the v2 engine could be compared against v1.
 
+        `category` is a `QueryCategory` value; when supplied, only the sources
+        that answer that kind of question are rendered. Passing None keeps the
+        historical behaviour of rendering everything.
+
         Returns (context, prompt) so callers keep access to the raw context.
         """
         context = await self.retrieve_context(
             user_id=user_id, session_id=session_id, query=query
         )
-        prompt = self.format_context_for_prompt(context)
+        prompt = self.format_context_for_prompt(context, category=category)
 
         if settings.memory_v2_shadow_read:
             # Detached deliberately. Shadow retrieval exists to gather
@@ -444,9 +515,75 @@ class MemoryManager:
             trace.degraded,
         )
 
-    def format_context_for_prompt(self, context: Dict[str, Any]) -> str:
+    # Which memory sections answer which kind of question.
+    #
+    # Dumping every source into every prompt is how a question about the user's
+    # CGPA arrived alongside their project list, their skills, four episode
+    # summaries and a résumé excerpt — and how the model, given a wall of
+    # loosely related text, produced a fluent answer drawn from the wrong part
+    # of it. Narrower context is both cheaper and more accurate.
+    #
+    # A category absent from this map renders everything, which is also what
+    # `category=None` does: a new category is under-filtered, never blind.
+    _SECTIONS_BY_CATEGORY: Dict[str, frozenset] = {
+        QueryCategory.PROFILE_IDENTITY.value: frozenset(
+            {"profile_facts", "chat_history", "resume"}),
+        QueryCategory.PROFILE_EDUCATION.value: frozenset(
+            {"profile_facts", "chat_history", "resume", "status"}),
+        QueryCategory.PROFILE_EXPERIENCE.value: frozenset(
+            {"profile_facts", "chat_history", "resume", "status"}),
+        QueryCategory.PROFILE_ACHIEVEMENTS.value: frozenset(
+            {"profile_facts", "chat_history", "resume", "status"}),
+        QueryCategory.PROFILE_SKILLS.value: frozenset(
+            {"profile_facts", "chat_history", "skills", "resume", "status"}),
+        QueryCategory.PROFILE_PROJECTS.value: frozenset(
+            {"profile_facts", "chat_history", "projects", "resume", "status"}),
+        QueryCategory.DOCUMENT_RESUME.value: frozenset(
+            {"profile_facts", "chat_history", "resume", "skills", "projects", "status"}),
+        QueryCategory.EXPLICIT_MEMORY.value: frozenset(
+            {"profile_facts", "chat_history", "episodes"}),
+        QueryCategory.CONVERSATION_CURRENT.value: frozenset(
+            {"chat_history", "profile_facts"}),
+        QueryCategory.CONVERSATION_FOLLOWUP.value: frozenset(
+            {"chat_history", "profile_facts", "projects", "skills", "resume"}),
+        QueryCategory.EPISODIC_MEMORY.value: frozenset(
+            {"episodes", "chat_history", "profile_facts"}),
+        # The clock answers these; memory is present only so the assistant does
+        # not lose the thread of the conversation it is in.
+        QueryCategory.TEMPORAL_CURRENT.value: frozenset({"chat_history"}),
+        QueryCategory.SCHEDULE_TEMPORAL.value: frozenset(
+            {"chat_history", "profile_facts", "episodes"}),
+        # A general question needs the user's stated preferences (tone, length)
+        # and the thread — not their résumé.
+        QueryCategory.GENERAL_KNOWLEDGE.value: frozenset(
+            {"profile_facts", "chat_history", "preferences"}),
+        QueryCategory.SMALL_TALK.value: frozenset({"chat_history", "profile_facts"}),
+        QueryCategory.ACTION_REQUEST.value: frozenset(
+            {"profile_facts", "chat_history", "preferences", "episodes"}),
+        QueryCategory.AMBIGUOUS_ACTION.value: frozenset(
+            {"chat_history", "profile_facts"}),
+    }
+
+    _ALL_SECTIONS = frozenset({
+        "profile_facts", "episodes", "chat_history", "preferences",
+        "skills", "projects", "status", "resume",
+    })
+
+    def sections_for(self, category: Optional[str]) -> frozenset:
+        """Which prompt sections this category of question should see."""
+        if not category:
+            return self._ALL_SECTIONS
+        return self._SECTIONS_BY_CATEGORY.get(category, self._ALL_SECTIONS)
+
+    def format_context_for_prompt(
+        self, context: Dict[str, Any], category: Optional[str] = None
+    ) -> str:
         """
         Format memory context into a clean prompt injection.
+
+        `category` narrows the rendered sections to the sources that answer that
+        kind of question (see `_SECTIONS_BY_CATEGORY`). None renders everything,
+        which is the historical behaviour and remains the default.
 
         Fix 5 — Priority-ordered sections to prevent silent data loss.
         Sections are written highest-priority first so that if the combined
@@ -464,16 +601,17 @@ class MemoryManager:
           7. Resume          — large blob; useful but survives partial loss
         """
         parts = []
+        allowed = self.sections_for(category)
 
         # ── 1. Profile Facts (highest priority — explicit user preferences) ──
-        profile_facts = context.get("profile_facts", [])
+        profile_facts = context.get("profile_facts", []) if "profile_facts" in allowed else []
         if profile_facts:
             lines = [f"- {f['key']}: {f['value']}" for f in profile_facts if f.get("value")]
             if lines:
                 parts.append("User Profile Facts:\n" + "\n".join(lines))
 
         # ── 2. Recent Episode Summaries (cross-session context) ──────────────
-        episodes = context.get("episodes", [])
+        episodes = context.get("episodes", []) if "episodes" in allowed else []
         if episodes:
             lines = [
                 f"- [{e.get('agent_used', '?')}] {e.get('user_summary', '')} → {e.get('agent_summary', '')}"
@@ -484,13 +622,13 @@ class MemoryManager:
                 parts.append("Recent Activity:\n" + "\n".join(lines))
 
         # ── 3. Recent Conversation (in-session continuity) ───────────────────
-        chat_history = context.get("chat_history", [])
+        chat_history = context.get("chat_history", []) if "chat_history" in allowed else []
         history_block = self._format_chat_history_for_prompt(chat_history)
         if history_block:
             parts.append(history_block)
 
         # ── 4. Smart Memory Preferences (inferred from conversations) ────────
-        preferences = context.get("preferences", [])
+        preferences = context.get("preferences", []) if "preferences" in allowed else []
         if preferences:
             pref_text = []
             for pref in preferences:
@@ -507,7 +645,7 @@ class MemoryManager:
         # Skills. The isinstance guard is retained because a cached context
         # dictionary written before RetrievalResult existed may still carry the
         # bare "NO_DATA" string in this slot.
-        skills = long_term.get("skills", [])
+        skills = long_term.get("skills", []) if "skills" in allowed else []
         if not isinstance(skills, list):
             skills = []
         if skills:
@@ -516,7 +654,7 @@ class MemoryManager:
                 parts.append("User Skills:\n" + "\n".join([f"- {s}" for s in skill_list if s]))
 
         # Projects — same legacy-cache guard as skills above.
-        projects = long_term.get("projects", [])
+        projects = long_term.get("projects", []) if "projects" in allowed else []
         if not isinstance(projects, list):
             projects = []
         if projects:
@@ -532,8 +670,8 @@ class MemoryManager:
         # the model is told the state is unknown instead. Both cases arm the
         # refusal policy, because both are states in which a model left to its
         # own devices invents an answer.
-        skills_status = long_term.get("skills_status")
-        projects_status = long_term.get("projects_status")
+        skills_status = long_term.get("skills_status") if "status" in allowed else None
+        projects_status = long_term.get("projects_status") if "status" in allowed else None
         if skills_status == "NO_DATA":
             parts.append("Retrieval Status: No skills data found in vector memory.")
         if projects_status == "NO_DATA":
@@ -558,7 +696,7 @@ class MemoryManager:
 
         # Resume — lowest priority: large, useful but partial loss is acceptable.
         # Capped at 300 chars (was 500) to leave room for other sections.
-        resume = long_term.get("resume", {})
+        resume = long_term.get("resume", {}) if "resume" in allowed else {}
         if resume and resume.get("content"):
             parts.append(f"User Resume:\n{resume['content'][:300]}")
 
@@ -611,10 +749,35 @@ class MemoryManager:
 
         return "Recent Conversation:\n" + "\n".join(lines)
 
+    # ── Cache coherence ─────────────────────────────────────────────────
+    #
+    # Every write that changes what retrieval would return must drop the cached
+    # context, or the assistant keeps answering from the superseded version for
+    # the cache's full TTL. Nothing called `invalidate` before: a résumé re-upload
+    # served the old résumé for five minutes, and a deleted memory kept being
+    # retrieved after the user had erased it — a deletion that silently did not
+    # take effect.
+    def _invalidate(self, user_id: str, reason: str) -> None:
+        try:
+            dropped = memory_cache.invalidate(user_id)
+            if dropped:
+                log_step("memory_cache_invalidated", {
+                    "user_id": user_id, "entries": dropped, "reason": reason,
+                })
+        except Exception as exc:
+            # A cache that fails to clear is a correctness problem, but failing
+            # the write that already succeeded would be worse.
+            logger.error(
+                "Could not invalidate memory cache for user=%s after %s: %s",
+                user_id, reason, exc,
+            )
+
     # Long-term operations (pass-through)
     async def store_resume(self, user_id: str, resume_text: str, metadata: Optional[Dict] = None) -> str:
         """Store resume in long-term memory."""
-        return await self.long_term.store_resume(user_id, resume_text, metadata)
+        record_id = await self.long_term.store_resume(user_id, resume_text, metadata)
+        self._invalidate(user_id, "store_resume")
+        return record_id
 
     async def search_long_term(
         self, user_id: str, query: str, limit: int = 5
@@ -640,7 +803,9 @@ class MemoryManager:
 
     async def store_skill(self, user_id: str, skill_name: str, skill_level: str, metadata: Optional[Dict] = None) -> str:
         """Store skill in long-term memory."""
-        return await self.long_term.store_skill(user_id, skill_name, skill_level, metadata)
+        record_id = await self.long_term.store_skill(user_id, skill_name, skill_level, metadata)
+        self._invalidate(user_id, "store_skill")
+        return record_id
 
     async def store_project(
         self,
@@ -651,7 +816,11 @@ class MemoryManager:
         metadata: Optional[Dict] = None
     ) -> str:
         """Store project in long-term memory."""
-        return await self.long_term.store_project(user_id, project_name, description, technologies, metadata)
+        record_id = await self.long_term.store_project(
+            user_id, project_name, description, technologies, metadata
+        )
+        self._invalidate(user_id, "store_project")
+        return record_id
 
     # ── Phase 1 dual-write ──────────────────────────────────────────────
     #
@@ -687,6 +856,7 @@ class MemoryManager:
         # An empty id means the value was rejected as credential-shaped. Never
         # mirror what the sensitivity filter just refused.
         if record_id:
+            self._invalidate(user_id, f"save_profile_fact:{key}")
             await self._mirror(
                 f"profile_fact:{key}",
                 memory_writer.record_profile_fact(
@@ -700,10 +870,15 @@ class MemoryManager:
         return await self.short_term.get_profile_facts(user_id, key)
 
     async def forget_profile_fact(self, user_id: str, key: str) -> bool:
-        return await self.short_term.forget_profile_fact(user_id, key)
+        deleted = await self.short_term.forget_profile_fact(user_id, key)
+        if deleted:
+            self._invalidate(user_id, f"forget_profile_fact:{key}")
+        return deleted
 
     async def forget_all_profile(self, user_id: str) -> int:
-        return await self.short_term.forget_all_profile(user_id)
+        count = await self.short_term.forget_all_profile(user_id)
+        self._invalidate(user_id, "forget_all_profile")
+        return count
 
     # Turn counter
     async def get_session_turn_count(self, user_id: str, session_id: str) -> int:

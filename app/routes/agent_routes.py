@@ -7,6 +7,7 @@ import logging
 import re
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from app.config import settings
@@ -1033,6 +1034,58 @@ async def forget_memory_record(
             record_id, principal.user_id, deleted,
         )
         return {"success": True, "deleted_count": deleted, "cascaded": deleted > 1}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise internal_error("Could not erase memory", e, user_id=principal.user_id)
+
+
+@router.delete("/memory/all")
+async def erase_all_memory(
+    confirm: str = "",
+    principal: Principal = Depends(require_owner),
+):
+    """
+    Erase everything the assistant remembers about the caller.
+
+    There was no way to do this. `DELETE /memory/records/{id}` removes one
+    memory and `DELETE /memory/profile/{user_id}` removes profile facts, but
+    nothing cleared the résumé chunks, conversation history, episodes, tool
+    memory or the conversational vector store — so "delete my data" could only
+    be answered partially, and the internal helper that claimed to do it
+    covered one store out of nine.
+
+    Requires `?confirm=erase`: this is irreversible, cascading, and cannot be
+    triggered by a stray DELETE.
+
+    Reports per-store results. A partial erasure returns 207 rather than 200,
+    because telling the user their data is gone when some of it survives is the
+    same false statement as reporting NO_DATA after a failed lookup.
+    """
+    if confirm != "erase":
+        raise HTTPException(
+            status_code=400,
+            detail="Irreversible operation. Repeat the request with ?confirm=erase",
+        )
+
+    try:
+        from app.memory.erasure import memory_erasure
+
+        report = await memory_erasure.erase_owner(principal.user_id)
+        payload = {"success": report.complete, **report.summary()}
+
+        if not report.complete:
+            logger.error(
+                "Partial erasure for user=%s; data survives in: %s",
+                principal.user_id, report.failed_stores,
+            )
+            return JSONResponse(status_code=207, content=payload)
+
+        logger.info(
+            "Erased all memory for user=%s (%d rows across %d stores)",
+            principal.user_id, report.deleted, len(report.results),
+        )
+        return payload
     except HTTPException:
         raise
     except Exception as e:

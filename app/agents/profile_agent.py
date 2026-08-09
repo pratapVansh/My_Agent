@@ -2,12 +2,20 @@
 Profile Agent - Handles user profile queries and general assistance.
 Returns a TaskEnvelope for structured coordination.
 """
-from typing import Dict, Any
+import logging
+from typing import Dict, Any, Optional
+
+from app.agents import profile_intent as profile_intent_module
 from app.agents.base_agent import BaseAgent
 from app.agents.state import make_envelope
 from app.auth.models import Scope
+from app.memory import identity as identity_module
 from app.memory.long_term_memory_qdrant import long_term_memory_qdrant
 from app.memory.memory_manager import memory_manager
+from app.memory.sources import QueryCategory
+from app.services.debug_logger import log_step
+
+logger = logging.getLogger(__name__)
 
 
 class ProfileAgent(BaseAgent):
@@ -22,6 +30,16 @@ class ProfileAgent(BaseAgent):
         user_input = state["user_input"]
         intent = state.get("detected_intent", "")
         user_id = state.get("user_id", "")
+
+        # ── Name directives are handled before the model sees them ───────────
+        # "Remember the name Devasi" and "update my name to X" differ only in
+        # clause, and the model got that difference wrong in the way that costs
+        # most: it changed the user's name. The decision is deterministic, so it
+        # is made deterministically, and the model is left to phrase the
+        # confirmation rather than to choose the key.
+        directive_state = await self._handle_name_directive(state, user_id, user_input)
+        if directive_state is not None:
+            return directive_state
 
         base_system_prompt = """You are a personal profile assistant. You help users understand their own professional profile.
 
@@ -41,8 +59,11 @@ Your capabilities:
 11. **list_my_memories** — show all stored preferences and profile facts.
 
 Question → tool (retrieve first, always):
-- name, "who am I"                          → get_profile_summary
-- college, university, CGPA, branch, degree → get_education
+- name, "who am I"                          → get_identity
+- "what name did I ask you to remember"     → recall_explicit_memory
+- today's date, the time, "what day is it"  → get_current_datetime
+- college, university, CGPA/CPI/SPI, branch,
+  degree                                    → get_education
 - internship, "where did I intern",
   "what company did I intern at", experience → get_experience
 - projects, portfolio                        → get_projects (pass `query` when
@@ -112,9 +133,29 @@ Answer first, clarify last:
   get_projects accepts a `query` for exactly this. Never ask the user to repeat
   a name they just used.
 
+Identity vs. remembered values — keep these apart:
+- The user's NAME is canonical identity. Only get_identity answers "what is my
+  name". A name the user asked you to remember is a different thing stored under
+  a different key, and it must never be offered as their own name.
+- "Remember the name X" stores X as a remembered value. It does NOT change who
+  the user is. Only an explicit instruction — "update my name to X", "my legal
+  name is X" — changes their name, and that is handled before you see the turn.
+- Never call remember_preference with key "name". It will be redirected.
+
+Current information is not memory:
+- Today's date, the current time, and the day of the week come from
+  get_current_datetime. Never answer them from stored text and never say you
+  have no real-time access — you have a clock.
+- "What do I have today/tomorrow" needs the date from get_current_datetime plus
+  the schedule from memory. Resolve the date yourself; don't ask which day.
+
 Rules:
 - Use ONLY information from tool results and the conversation context above.
   Do NOT invent or hallucinate.
+- A tool that FAILED is not a tool that found nothing. If a tool reports an
+  error or says a lookup could not be completed, say you couldn't retrieve it
+  right now. Never convert a failure into "you have no X on file" — that
+  asserts something you do not know.
 - If a specific piece of information is not found, say plainly that you don't
   have it — e.g. "I don't have your class 10 GPA on file." Never guess a value,
   and never ask a clarifying question in place of saying you don't have it.
@@ -158,6 +199,77 @@ Rules:
                 "projects": projects_list[:5],
                 "has_data": bool(resume_data or skills_list or projects_list),
             }
+
+        async def tool_get_identity(tool_input: Dict[str, Any]):
+            """
+            The user's canonical name — and only that.
+
+            Deliberately separate from every other name in the store. A name the
+            user asked to have remembered ("remember the name Devasi") lives
+            under its own key and must never be able to answer "what is my
+            name?"; the two are returned by different tools so no ranking
+            accident can substitute one for the other.
+
+            Résumé is the fallback source, not the primary one: an explicit
+            identity update supersedes a document, and the document supplies the
+            answer when no update has ever been made.
+            """
+            facts = await memory_manager.get_profile_facts(
+                user_id=user_id, key=identity_module.CANONICAL_NAME_KEY
+            )
+            canonical = next(
+                (f.get("value") for f in facts if f.get("value")), None
+            )
+            if canonical:
+                return {
+                    "success": True, "found": True, "name": canonical,
+                    "source": "canonical_identity",
+                    "provenance": "profile:canonical_name",
+                }
+
+            resume_data = await long_term_memory_qdrant.retrieve_resume(user_id=user_id)
+            resume_name = (resume_data or {}).get("name")
+            if resume_name:
+                return {
+                    "success": True, "found": True, "name": resume_name,
+                    "source": "resume_document", "provenance": "resume:header",
+                }
+
+            return {
+                "success": True, "found": False,
+                "message": "I don't have your name on file.",
+                "source": "canonical_identity",
+            }
+
+        async def tool_recall_explicit_memory(tool_input: Dict[str, Any]):
+            """
+            Read back what the user asked to have remembered.
+
+            Answers "what name did I ask you to remember?" — a different
+            question from "what is my name?", reaching a different key.
+            """
+            facts = await memory_manager.get_profile_facts(user_id=user_id)
+            remembered = [
+                {"key": f["key"], "value": f["value"]}
+                for f in facts
+                if identity_module.is_explicit_memory_key(f.get("key", ""))
+                and f.get("value")
+            ]
+            if not remembered:
+                return {
+                    "success": True, "found": False, "count": 0,
+                    "message": "You haven't asked me to remember anything yet.",
+                }
+            return {
+                "success": True, "found": True, "count": len(remembered),
+                "remembered": remembered, "source": "explicit_memory",
+            }
+
+        async def tool_get_current_datetime(tool_input: Dict[str, Any]):
+            """The clock. Never memory — see app/tools/time_tool.py."""
+            from app.tools import time_tool
+
+            return time_tool.as_tool_result(user_input)
 
         async def tool_get_skills(tool_input: Dict[str, Any]):
             """Retrieve user's skills from vector memory."""
@@ -296,6 +408,36 @@ Rules:
             value = str(tool_input.get("value", "")).strip()
             if not key or not value:
                 return {"success": False, "reason": "Both 'key' and 'value' are required."}
+
+            # Canonical identity is not writable through the generic memory
+            # tool. The model reached for this tool with key="name" after
+            # "remember the name Devasi" — a reasonable-looking call that
+            # rewrote who the user is. Identity changes require an explicit
+            # identity-update instruction, which is detected before the model
+            # runs; anything arriving here is redirected to its own namespace,
+            # where it is kept rather than lost.
+            if identity_module.is_canonical_key(key) or key in ("name", "full_name", "my_name"):
+                redirected = identity_module.explicit_key(key)
+                logger.info(
+                    "Redirected an identity write to the explicit namespace: %s → %s",
+                    key, redirected,
+                )
+                log_step("memory_write", {
+                    "user_id": user_id, "redirected_from": key,
+                    "key": redirected, "reason": "canonical identity is not "
+                                                 "writable without an explicit identity update",
+                })
+                record_id = await memory_manager.save_profile_fact(
+                    user_id=user_id, key=redirected, value=value,
+                    source="explicit", confidence=1.0, consent_level="explicit",
+                )
+                return {
+                    "success": True, "id": record_id, "key": redirected, "value": value,
+                    "message": f"Saved: {redirected} = {value}",
+                    "note": "Stored as a remembered value. Your name on file is "
+                            "unchanged — say 'update my name to ...' to change it.",
+                }
+
             source = str(tool_input.get("source", "explicit"))
             confidence = float(tool_input.get("confidence", 1.0))
             record_id = await memory_manager.save_profile_fact(
@@ -328,6 +470,34 @@ Rules:
             return {"success": True, "count": len(facts), "facts": facts}
 
         tools = {
+            "get_identity": {
+                "description": (
+                    "Retrieve the user's canonical name — the answer to 'what is "
+                    "my name', 'who am I'. This is the ONLY tool that answers a "
+                    "question about the user's actual name. Args: none."
+                ),
+                "callable": tool_get_identity,
+                "scope": Scope.PROFILE_READ.value,
+            },
+            "recall_explicit_memory": {
+                "description": (
+                    "Retrieve values the user explicitly asked you to remember. "
+                    "Use for 'what name did I ask you to remember', 'what did I "
+                    "tell you to remember', 'what have you saved'. This is NOT "
+                    "the user's own name. Args: none."
+                ),
+                "callable": tool_recall_explicit_memory,
+                "scope": Scope.PROFILE_READ.value,
+            },
+            "get_current_datetime": {
+                "description": (
+                    "Get the current date, time and weekday. Use for 'what is "
+                    "today's date', 'what time is it', and whenever you need to "
+                    "resolve 'today', 'tomorrow' or 'this week'. Never answer a "
+                    "date or time question from memory. Args: none."
+                ),
+                "callable": tool_get_current_datetime,
+            },
             "get_profile_summary": {
                 "description": (
                     "Fetch a complete profile overview including name, skills, projects, and resume snippet. "
@@ -432,7 +602,7 @@ Rules:
         try:
             loop_result = await self.execute_reasoning_loop(
                 state=state,
-                base_system_prompt=base_system_prompt,
+                base_system_prompt=base_system_prompt + self._routing_directive(state),
                 tools=tools,
                 max_iterations=3,
             )
@@ -484,6 +654,127 @@ Rules:
             state["task_result"] = envelope
             state["error"] = f"Profile agent error: {str(e)}"
             return state
+
+    # ── Deterministic pre-decisions ──────────────────────────────────────────
+
+    def _routing_directive(self, state: Dict[str, Any]) -> str:
+        """
+        Hand the model the decision that was already made for it.
+
+        The category and its source order were settled deterministically at the
+        routing edge. Restating them here — rather than hoping the model
+        re-derives the same conclusion from a tool list — is what stops "what is
+        my CPI" from being answered out of a project summary that happened to
+        rank well.
+        """
+        category = state.get("query_category") or ""
+        legacy = state.get("profile_intent") or ""
+        sources = state.get("memory_sources") or []
+        subject = state.get("followup_subject")
+
+        required = profile_intent_module.tools_for(legacy)
+        if category == QueryCategory.EXPLICIT_MEMORY.value:
+            required = ["recall_explicit_memory"]
+
+        if not (category or required):
+            return ""
+
+        lines = [
+            "\n\nROUTING DECISION (already made deterministically — follow it, "
+            "do not re-derive it):",
+        ]
+        if category:
+            lines.append(f"- Question type: {category}")
+        if sources:
+            lines.append(f"- Consult these sources in order: {', '.join(sources)}")
+        if required:
+            lines.append(
+                f"- Call {' then '.join(required)} FIRST, before saying anything "
+                f"about what you do or do not have."
+            )
+        if subject:
+            lines.append(
+                f"- This question refers to '{subject}' from earlier in the "
+                f"conversation. Pass it as the `query` argument where a tool "
+                f"accepts one, and never ask the user to repeat it."
+            )
+        lines.append(
+            "- If the tool returns nothing, say plainly that you don't have it. "
+            "If the tool reports a failure, say you could not look it up — do "
+            "NOT claim the information is absent. Never ask a clarifying "
+            "question in place of either statement."
+        )
+        return "\n".join(lines)
+
+    async def _handle_name_directive(
+        self, state: Dict[str, Any], user_id: str, user_input: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Execute a name instruction deterministically, or decline to see one.
+
+        Returns an updated state when the utterance was an instruction about a
+        name, and None otherwise — which is the overwhelmingly common case. The
+        asymmetry is the safety property: identity changes only when the
+        sentence explicitly asks for one.
+        """
+        directive = identity_module.detect_name_directive(user_input)
+        if directive is None or not user_id:
+            return None
+
+        canonical = directive.kind is identity_module.DirectiveKind.CANONICAL_UPDATE
+
+        previous = ""
+        if canonical:
+            facts = await memory_manager.get_profile_facts(
+                user_id=user_id, key=identity_module.CANONICAL_NAME_KEY
+            )
+            previous = next((f.get("value", "") for f in facts if f.get("value")), "")
+
+        await memory_manager.save_profile_fact(
+            user_id=user_id,
+            key=directive.key,
+            value=directive.value,
+            source="explicit",
+            confidence=1.0,
+            consent_level="explicit",
+        )
+
+        log_step("memory_write", {
+            "user_id": user_id,
+            "key": directive.key,
+            "canonical": canonical,
+            "reason": directive.reason,
+            "superseded": bool(previous),
+        })
+
+        if canonical:
+            message = f"Updated — I'll refer to you as {directive.value} from now on."
+            if previous and previous.lower() != directive.value.lower():
+                message += f" (Previously: {previous}.)"
+        else:
+            message = (
+                f"Noted — I'll remember the name {directive.value}. "
+                f"Your own name on file is unchanged."
+            )
+
+        envelope = make_envelope(
+            agent=self.name,
+            goal="record a name instruction",
+            inputs={"user_input": user_input},
+            result_content=message,
+            status="success",
+            confidence=0.95,
+            tools_used=["remember_preference"],
+        )
+        state["task_result"] = envelope
+        state["current_agent"] = self.name
+        state["agent_reasoning"] = (
+            f"Name directive handled deterministically: kind={directive.kind.value}, "
+            f"key={directive.key}"
+        )
+        if state.get("execution_path") is not None:
+            state["execution_path"].append(self.name)
+        return state
 
 
 # Singleton instance

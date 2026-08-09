@@ -936,6 +936,125 @@ works today would be false.
 management screen is UI work with no architectural risk, and it is a poor use
 of the remaining rollout risk budget compared with getting the cutover right.
 
+### Phase 6.5 — Source-aware retrieval ✅ **COMPLETE**
+
+Phases 0–6 built storage and retrieval. This phase supplies the thing that was
+missing between them: **a decision about where to look.**
+
+The evidence that it was missing came from real conversations, not from a
+metric. Asked "What is my current CPI?", the assistant answered "I don't have
+real-time access to your current CPI" — while the number sat in an `education`
+chunk that `retrieve_section` returns correctly and always had. Nothing was
+broken in the store. Every source was flattened into one prompt block, and the
+model was left to infer both relevance and trust from an undifferentiated wall
+of text.
+
+Five defects, one shape:
+
+| Symptom | Cause |
+|---|---|
+| "No real-time access to your CPI" | `CPI`/`SPI` absent from the CGPA vocabulary; query matched no subject and fell through to the planner |
+| "Remember the name Devasi" changed the user's name | No distinction between canonical identity and an explicitly remembered value |
+| "I don't have real-time access to the date" | No clock anywhere in the system |
+| Three scoping questions before answering "how do I build an AI agent" | Clarification unbudgeted, and how-to questions read as questions about the user's own projects |
+| "Okay." stored as long-term memory | Every utterance embedded verbatim |
+
+**New modules**
+
+- `app/memory/sources.py` — `QueryCategory`, `MemorySource`, `SOURCE_PRECEDENCE`,
+  `SOURCE_TRUST`, `RetrievedMemory`. Precedence says where to look; trust says
+  whom to believe when two sources disagree. They are deliberately different
+  orderings — a passing remark is the freshest thing in the store and the least
+  authoritative.
+- `app/agents/query_intent.py` — deterministic categorisation by grammatical
+  shape. Runs before the planner on every turn including spoken ones, so it
+  must cost microseconds; the LLM keeps only the genuinely ambiguous residue.
+- `app/memory/answerability.py` — `ANSWERABLE` / `PARTIALLY_ANSWERABLE` /
+  `NO_DATA` / `AMBIGUOUS` / `ACTION_MISSING_PARAMETER` / `TOOL_ERROR`.
+  `NO_DATA ≠ TOOL_ERROR` is the load-bearing distinction: telling a model there
+  is no data after a Qdrant timeout asserts something false, and is precisely
+  the state in which it invents an answer.
+- `app/memory/identity.py` — canonical identity, the explicit-memory namespace,
+  and a deterministic conflict resolver. Nothing in it deletes; every outcome
+  records the losing value with its provenance.
+- `app/memory/write_policy.py` — the gate deciding what earns a place in
+  long-term memory. Conservative towards *not* storing: a fact missed today is
+  usually restated, a store full of "okay" cannot be cleaned up later.
+- `app/tools/time_tool.py` — the clock, timezone from configuration rather than
+  the host. Injected into every agent prompt, and answerable without a model
+  call or a planner (so a rate-limited LLM cannot take the date down with it).
+- `app/agents/clarification_policy.py` — one question per conversation, and
+  none at all once the user has asked to be questioned less.
+
+**Wiring**
+
+- `workflow.decide_route` is now the single routing decision, shared by the
+  graph and the streaming path. The spoken path previously read
+  `needs_clarification` straight off the planner, so every policy the graph
+  applied was silently absent from voice turns.
+- A `temporal` node answers date/time deterministically and bypasses reflect.
+- `format_context_for_prompt(context, category=...)` renders only the sources
+  that answer that kind of question. `category=None` renders everything, so no
+  existing caller is narrowed silently, and an unmapped category degrades to
+  showing *more* rather than nothing.
+- `retrieve_resume` finally returns the `name` it has always stored. The chunk
+  existed with `semantic_type="name"`; nothing read it back, so every caller
+  doing `resume_data["name"]` — including the profile summary — got `None` from
+  a store holding the answer.
+
+**Preserved unchanged:** Qdrant, Postgres, `memory_records`, the event queue and
+worker, embeddings, decay, dedup, erasure, `RetrievalScope`, visibility, dual
+writes, shadow reads, resume ingestion, project entity IDs, and every legacy
+fallback. No read cutover was performed.
+
+**Tests:** `tests/test_memory_intelligence.py` — 131 cases covering all thirty
+named regressions. Each asserts the decision, not only the answer: selected
+category, selected source, whether retrieval occurred, whether clarification
+occurred and why, and provenance.
+
+### Phase 6.6 — Integrity audit ✅ **COMPLETE**
+
+An audit of the lifecycle, store and caching layers, looking for defects rather
+than missing features. Six were found; all six were places where the system
+*reported* one thing and *did* another.
+
+| Defect | Consequence |
+|---|---|
+| `forget_owner` erased 1 store of 9 | A user who erased their memory kept being answered from it. Legacy stores are authoritative until cutover, and none were touched. Guest collection was a no-op for the same reason. |
+| `memory_cache` was never invalidated | Every write — résumé re-upload, name correction, memory deletion — kept serving the stale value for the full 5-minute TTL. On the deletion path the deletion silently did not take effect. |
+| `memory_cache.get` returned its own storage | `retrieve_context` overwrote chat history *inside the cache* on every hit, corrupting the entry for the next reader and racing with concurrent turns on the same user. |
+| `identity.resolve_conflict` was dead code | Written and tested last phase, called from nowhere. The live writer still superseded on any content difference, so an inferred remark permanently overwrote résumé- and user-stated facts. |
+| `canonical_name` classified as `semantic` | Moving identity to its own key silently cost it always-injected status, the identity kind prior, and decay exemption — a name on a 365-day half-life. |
+| `MemoryRecord.pinned` was never set | Honoured by `is_decay_exempt` and by ranking, assigned by nothing. Explicit vs inferred existed in the schema and nowhere in behaviour. |
+
+**New:** `app/memory/erasure.py` — cross-store deletion with a per-store report.
+Stores are enumerated in one table; partial failure is named, never swallowed
+(`complete` is false and `failed_stores` lists the survivors); a store that
+cannot report a count returns `None` rather than a misleading `0`. Two drift
+guards in the tests fail the moment a Qdrant collection or an owner-keyed table
+is added without being registered.
+
+**New:** `DELETE /memory/all?confirm=erase` — there was no right-to-erasure
+endpoint at all. Returns 207 on partial erasure, because telling a user their
+data is gone while some of it survives is the same false statement as reporting
+NO_DATA after a failed lookup.
+
+**New:** the `degraded` workflow node. Found by a live run during a real Groq
+outage: every question became an error page, including ones whose answer is a
+database row. Identity and explicit-memory questions are now answered from
+stored records with no model call — they cannot hallucinate, because they
+compose no prose beyond a fixed template — and the reply distinguishes "I have
+no record of this" from "I couldn't think right now". Categories needing
+synthesis still fail honestly rather than guessing from fragments.
+
+**Changed:** `resolve_conflict` is wired into `MemoryWriter.upsert_with_outcome`,
+which gained `WriteOutcome.REJECTED`. Its equal-trust tie-break was also wrong —
+it kept the stored value, so a user correcting their own explicit fact was
+silently refused; only a demonstrably *older* claim now loses.
+
+**Preserved:** every existing store, flag, contract and fallback. No read
+cutover. 941 pre-existing tests still pass unchanged, plus 52 new ones.
+
 ### Phase 7 — Connectors
 
 - `Source` protocol + `sync_cursor`.

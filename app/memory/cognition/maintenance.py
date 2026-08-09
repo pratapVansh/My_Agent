@@ -93,7 +93,7 @@ def is_decay_exempt(record: MemoryRecord) -> bool:
 class MemoryMaintenance:
     """Periodic sweeps that keep the store useful as it ages."""
 
-    def __init__(self, record_store=None, vector_store=None, embedder=None):
+    def __init__(self, record_store=None, vector_store=None, embedder=None, erasure=None):
         if record_store is None:
             from app.memory.stores.postgres_record_store import postgres_record_store
             record_store = postgres_record_store
@@ -104,6 +104,20 @@ class MemoryMaintenance:
         self.records = record_store
         self.vectors = vector_store
         self.embedder = embedder
+        # Bound to *this* instance rather than the global singleton, so a
+        # maintenance object built over a test store erases that store. Reaching
+        # for the singleton here would silently ignore the injected dependency —
+        # the sweep would report a purge and leave the data untouched.
+        self._erasure = erasure
+
+    @property
+    def erasure(self):
+        """The cross-store eraser, wired to this instance's stores."""
+        if self._erasure is None:
+            from app.memory.erasure import MemoryErasure
+
+            self._erasure = MemoryErasure(maintenance=self)
+        return self._erasure
 
     async def run_once(self) -> MaintenanceStats:
         """
@@ -295,12 +309,24 @@ class MemoryMaintenance:
             if last_active >= cutoff:
                 continue
 
-            deleted = await self.forget_owner(owner_id)
+            # Erase across *every* store, not just `memory_records`. Purging one
+            # store and calling the partition collected is what let abandoned
+            # guest chat history, profile facts and vectors accumulate
+            # indefinitely — the exact cost this sweep exists to prevent.
+            report = await self.erasure.erase_owner(owner_id)
             stats.guests_purged += 1
-            stats.records_deleted += deleted
-            logger.info(
-                "Purged abandoned guest partition %s (%d records)", owner_id, deleted
-            )
+            stats.records_deleted += report.deleted
+            if not report.complete:
+                stats.failed_jobs.append(f"guest_gc:{owner_id}")
+                logger.error(
+                    "Guest partition %s only partially purged; these stores still "
+                    "hold data: %s", owner_id, report.failed_stores,
+                )
+            else:
+                logger.info(
+                    "Purged abandoned guest partition %s (%d records across %d stores)",
+                    owner_id, report.deleted, len(report.results),
+                )
 
     # ── forgetting ──────────────────────────────────────────────────────
 
@@ -338,7 +364,22 @@ class MemoryMaintenance:
                     "Could not delete vectors for erased records: %s", exc
                 )
 
-        return await self.records.hard_delete(doomed)
+        deleted = await self.records.hard_delete(doomed)
+
+        # A cached context assembled before this delete would keep serving the
+        # erased memory for the cache's full TTL — the deletion appearing to
+        # work and then not having happened.
+        try:
+            from app.memory.memory_cache import memory_cache
+
+            memory_cache.invalidate(owner_id)
+        except Exception as exc:
+            logger.error(
+                "Erased records for %s but could not clear the retrieval "
+                "cache; stale context may be served briefly: %s", owner_id, exc,
+            )
+
+        return deleted
 
     async def forget_owner(self, owner_id: str) -> int:
         """Erase everything belonging to one owner."""

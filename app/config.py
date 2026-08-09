@@ -237,6 +237,12 @@ class Settings(BaseSettings):
     # existing memory, so it defaults to the historical hardcoded value.
     owner_user_id: str = "vansh"
 
+    # The clock the assistant answers from. Taken from configuration rather
+    # than the host, because the host is a datacentre elsewhere: a server on
+    # UTC telling the user it is still yesterday is as wrong as answering the
+    # date from memory. Empty string means "use host local time".
+    assistant_timezone: str = "Asia/Kolkata"
+
     # Guest (recruiter/demo) sessions: anonymous, auto-issued, read-only.
     guest_sessions_enabled: bool = True
 

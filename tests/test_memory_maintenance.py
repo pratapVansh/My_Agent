@@ -400,12 +400,102 @@ async def test_the_owner_is_never_collected(store, monkeypatch):
     assert await store.count("vansh") == 1
 
 
+class FakeQdrant:
+    """Records which legacy collections an erasure actually cleared."""
+
+    def __init__(self):
+        self.cleared: list = []
+
+    async def delete_by_filter(self, collection_name, filter_conditions):
+        self.cleared.append((collection_name, filter_conditions.get("user_id")))
+
+
+class FakeSessionMaker:
+    """Records the Postgres tables an erasure deleted from."""
+
+    def __init__(self):
+        self.statements: list = []
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+
+        class _Result:
+            rowcount = 1
+
+        return _Result()
+
+    async def commit(self):
+        return None
+
+
+def build_erasure(maintenance):
+    """A cross-store eraser wired entirely to doubles — no network, no DB."""
+    from app.memory.erasure import MemoryErasure
+    from app.memory.memory_cache import MemoryCache
+
+    return MemoryErasure(
+        maintenance=maintenance,
+        cache=MemoryCache(),
+        session_maker=FakeSessionMaker(),
+        qdrant=FakeQdrant(),
+    )
+
+
 async def run_guest_gc(store):
+    """
+    Guest collection over doubles for every store it now touches.
+
+    Collection stopped being a `memory_records`-only operation once it was
+    found to leave chat history, profile facts and four Qdrant collections
+    behind. The doubles are injected rather than reached for so this stays a
+    unit test — an eraser that quietly required a live Postgres would make the
+    one path where silent partial failure is unacceptable the least tested.
+    """
     maintenance = MemoryMaintenance(record_store=store, vector_store=FakeVectors())
+    maintenance._erasure = build_erasure(maintenance)
     from app.memory.cognition.maintenance import MaintenanceStats
     stats = MaintenanceStats()
     await maintenance.collect_abandoned_guests(stats)
     return stats
+
+
+async def test_guest_collection_clears_every_store_not_just_records(store, monkeypatch):
+    """
+    The purge used to cover one store out of nine.
+
+    `memory_records` is not the store that answers questions — until the read
+    cutover the legacy tables are authoritative — so purging it alone let
+    abandoned guest data accumulate indefinitely while the sweep reported
+    success. This pins that every registered store is actually visited.
+    """
+    from app.memory.erasure import _POSTGRES_TABLES, _QDRANT_COLLECTIONS
+
+    monkeypatch.setattr(settings, "memory_guest_retention_days", 30)
+    await store.add(make(owner_id="guest-abc123", store_age_days=90))
+
+    maintenance = MemoryMaintenance(record_store=store, vector_store=FakeVectors())
+    erasure = build_erasure(maintenance)
+    maintenance._erasure = erasure
+
+    from app.memory.cognition.maintenance import MaintenanceStats
+    stats = MaintenanceStats()
+    await maintenance.collect_abandoned_guests(stats)
+
+    assert stats.guests_purged == 1
+    assert await store.count("guest-abc123") == 0
+    assert [name for name, _ in erasure._qdrant.cleared] == list(_QDRANT_COLLECTIONS)
+    assert all(owner == "guest-abc123" for _, owner in erasure._qdrant.cleared)
+    assert len(erasure._session_maker.statements) == len(_POSTGRES_TABLES)
+    assert stats.failed_jobs == []
 
 
 # ─────────────────────────────────────────────────────────────────────────

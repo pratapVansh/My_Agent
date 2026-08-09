@@ -40,7 +40,10 @@ CONVERSATION_FOLLOWUP = "CONVERSATION_FOLLOWUP"
 # Which retrieval each intent should reach for. Consumed by the profile agent so
 # the tool choice for these questions is not left to the model either.
 INTENT_TOOLS = {
-    PROFILE_NAME: ["get_profile_summary"],
+    # Identity reads canonical identity, not a profile summary. "What is my
+    # name?" must not be answerable from a name the user once asked to have
+    # remembered — see app/memory/identity.py.
+    PROFILE_NAME: ["get_identity"],
     PROFILE_EDUCATION: ["get_education"],
     PROFILE_CGPA: ["get_education"],
     PROFILE_COLLEGE: ["get_education"],
@@ -76,7 +79,13 @@ _ABOUT_SELF_RE = re.compile(r"\babout\s+(me|myself|us|ourselves)\b")
 # "what company did I intern at" and "tell me about my internship".
 _SUBJECTS = [
     (PROFILE_INTERNSHIP, {"intern", "interned", "interning", "internship", "internships"}),
-    (PROFILE_CGPA, {"cgpa", "gpa", "grade", "grades", "percentage", "marks", "score"}),
+    # CPI/SPI are what this user's institute calls the CGPA, and their absence
+    # here is the whole of failure #1: "what is my current CPI" matched no
+    # subject, fell through to the planner, and came back "I don't have
+    # real-time access to your current CPI" — from a system holding an
+    # education chunk that states it.
+    (PROFILE_CGPA, {"cgpa", "gpa", "cpi", "spi", "sgpa", "cgpi", "grade", "grades",
+                    "percentage", "marks", "score", "aggregate", "result", "results"}),
     (PROFILE_COLLEGE, {"college", "university", "institute", "school", "campus"}),
     (PROFILE_EDUCATION, {"education", "degree", "branch", "major", "btech", "b.tech",
                          "bachelor", "bachelors", "master", "masters", "course",
@@ -133,8 +142,13 @@ def _tokens(query: str) -> list:
     Interior dots survive so "b.tech" stays one token, but a trailing one is
     removed — without that, "Tell me about my education." tokenised to
     "education." and matched no subject at all.
+
+    Possessive "'s" is dropped before apostrophes are removed. Without that step
+    "today's date" tokenised to "todays", which matches no temporal subject and
+    is why "what is today's date?" reached memory instead of the clock.
     """
-    raw = (query or "").lower().replace("’", "'").replace("'", "")
+    raw = (query or "").lower().replace("’", "'")
+    raw = re.sub(r"'s\b", "", raw).replace("'", "")
     return [token.strip(".") for token in _WORD_RE.findall(raw) if token.strip(".")]
 
 
@@ -203,3 +217,14 @@ def is_personal_information_query(query: str, *, has_context: bool = False) -> b
 def tools_for(intent: Optional[str]) -> list:
     """The retrieval an intent should reach for; empty when it needs context."""
     return list(INTENT_TOOLS.get(intent or "", []))
+
+
+def tokens(query: str) -> list:
+    """
+    Public tokenizer, shared with the query-category layer.
+
+    Exported so the two classifiers cannot drift apart on what a word is —
+    a possessive handled in one and not the other is precisely the kind of
+    divergence that sends "today's date" to the wrong store.
+    """
+    return _tokens(query)

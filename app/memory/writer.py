@@ -38,6 +38,37 @@ class WriteOutcome(str, Enum):
     """An identical active record already existed; nothing was written."""
     SUPERSEDED = "superseded"
     """A contradictory record was closed and replaced by this one."""
+    REJECTED = "rejected"
+    """A contradictory record existed and outranked this write. The stored
+    value is unchanged; the incoming one is reported, not silently dropped."""
+
+
+def _claim_for(record: MemoryRecord):
+    """Describe a record as a claim the conflict resolver can rank."""
+    from app.memory.identity import FactClaim
+    from app.memory.sources import MemorySource
+
+    source = {
+        SourceType.UPLOAD: MemorySource.RESUME_DOCUMENT,
+        SourceType.SYSTEM: MemorySource.PROFILE_MEMORY,
+        SourceType.CHAT: MemorySource.CONVERSATION_CURRENT,
+    }.get(record.source_type, MemorySource.SEMANTIC_MEMORY)
+
+    structured = record.structured or {}
+    explicit = bool(structured.get("explicit"))
+    if "explicit" not in structured:
+        # Records written before the flag existed: an inferred write is the only
+        # one that arrives over SourceType.CHAT.
+        explicit = record.source_type is not SourceType.CHAT
+
+    return FactClaim(
+        key=str(structured.get("key") or record.dedup_key or ""),
+        value=str(structured.get("value") or record.content),
+        source=source,
+        confidence=record.confidence,
+        explicit=explicit,
+        timestamp=record.updated_at or record.created_at,
+    )
 
 
 # ── Profile-key classification ──────────────────────────────────────────
@@ -50,6 +81,13 @@ class WriteOutcome(str, Enum):
 
 _IDENTITY_KEYS = frozenset({
     "name", "full_name", "first_name", "last_name", "nickname",
+    # The canonical namespace, added when identity was given its own keys. Their
+    # absence made this classifier return SEMANTIC for the user's own name,
+    # which quietly cost it three things: always-injected status, the identity
+    # kind prior, and — worst — decay exemption. A name on a 365-day half-life
+    # is a name the assistant eventually forgets.
+    "canonical_name", "canonical_email", "canonical_college",
+    "canonical_degree", "canonical_location",
     "role", "title", "occupation", "profession",
     "email", "contact_email", "phone", "location", "city", "country",
     "timezone", "university", "college", "school", "degree", "major",
@@ -71,9 +109,19 @@ _GOAL_KEYS = frozenset({
 
 
 def classify_profile_key(key: str) -> MemoryKind:
-    """Map a legacy `user_profile.key` onto a memory kind."""
+    """
+    Map a legacy `user_profile.key` onto a memory kind.
+
+    The `remembered_` namespace is checked *first* and never becomes IDENTITY.
+    "remembered_name" holds a name the user asked to be kept beside their own,
+    and classifying it as identity would put it in the always-injected tier
+    alongside the real one — recreating, through the taxonomy, exactly the
+    confusion the separate keys exist to prevent.
+    """
     normalized = (key or "").strip().lower()
 
+    if _is_remembered_key(normalized):
+        return MemoryKind.SEMANTIC
     if normalized in _IDENTITY_KEYS:
         return MemoryKind.IDENTITY
     if normalized in _GOAL_KEYS:
@@ -85,6 +133,29 @@ def classify_profile_key(key: str) -> MemoryKind:
     return MemoryKind.SEMANTIC
 
 
+def _is_remembered_key(normalized: str) -> bool:
+    """Whether this key holds something the user explicitly asked to keep."""
+    from app.memory.identity import is_explicit_memory_key
+
+    return is_explicit_memory_key(normalized)
+
+
+def is_pinned_key(key: str) -> bool:
+    """
+    Whether a profile key should be exempt from decay.
+
+    `pinned` already means "never decays, never dropped for budget" and
+    `is_decay_exempt` honours it — but nothing ever set it, so a value the user
+    explicitly asked to be remembered aged out on the same schedule as one the
+    extractor guessed at. Two categories earn the exemption: canonical identity,
+    and anything the user deliberately asked to keep.
+    """
+    from app.memory.identity import is_canonical_key, is_explicit_memory_key
+
+    normalized = (key or "").strip().lower()
+    return is_canonical_key(normalized) or is_explicit_memory_key(normalized)
+
+
 # ── Content rendering ───────────────────────────────────────────────────
 #
 # `content` is what gets embedded and what gets injected, so it has to read as
@@ -93,6 +164,11 @@ def classify_profile_key(key: str) -> MemoryKind:
 
 _KEY_TEMPLATES: Dict[str, str] = {
     "name": "The user's name is {value}.",
+    "canonical_name": "The user's name is {value}.",
+    "canonical_email": "The user's email address is {value}.",
+    "canonical_college": "The user studies at {value}.",
+    "canonical_degree": "The user is pursuing {value}.",
+    "canonical_location": "The user is located in {value}.",
     "full_name": "The user's full name is {value}.",
     "github": "The user's GitHub profile is {value}.",
     "linkedin": "The user's LinkedIn profile is {value}.",
@@ -108,8 +184,33 @@ _KEY_TEMPLATES: Dict[str, str] = {
 
 
 def render_profile_fact(key: str, value: str) -> str:
-    """Turn a key/value pair into a self-contained sentence."""
+    """
+    Turn a key/value pair into a self-contained sentence.
+
+    Remembered values get a sentence that says what they are *and what they are
+    not*. This matters more than it looks: `content` is what gets embedded and
+    injected, so "The user's remembered name is Devasi" — the phrasing the
+    generic template produced — reads to a model as a statement about the user's
+    name. Separate keys stop the wrong value being *retrieved*; only the wording
+    stops the right value being *misread* once it is in the prompt.
+    """
     normalized = (key or "").strip().lower()
+
+    if _is_remembered_key(normalized):
+        subject = normalized
+        for prefix in ("remembered_",):
+            if subject.startswith(prefix):
+                subject = subject[len(prefix):]
+        subject = subject.replace("_", " ").strip() or "value"
+        if subject in ("name", "alternate name", "nickname", "preferred name", "alias"):
+            return (
+                f"The user asked the assistant to remember the name {value}. "
+                f"This is not the user's own name."
+            )
+        return (
+            f"The user asked the assistant to remember this {subject}: {value}."
+        )
+
     template = _KEY_TEMPLATES.get(normalized)
     if template:
         return template.format(value=value)
@@ -177,25 +278,68 @@ class MemoryWriter:
         occurred_at: Optional[datetime] = None,
     ) -> Optional[MemoryRecord]:
         """
-        Mirror a profile fact.
+        Mirror a profile fact. Returns the record that is now current.
+
+        Note the record returned is not necessarily the one submitted: a write
+        that loses to a higher-trust stored value hands back the survivor. Use
+        `record_profile_fact_with_outcome` when the caller needs to know which
+        happened.
+        """
+        stored, _ = await self.record_profile_fact_with_outcome(
+            owner_id, key, value,
+            source=source, confidence=confidence, occurred_at=occurred_at,
+        )
+        return stored
+
+    async def record_profile_fact_with_outcome(
+        self,
+        owner_id: str,
+        key: str,
+        value: str,
+        *,
+        source: str = "explicit",
+        confidence: float = 1.0,
+        occurred_at: Optional[datetime] = None,
+    ) -> tuple[MemoryRecord, WriteOutcome]:
+        """
+        Mirror a profile fact and report what the write actually did.
 
         A profile key holds exactly one current value, so re-saving a key with
-        a different value is a *contradiction*, not a second fact. The old
-        record is superseded rather than deleted, which preserves the history
-        the redesign needs for versioning and for answering "what did you think
-        my role was in March".
+        a different value is a *contradiction*, not a second fact. Whether the
+        new value wins is decided by `resolve_conflict` rather than by arrival
+        order — an inferred remark must not displace something the user stated
+        deliberately. The loser is reported, never silently dropped.
+
+        The superseded record is retained rather than deleted, which preserves
+        the history the redesign needs for versioning and for answering "what
+        did you think my role was in March".
         """
         kind = classify_profile_key(key)
         content = render_profile_fact(key, value)
         dedup_key = f"profile:{(key or '').strip().lower()}"
 
+        # Explicit beats inferred, structurally rather than by prompt wording.
+        # A value the user asked to keep is pinned — exempt from decay and from
+        # budget eviction — while an inferred one takes its chances with the
+        # ranker. Before this, `pinned` was honoured everywhere and set nowhere,
+        # so the distinction existed in the schema and nowhere in behaviour.
+        pinned = is_pinned_key(key) or (
+            source == "explicit" and kind is MemoryKind.PREFERENCE
+        )
+
         record = MemoryRecord(
             owner_id=owner_id,
             kind=kind,
             content=content,
-            structured={"key": key, "value": value, "source": source},
+            structured={
+                "key": key,
+                "value": value,
+                "source": source,
+                "explicit": source == "explicit",
+            },
             importance=BASE_IMPORTANCE[kind],
             confidence=confidence,
+            pinned=pinned,
             occurred_at=occurred_at,
             source_type=SourceType.CHAT if source == "inferred" else SourceType.SYSTEM,
             source_ref=f"user_profile:{key}",
@@ -203,7 +347,7 @@ class MemoryWriter:
             visibility=Visibility.PRIVATE,
         )
 
-        return await self.upsert(record)
+        return await self.upsert_with_outcome(record)
 
     async def upsert(self, record: MemoryRecord) -> MemoryRecord:
         """Write a record, superseding any active contradiction."""
@@ -249,15 +393,34 @@ class MemoryWriter:
                 else WriteOutcome.DUPLICATE
             )
 
-        # Supersede the most recent contradictory version; any older ones were
-        # already closed when it was written.
+        previous = conflicting[0]
+
+        # Whether the incoming claim is actually *allowed* to win.
         #
+        # This used to be unconditional: any content difference superseded the
+        # stored value, so "newest wins" was the entire conflict policy. That
+        # let a low-confidence inferred remark overwrite a fact the user had
+        # stated deliberately or that came from their résumé — a silent,
+        # unrecoverable downgrade of the best evidence in the store.
+        #
+        # The resolver is deterministic on purpose. A model asked to reconcile
+        # two contradictory facts invents a rule, and invents a different one
+        # next time; the ordering here is fixed, inspectable, and testable.
+        from app.memory.identity import Resolution, resolve_conflict
+
+        verdict = resolve_conflict(_claim_for(previous), _claim_for(record))
+        if verdict.resolution is not Resolution.SUPERSEDE:
+            logger.info(
+                "Rejected a contradictory write to %s for owner=%s: %s",
+                record.dedup_key, record.owner_id, verdict.reason,
+            )
+            return previous, WriteOutcome.REJECTED
+
         # The replacement is derived from the previous record rather than
         # inserted fresh, so it inherits the version chain. Writing the
         # freshly-built record here would leave every version at v1 with a null
         # `supersedes_id`, silently breaking the history that makes "what did
         # you think my role was in March" answerable.
-        previous = conflicting[0]
         replacement = previous.superseding(
             kind=record.kind,
             content=record.content,

@@ -19,6 +19,11 @@ httpx==0.27.2
 aiofiles==24.1.0
 
 # Utilities
+# tzdata ships the IANA timezone database. zoneinfo reads it from the OS on
+# Linux, but Windows has no system copy — without this the assistant's
+# configured timezone silently falls back to the host clock, which on a
+# datacentre host means answering "what is today's date" in the wrong day.
+tzdata>=2024.1
 python-multipart==0.0.12
 tavily-python==0.5.2
 playwright==1.53.0

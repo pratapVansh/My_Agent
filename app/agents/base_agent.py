@@ -174,15 +174,33 @@ class BaseAgent(ABC):
                 self.name, original_len, _MAX_MEMORY_CHARS, dropped,
             )
 
+        # The clock, on every prompt. Without it a model cannot tell whether a
+        # deadline has passed, cannot resolve "next Friday", and — as observed —
+        # answers "what is today's date" by reporting that it has no real-time
+        # access. It is one line, it is never stale, and it belongs to no
+        # particular agent, so it is injected here rather than in each of them.
+        try:
+            from app.tools import time_tool
+
+            clock_line = time_tool.current_context().prompt_line()
+        except Exception as exc:  # a broken clock must not cost a turn
+            logger.warning("Could not read the clock for prompt injection: %s", exc)
+            clock_line = ""
+
+        header = f"## Now\n{clock_line}\n\n" if clock_line else ""
+
         if memory_prompt:
             return (
+                f"{header}"
                 f"## Memory Context\n{memory_prompt}\n\n"
                 "Use this context to keep continuity with prior conversation and "
                 "personal data when relevant. Do not mention memory sources explicitly "
-                "unless the user asks.\n\n"
+                "unless the user asks. The date and time above come from the system "
+                "clock, not from memory — use them, and never say you lack real-time "
+                "access to the current date or time.\n\n"
                 f"{system_prompt}"
             )
-        return system_prompt
+        return f"{header}{system_prompt}" if header else system_prompt
 
     async def execute_reasoning_loop(
         self,

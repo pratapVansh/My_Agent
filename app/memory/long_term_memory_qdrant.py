@@ -1207,9 +1207,32 @@ class LongTermMemoryQdrant:
                 chunk["payload"]["text"] for chunk in sorted_chunks
             )
 
+            # The name, from the chunk ingestion already classified as one.
+            #
+            # Callers have always asked for `resume_data["name"]` and always
+            # received None, because this method never produced the key — so
+            # "what is my name?" had no source at all, and the answer came from
+            # whatever else happened to be in context. The chunk exists
+            # (semantic_type="name", tagged identity); it simply was not read.
+            #
+            # Re-parsing the reconstructed text is the fallback for résumés
+            # ingested before that classification existed.
+            name = next(
+                (
+                    chunk["payload"]["text"].strip()
+                    for chunk in sorted_chunks
+                    if chunk["payload"].get("semantic_type") == "name"
+                    and (chunk["payload"].get("text") or "").strip()
+                ),
+                None,
+            )
+            if not name:
+                name = self._detect_name(full_text.splitlines())
+
             return {
                 "content": full_text,
-                "metadata": sorted_chunks[0]["payload"]
+                "name": name,
+                "metadata": sorted_chunks[0]["payload"],
             }
 
         except Exception as e:
@@ -1413,6 +1436,12 @@ class LongTermMemoryQdrant:
         "experience": {"semantic_type": "experience"},
         "education": {"semantic_type": "education"},
         "achievements": {"semantic_type": "other", "tag": "achievements"},
+        # The name is chunked and stored at ingestion with semantic_type="name",
+        # and nothing read it back. `retrieve_resume` returned only content and
+        # metadata, so every caller doing `resume_data.get("name")` — the
+        # profile summary among them — got None from a store that held
+        # "Vansh Pratap Singh" the whole time.
+        "name": {"semantic_type": "name"},
     }
 
     async def retrieve_section(

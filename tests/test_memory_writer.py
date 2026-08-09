@@ -134,8 +134,11 @@ async def test_profile_fact_is_written_with_kind_and_salience(writer, store):
     assert record.kind is MemoryKind.IDENTITY
     assert record.importance == BASE_IMPORTANCE[MemoryKind.IDENTITY]
     assert record.content == "The user's name is Vansh Pratap Singh."
+    # `explicit` is carried as a boolean alongside the raw `source` string so
+    # ranking and decay can read it without re-parsing free text.
     assert record.structured == {
-        "key": "name", "value": "Vansh Pratap Singh", "source": "explicit"
+        "key": "name", "value": "Vansh Pratap Singh",
+        "source": "explicit", "explicit": True,
     }
     assert record.dedup_key == "profile:name"
     assert await store.count("vansh") == 1

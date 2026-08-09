@@ -84,6 +84,16 @@ class AgentState(TypedDict):
     planner_confidence: Optional[float]       # 0.0–1.0
     needs_clarification: Optional[bool]       # True → ask user before routing
     clarification_question: Optional[str]     # What to ask the user
+    clarification_reason: Optional[str]       # Why it was asked, or suppressed
+
+    # Source-aware routing (app.memory.sources). Decided deterministically
+    # before the planner's opinion is consulted, because the planner scores
+    # intent from query text alone and cannot tell "my current CPI" (a stored
+    # fact) from "the current date" (the clock).
+    query_category: Optional[str]             # QueryCategory value
+    memory_sources: Optional[List[str]]       # MemorySource values, in precedence order
+    profile_intent: Optional[str]             # Legacy profile label, drives tool choice
+    followup_subject: Optional[str]           # Entity a follow-up refers back to
 
     # Task agent outputs — now uses TaskEnvelope
     task_result: Optional[TaskEnvelope]

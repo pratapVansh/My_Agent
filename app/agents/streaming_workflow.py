@@ -11,7 +11,7 @@ import uuid
 import logging
 from typing import Dict, Any, AsyncGenerator, FrozenSet, Optional
 from app.agents.agent_profiles import get_capabilities
-from app.agents.workflow import parallel_init_node
+from app.agents.workflow import decide_route, parallel_init_node
 from app.agents.job_agent import job_agent
 from app.agents.email_agent import email_agent
 from app.agents.academic_agent import academic_agent
@@ -105,6 +105,11 @@ async def run_streaming_workflow(
         "planner_confidence": None,
         "needs_clarification": None,
         "clarification_question": None,
+        "clarification_reason": None,
+        "query_category": None,
+        "memory_sources": None,
+        "profile_intent": None,
+        "followup_subject": None,
         "task_result": None,
         "agent_reasoning": None,
         "iteration_count": 0,
@@ -147,8 +152,33 @@ async def run_streaming_workflow(
     if not state.get("detected_intent"):
         state["detected_intent"] = user_input
 
-    # Handle clarification — emit as a complete event immediately
-    if state.get("needs_clarification"):
+    # ── Source-aware routing, identical to the tool-calling path ─────────────
+    # This path used to read `needs_clarification` straight off the planner,
+    # which meant every policy the graph applied — answer-first, one question
+    # per conversation, the clock instead of memory — was silently absent from
+    # spoken turns. One decision function now serves both.
+    route = decide_route(state)
+
+    if route == "temporal":
+        from app.tools import time_tool
+
+        answer = time_tool.answer_temporal_query(user_input)
+        yield {
+            "type": "metadata",
+            "selected_agent": "temporal",
+            "detected_intent": state.get("query_category"),
+            "execution_path": state.get("execution_path", []),
+        }
+        yield {
+            "type": "complete",
+            "display_text": answer,
+            "speech_text": answer,
+            "agent": "temporal",
+            "success": True,
+        }
+        return
+
+    if route == "clarification":
         question = state.get("clarification_question") or "Could you clarify what you need help with?"
         yield {
             "type": "metadata",
@@ -164,6 +194,9 @@ async def run_streaming_workflow(
             "success": True,
         }
         return
+
+    if route in ("job", "email", "academic", "profile"):
+        state["selected_agent"] = route
 
     # ── Emit metadata (agent selected, intent detected) ──────────────────────
     yield {
