@@ -53,6 +53,7 @@ from app.services.deepgram_bridge import DeepgramBridge
 from app.agents.streaming_workflow import run_streaming_workflow
 from app.agents.workflow import run_workflow
 from app.agents.hybrid_router import ROUTE_TOOL, determine_route
+from app.agents import interruption
 from app.memory.memory_manager import memory_manager
 from app.services.langsmith_service import configure_langsmith
 from app.services.tts_streamer import SpokenChunk, tts_streamer
@@ -195,10 +196,17 @@ class ParticipantState:
     # Turn management
     turn_task: Optional[asyncio.Task] = None
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # True only while TTS frames are actually being handed to LiveKit. Barge-in
-    # is gated on this: interrupting a turn that has not started speaking yet
-    # just loses the reply without the user ever hearing anything to interrupt.
+    # True only while TTS frames are actually being handed to LiveKit. Ordinary
+    # speech barge-in is gated on this: interrupting a turn that has not started
+    # speaking yet just loses the reply without the user ever hearing anything
+    # to interrupt. An explicit stop command deliberately ignores this gate —
+    # see `interruption` — because the wait itself is what is being cut short.
     speaking: bool = False
+
+    # Set immediately before a cancellation the *user* asked for, so the turn's
+    # CancelledError handler can tell a deliberate stop apart from a stall or an
+    # ordinary barge-in and stay silent instead of apologising for itself.
+    stopped_by_user: bool = False
 
 
 async def main(
@@ -315,7 +323,12 @@ async def main(
                     state.history.append(
                         {"role": "assistant", "content": f"{partial} [interrupted]"}
                     )
-                terminal = {"type": "interrupted", "partial_text": partial}
+                terminal = (
+                    {"type": "turn_end", "reason": "stopped_by_user",
+                     "partial_text": partial}
+                    if state.stopped_by_user
+                    else {"type": "interrupted", "partial_text": partial}
+                )
                 raise
 
             # The watchdog cancelled us. Absorb the cancellation — this turn is
@@ -687,6 +700,38 @@ async def main(
 
         async def on_turn(transcript: str) -> None:
             await publish({"type": "utterance_end", "transcript": transcript})
+
+            # A bare stop command is not a question. Cancelling the turn and
+            # then handing "stop" to the language model produces a reply *to
+            # the word stop* — the old task ends and a new one immediately
+            # takes its place, which from the listener's side is the previous
+            # task carrying on. So it is cancelled here and nothing is asked.
+            if interruption.is_pure_stop(transcript):
+                logger.info("Stop command from %s: %r", identity, transcript[:40])
+                state.stopped_by_user = True
+                await cancel_turn(state)
+                state.stopped_by_user = False
+                # Record what was said so a follow-up ("carry on") still has a
+                # thread, without inviting an answer to it.
+                state.history.append({"role": "user", "content": transcript})
+                await publish({"type": "turn_end", "reason": "stopped_by_user"})
+                return
+
+            # "No, tell me about my projects" cancels *and* asks. Cancel first
+            # so the old turn stops immediately, then run the remaining request
+            # rather than dropping a question the user did ask.
+            if interruption.carries_new_request(transcript):
+                request = interruption.strip_stop_prefix(transcript)
+                logger.info(
+                    "Stop-with-request from %s: %r → %r",
+                    identity, transcript[:40], request[:40],
+                )
+                state.stopped_by_user = True
+                await cancel_turn(state)
+                state.stopped_by_user = False
+                spawn(start_turn(state, request), f"start-turn-{identity}")
+                return
+
             spawn(start_turn(state, transcript), f"start-turn-{identity}")
 
         async def on_interim(transcript: str) -> None:
@@ -694,14 +739,42 @@ async def main(
             # Transcript-confirmed barge-in. Requiring real words (rather than
             # acting on raw VAD) is what stops a cough, a keypress, or the
             # assistant's own voice echoing back from killing the reply.
-            if not state.speaking:
-                return
-            if len(transcript.split()) < settings.voice_bargein_min_words:
-                return
             task = state.turn_task
-            if task and not task.done():
-                logger.info("Barge-in by %s: %s", identity, transcript[:40])
-                task.cancel()
+            if not task or task.done():
+                return
+
+            stop = interruption.is_stop_command(transcript)
+
+            # An explicit stop command cancels whatever the turn is doing —
+            # including an LLM call or a tool round-trip that has not produced
+            # a syllable yet. Gating on `speaking` made "stop" a no-op during
+            # exactly the wait people most want to cut short, and the word-count
+            # floor rejected every one-word way of saying it.
+            if not stop:
+                if not state.speaking:
+                    return
+                if len(transcript.split()) < settings.voice_bargein_min_words:
+                    return
+
+            logger.info(
+                "Barge-in by %s (%s): %s",
+                identity, "stop command" if stop else "speech", transcript[:40],
+            )
+            if stop:
+                # Mark it before cancelling so the turn's CancelledError handler
+                # reports a user stop rather than a stall, and so the audio
+                # already queued is dropped rather than played out.
+                state.stopped_by_user = True
+            task.cancel()
+            if stop and state.audio_source is not None:
+                # Drop buffered speech immediately. Without this the sentence
+                # in LiveKit's playout buffer keeps playing after the cancel,
+                # which is precisely what "stop" was asking not to happen.
+                try:
+                    await tts_streamer.clear_pending_audio(state.audio_source)
+                except Exception as exc:
+                    logger.debug("clear_pending_audio after stop failed: %s", exc)
+                state.speaking = False
 
         async def on_speech_started() -> None:
             # VAD onset is a hint only — it fires on any sound. Acting on it

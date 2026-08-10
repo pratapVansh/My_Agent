@@ -48,6 +48,93 @@ def _spawn_background(coro, description: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# What the tools actually produced
+# ─────────────────────────────────────────────────────────────
+#
+# The honesty rules live in every specialist's system prompt: a tool that
+# failed is not a tool that found nothing; never convert a failure into "you
+# have no X on file". Those sentences are correct and they are also only
+# instructions — the model may follow them, and a model shown an empty result
+# is in precisely the state where it invents a plausible value instead.
+#
+# These three helpers derive the same verdict from the observed tool results,
+# so the distinction survives regardless of what the model does with it. The
+# shapes they read are the conventions the tools already use: `success` for
+# whether the call worked, `found`/`count` for whether it found anything.
+
+_EMPTY_MARKERS = ("found", "has_data")
+
+
+def _tool_reported_failure(result: Any) -> bool:
+    """Whether the tool itself failed, as distinct from finding nothing."""
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return True
+        if result.get("error"):
+            return True
+    return False
+
+
+def _tool_yielded_evidence(result: Any) -> bool:
+    """
+    Whether this tool actually returned data.
+
+    An explicit `found: False` or `count: 0` is a successful lookup of an empty
+    store — evidence of absence, not evidence. Anything else that came back
+    non-empty counts.
+    """
+    if result is None:
+        return False
+    if isinstance(result, dict):
+        for marker in _EMPTY_MARKERS:
+            if marker in result:
+                return bool(result[marker])
+        if "count" in result:
+            try:
+                return int(result["count"]) > 0
+            except (TypeError, ValueError):
+                return True
+        # No explicit emptiness marker: treat any payload beyond the status
+        # keys as evidence.
+        payload = {
+            key: value for key, value in result.items()
+            if key not in ("success", "message", "error", "source", "provenance")
+        }
+        return any(
+            bool(value) for value in payload.values()
+        ) if payload else False
+    if isinstance(result, (list, tuple, set, str)):
+        return len(result) > 0
+    return True
+
+
+def _assess_tool_outcomes(
+    tools_used: list, tools_with_evidence: list, tools_errored: list
+) -> str:
+    """
+    The answerability verdict for one reasoning loop.
+
+    Mirrors `app.memory.answerability.assess`, expressed over tool outcomes
+    rather than retrieved records — same three-way distinction, same reason for
+    it: NO_DATA and TOOL_ERROR are both true statements and they are not
+    interchangeable.
+    """
+    from app.memory.answerability import Answerability
+
+    if not tools_used:
+        # Answered without looking anything up. Nothing to assert about the
+        # store either way.
+        return ""
+    if tools_with_evidence and tools_errored:
+        return Answerability.PARTIALLY_ANSWERABLE.value
+    if tools_with_evidence:
+        return Answerability.ANSWERABLE.value
+    if tools_errored:
+        return Answerability.TOOL_ERROR.value
+    return Answerability.NO_DATA.value
+
+
+# ─────────────────────────────────────────────────────────────
 # Pydantic models for structured LLM output validation
 # ─────────────────────────────────────────────────────────────
 
@@ -305,6 +392,12 @@ Rules:
         observations: list[str] = []
         trace: list[str] = []
         tools_used: list[str] = []
+        # Which tools actually produced data, and which failed. Kept apart on
+        # purpose: a tool that returned nothing and a tool that raised look
+        # identical downstream, and they license opposite statements. See
+        # `app.memory.answerability`.
+        tools_with_evidence: list[str] = []
+        tools_errored: list[str] = []
         final_answer = ""
 
         # Build recent conversation history for multi-turn context.
@@ -374,6 +467,10 @@ Rules:
                     summarized = self._summarize_tool_result(result)
                     observations.append(f"Tool {tool_name} observation: {summarized}")
                     tools_used.append(tool_name)
+                    if _tool_reported_failure(result):
+                        tools_errored.append(tool_name)
+                    elif _tool_yielded_evidence(result):
+                        tools_with_evidence.append(tool_name)
                     trace.append(f"step_{step}: tool_call:{tool_name}")
 
                     # ── Fix 3: Save successful tool outcome to memory ─────────
@@ -398,6 +495,7 @@ Rules:
 
                 except asyncio.TimeoutError:
                     observations.append(f"Tool {tool_name} timed out after {_TOOL_CALL_TIMEOUT:.0f}s.")
+                    tools_errored.append(tool_name)
                     trace.append(f"step_{step}: tool_timeout:{tool_name}")
                     logger.warning(
                         "Tool '%s' timed out after %.0fs in agent '%s'",
@@ -405,6 +503,7 @@ Rules:
                     )
                 except Exception as e:
                     observations.append(f"Tool {tool_name} failed: {str(e)}")
+                    tools_errored.append(tool_name)
                     trace.append(f"step_{step}: tool_error:{tool_name}")
                     logger.warning(
                         "Tool '%s' raised an exception in agent '%s': %s",
@@ -430,6 +529,15 @@ Rules:
             "iterations": len(trace),
             "tools_used": list(dict.fromkeys(tools_used)),   # deduplicated, order preserved
             "trace": trace,
+            # Deterministic verdict on what the tools actually produced. The
+            # honesty rules in the system prompt say the right thing; this is
+            # the same claim derived from observed tool results rather than
+            # from the model's willingness to follow an instruction.
+            "answerability": _assess_tool_outcomes(
+                tools_used, tools_with_evidence, tools_errored
+            ),
+            "tools_with_evidence": list(dict.fromkeys(tools_with_evidence)),
+            "tools_errored": list(dict.fromkeys(tools_errored)),
         }
 
     def _parse_reasoning_decision(self, response: str) -> Dict[str, Any]:

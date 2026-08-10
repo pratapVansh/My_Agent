@@ -67,6 +67,24 @@ class QueryCategory(str, Enum):
     DOCUMENT_RESUME = "DOCUMENT_RESUME"
     """Explicitly about the résumé as a document."""
 
+    ACADEMIC_CURRENT = "ACADEMIC_CURRENT"
+    """The user's *present* academic standing — "what is my current CPI".
+
+    Split from PROFILE_EDUCATION because "my current CPI" and "the CPI on my
+    résumé" are different questions with different correct answers the moment
+    the two disagree, which is exactly when it matters. A résumé is a snapshot
+    written once; the current value is whatever was most recently recorded. So
+    this category reads profile memory first and falls back to the document,
+    while DOCUMENT_RESUME reads the document first and never lets a newer
+    profile fact answer a question that named the résumé."""
+
+    PROVENANCE_QUERY = "PROVENANCE_QUERY"
+    """"How did you know that?" — a question about the *previous answer's*
+    source, not a new question about the user. Answered from the provenance
+    recorded for the last turn, never by retrieving again: re-retrieving would
+    describe where the answer *would* come from now, which is not the same
+    claim and is wrong whenever routing has changed."""
+
     # ── Not memory at all ───────────────────────────────────────────────────
     TEMPORAL_CURRENT = "TEMPORAL_CURRENT"
     """The clock and the calendar. Never answerable from memory."""
@@ -218,6 +236,17 @@ SOURCE_PRECEDENCE: Dict[QueryCategory, Tuple[MemorySource, ...]] = {
         MemorySource.RESUME_DOCUMENT,
         MemorySource.PROFILE_MEMORY,
     ),
+    # Current standing: the most recently recorded value wins, and the résumé
+    # is the fallback rather than the authority.
+    QueryCategory.ACADEMIC_CURRENT: (
+        MemorySource.PROFILE_MEMORY,
+        MemorySource.RESUME_DOCUMENT,
+        MemorySource.SEMANTIC_MEMORY,
+    ),
+    # Answered from what was recorded about the previous turn.
+    QueryCategory.PROVENANCE_QUERY: (
+        MemorySource.CONVERSATION_CURRENT,
+    ),
     QueryCategory.TEMPORAL_CURRENT: (
         MemorySource.TEMPORAL_TOOL,
     ),
@@ -268,6 +297,9 @@ def requires_retrieval(category: QueryCategory) -> bool:
     return category not in NON_MEMORY_CATEGORIES and category not in (
         QueryCategory.SMALL_TALK,
         QueryCategory.AMBIGUOUS_ACTION,
+        # Answered from the provenance recorded for the previous turn. Looking
+        # it up again would report where the answer *would* come from now.
+        QueryCategory.PROVENANCE_QUERY,
     )
 
 

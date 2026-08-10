@@ -631,9 +631,15 @@ Rules:
             )
 
             state["task_result"] = envelope
+            # The observed verdict on what the tools produced, carried so the
+            # provenance record can distinguish "I checked and it was empty"
+            # from "I found it" — and so a NO_DATA turn can never be turned
+            # into a clarifying question downstream.
+            state["answerability"] = loop_result.get("answerability") or ""
             state["agent_reasoning"] = (
                 f"Profile query processed. intent={intent}, "
                 f"iterations={loop_result['iterations']}, tools={tools_used}, "
+                f"answerability={state['answerability'] or 'n/a'}, "
                 f"confidence={confidence:.2f}"
             )
             state["current_agent"] = self.name

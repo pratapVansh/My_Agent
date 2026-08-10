@@ -97,6 +97,62 @@ _IDENTITY_UPDATE_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\b(i\s+(have\s+)?(legally\s+)?(changed|renamed))\b.{0,20}\bname\b"),
 )
 
+# Asking where the *previous answer* came from. These are questions about the
+# assistant's own sourcing, not new questions about the user, and answering them
+# by retrieving again reports where the answer *would* come from now — a
+# different claim, and a wrong one whenever routing has changed since.
+#
+# Deliberately narrow and clause-level: "how did you know" is provenance, while
+# "how do I know if I qualify" is an ordinary question that happens to share a
+# verb.
+_PROVENANCE_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"\bhow\s+(did|do|would)\s+you\s+know\b"),
+    re.compile(r"\bhow\s+did\s+you\s+(find|figure)\s+(that|it|this)?\s*out\b"),
+    re.compile(r"\bwhere\s+did\s+you\s+(get|find|read|hear|see)\b"),
+    re.compile(r"\bwhat\s+(is\s+|was\s+)?your\s+source\b"),
+    re.compile(r"\b(which|what)\s+(tool|source|memory|record|agent|file)\s+"
+               r"(did|do)\s+you\s+(use|read|check)\b"),
+    re.compile(r"\bsays\s+who\b"),
+    re.compile(r"\b(what|which)\s+(made|makes)\s+you\s+(say|think)\b"),
+    re.compile(r"\bhow\s+are\s+you\s+(so\s+)?(sure|certain)\b"),
+    re.compile(r"\bwhere\s+(is|does)\s+that\s+(come\s+from|from)\b"),
+)
+
+# Day-scoped availability questions. "What do I have today" names no schedule
+# noun at all, so the subject-based rule below never fired and it fell through
+# to a generic personal-information route that has no access to the timetable.
+# The schedule nouns catch "what classes do I have"; these catch the far more
+# common phrasing that omits the noun entirely.
+#
+# Matched against the normalised text, where `_normalise` has already dropped
+# the possessive: "what's on" arrives as "what on". Hence the optional-copula
+# shape rather than a bare "what is".
+_AVAILABILITY_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"\bwhat\s+(do|have)\s+i\s+(have|got)\b"),
+    re.compile(r"\bdo\s+i\s+have\s+(anything|something|much|any)\b"),
+    re.compile(r"\bam\s+i\s+(free|busy|booked|occupied)\b"),
+    re.compile(r"\bwhat(s)?(\s+(is|was))?\s+on\b"),
+    re.compile(r"\bwhat(s)?(\s+(is|was))?\s+my\s+(routine|plan|day|agenda)\b"),
+    re.compile(r"\bhow(s)?(\s+(is|does))?\s+my\s+day\s+look\b"),
+    re.compile(r"\banything\s+(scheduled|planned|on)\b"),
+)
+
+# Named days. A day reference is what makes an availability question a
+# *timetable* question rather than an open-ended one about the user's life.
+_DAY_TOKENS: Set[str] = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday", "weekend", "weekday",
+}
+
+# Words that ask for the value as it stands *now*, used only for the academic
+# split. Broader than `_NOW_MARKERS` — "my latest CPI" is as much a question
+# about current standing as "my current CPI" — and kept separate precisely so
+# that widening it cannot leak into the clock check, where "latest" would be a
+# very different and much more damaging claim.
+_CURRENCY_MARKERS: Set[str] = _NOW_MARKERS | {
+    "latest", "newest", "updated", "recent", "standing", "uptodate",
+}
+
 # Asking about this thread, right now.
 _CURRENT_CONVERSATION_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\bwhat\s+did\s+i\s+just\s+(say|tell|ask|mention)"),
@@ -192,6 +248,9 @@ _PROFILE_CATEGORY_MAP: Dict[str, QueryCategory] = {
 _CATEGORY_AGENT: Dict[QueryCategory, str] = {
     QueryCategory.SCHEDULE_TEMPORAL: "academic",
     QueryCategory.TEMPORAL_CURRENT: "temporal",
+    # Answered from what was recorded about the previous turn, by a node that
+    # reads that record rather than a model that would reconstruct it.
+    QueryCategory.PROVENANCE_QUERY: "provenance",
 }
 
 
@@ -222,6 +281,7 @@ class QueryDecision:
     def is_personal(self) -> bool:
         return self.category.value.startswith("PROFILE_") or self.category in (
             QueryCategory.DOCUMENT_RESUME,
+            QueryCategory.ACADEMIC_CURRENT,
             QueryCategory.EXPLICIT_MEMORY,
             QueryCategory.EPISODIC_MEMORY,
             QueryCategory.CONVERSATION_CURRENT,
@@ -307,6 +367,19 @@ def classify(
                 0.95,
             )
 
+    # ── 1b. A question about where the last answer came from ─────────────────
+    # Ahead of everything except an identity change: these shapes are
+    # unambiguous, and every one of them was previously scattered across
+    # GENERAL_KNOWLEDGE and CONVERSATION_FOLLOWUP, neither of which can say
+    # which source produced the answer.
+    for pattern in _PROVENANCE_PATTERNS:
+        if pattern.search(text):
+            return _decide(
+                QueryCategory.PROVENANCE_QUERY,
+                "asks which source or tool produced the previous answer",
+                0.95,
+            )
+
     # ── 2. Reading back an explicitly stored memory ──────────────────────────
     # Before the write check: "what did I ask you to remember" contains
     # "remember" and is a question, not an instruction.
@@ -334,6 +407,20 @@ def classify(
             QueryCategory.SCHEDULE_TEMPORAL,
             "schedule question anchored to a day",
             0.9,
+        )
+
+    # ── 4b. The same question with the schedule noun left out ────────────────
+    # "What do I have today", "am I free tomorrow". A day reference is required:
+    # without one these are open-ended questions about the user's life, and
+    # sending those to the timetable would be as wrong as the generic routing
+    # that sent the day-scoped ones to a store with no schedule in it.
+    if (token_set & _NOW_MARKERS or token_set & _DAY_TOKENS) and any(
+        pattern.search(text) for pattern in _AVAILABILITY_PATTERNS
+    ):
+        return _decide(
+            QueryCategory.SCHEDULE_TEMPORAL,
+            "day-scoped availability question — the timetable answers it",
+            0.85,
         )
 
     # ── 5. The clock itself ──────────────────────────────────────────────────
@@ -410,14 +497,37 @@ def classify(
             subject=named,
         )
 
+    # ── 7e. "Who am I?" ──────────────────────────────────────────────────────
+    # An identity question that contains neither "name" nor "called", so the
+    # subject-token classifier never claimed it and it fell through to general
+    # knowledge — where the answer is a stored fact the model cannot see.
+    if _IDENTITY_QUESTION_RE.match(text):
+        return _decide(
+            QueryCategory.PROFILE_IDENTITY,
+            "asks who the user is",
+            0.9,
+            legacy=profile_intent.PROFILE_NAME,
+        )
+
     # ── 8. Questions about the user ──────────────────────────────────────────
     legacy = profile_intent.classify(query, has_context=has_context)
     if legacy is not None:
         category = _PROFILE_CATEGORY_MAP.get(legacy, QueryCategory.PROFILE_GENERAL)
 
-        # "What's in my resume?" with no section subject is a document question.
-        if category is QueryCategory.PROFILE_GENERAL and _mentions_resume(token_set):
+        # Two questions that share every word except the one that decides where
+        # to look. "The CPI on my résumé" is a question about a document and is
+        # answered from it; "my current CPI" is a question about the present and
+        # is answered from the most recently recorded value, with the document
+        # as fallback. Collapsing them was harmless only while the two agreed.
+        #
+        # Résumé scope is checked first: "the current CPI on my résumé" names a
+        # document, and the document wins.
+        if _mentions_resume(token_set) and category in (
+            QueryCategory.PROFILE_GENERAL, QueryCategory.PROFILE_EDUCATION
+        ):
             category = QueryCategory.DOCUMENT_RESUME
+        elif category is QueryCategory.PROFILE_EDUCATION and token_set & _CURRENCY_MARKERS:
+            category = QueryCategory.ACADEMIC_CURRENT
 
         subject = None
         if category is QueryCategory.CONVERSATION_FOLLOWUP:
@@ -506,6 +616,14 @@ def _is_temporal(token_set: Set[str]) -> bool:
     return bool(token_set & _NOW_MARKERS) or bool(
         token_set & {"what", "whats", "which", "tell", "give"}
     )
+
+
+# "Who am I?" — an identity question carrying none of the identity vocabulary.
+# Anchored to the start so "who am I to judge" and "remind me who I am talking
+# to" do not claim it.
+_IDENTITY_QUESTION_RE = re.compile(
+    r"^(who\s+am\s+i|who\s+i\s+am|remind\s+me\s+who\s+i\s+am)\s*$"
+)
 
 
 _POSSESSIVES: Set[str] = {"my", "mine", "our", "ours", "myself", "ourselves"}

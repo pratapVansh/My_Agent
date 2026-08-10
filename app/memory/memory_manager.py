@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 from app.memory.short_term_memory import short_term_memory
 from app.memory.smart_memory import smart_memory
 from app.memory.memory_cache import memory_cache
-from app.memory import write_policy
+from app.memory import identity, write_policy
 from app.memory.retrieval_result import RetrievalResult
 from app.memory.sources import QueryCategory
 from app.memory.writer import memory_writer
@@ -540,6 +540,15 @@ class MemoryManager:
             {"profile_facts", "chat_history", "projects", "resume", "status"}),
         QueryCategory.DOCUMENT_RESUME.value: frozenset(
             {"profile_facts", "chat_history", "resume", "skills", "projects", "status"}),
+        # Current standing reads the same sections as education; what differs is
+        # the precedence among them, which `sources.py` decides.
+        QueryCategory.ACADEMIC_CURRENT.value: frozenset(
+            {"profile_facts", "chat_history", "resume", "status"}),
+        # Answered from the recorded provenance of the previous turn. It needs
+        # the thread for continuity and nothing else — retrieving the user's
+        # facts here would invite an answer about the facts rather than about
+        # where the last one came from.
+        QueryCategory.PROVENANCE_QUERY.value: frozenset({"chat_history"}),
         QueryCategory.EXPLICIT_MEMORY.value: frozenset(
             {"profile_facts", "chat_history", "episodes"}),
         QueryCategory.CONVERSATION_CURRENT.value: frozenset(
@@ -575,6 +584,43 @@ class MemoryManager:
             return self._ALL_SECTIONS
         return self._SECTIONS_BY_CATEGORY.get(category, self._ALL_SECTIONS)
 
+    # Categories that are actually *about* the things the user asked to have
+    # remembered. Everywhere else those keys are withheld from the prompt.
+    _EXPLICIT_MEMORY_CATEGORIES = frozenset({
+        QueryCategory.EXPLICIT_MEMORY.value,
+        QueryCategory.EXPLICIT_MEMORY_WRITE.value,
+        QueryCategory.PROVENANCE_QUERY.value,
+    })
+
+    @staticmethod
+    def _fact_is_visible(key: str, category: Optional[str]) -> bool:
+        """
+        Whether one profile fact belongs in the prompt for this question.
+
+        Section filtering is not enough, and the gap between the two is a real
+        bug rather than a tidiness concern. `profile_facts` is a single section
+        holding both `canonical_name` and `remembered_name` — so narrowing an
+        identity question to "profile_facts + résumé" still hands the model a
+        line reading `remembered_name: Devasi` directly beneath the canonical
+        one. A model given two names and asked for the user's name volunteers
+        both, and no amount of prompt instruction reliably stops it, because
+        the fact is right there and looks relevant.
+
+        The keys are therefore withheld at assembly. "What is my name?" cannot
+        mention a remembered name because the remembered name is not in the
+        prompt; "what name did I ask you to remember?" is a category that reads
+        them, so it still sees them. Determinism at the source rather than an
+        instruction the model may or may not follow.
+
+        An unknown category (None) keeps the historical behaviour of rendering
+        everything: new categories are under-filtered, never blind.
+        """
+        if not category:
+            return True
+        if category in MemoryManager._EXPLICIT_MEMORY_CATEGORIES:
+            return True
+        return not identity.is_explicit_memory_key(key)
+
     def format_context_for_prompt(
         self, context: Dict[str, Any], category: Optional[str] = None
     ) -> str:
@@ -606,7 +652,11 @@ class MemoryManager:
         # ── 1. Profile Facts (highest priority — explicit user preferences) ──
         profile_facts = context.get("profile_facts", []) if "profile_facts" in allowed else []
         if profile_facts:
-            lines = [f"- {f['key']}: {f['value']}" for f in profile_facts if f.get("value")]
+            lines = [
+                f"- {f['key']}: {f['value']}"
+                for f in profile_facts
+                if f.get("value") and self._fact_is_visible(str(f.get("key", "")), category)
+            ]
             if lines:
                 parts.append("User Profile Facts:\n" + "\n".join(lines))
 

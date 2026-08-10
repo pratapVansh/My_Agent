@@ -22,7 +22,8 @@ from app.agents.academic_agent import academic_agent
 from app.agents.profile_agent import profile_agent
 from app.agents.response_agent import response_agent
 from app.memory.memory_manager import memory_manager
-from app.memory.sources import QueryCategory
+from app.memory import provenance
+from app.memory.sources import QueryCategory, sources_for
 from app.services.debug_logger import log_step
 from app.services.langsmith_service import traceable
 from app.config import settings
@@ -227,7 +228,126 @@ async def profile_node(state: AgentState) -> AgentState:
 
 @traceable(name="response_node", run_type="chain", tags=["workflow", "response"])
 async def response_node(state: AgentState) -> AgentState:
-    return await response_agent.execute(state)
+    result = await response_agent.execute(state)
+    _record_provenance(result)
+    return result
+
+
+def _record_provenance(state: AgentState) -> None:
+    """
+    Write down where this turn's answer came from.
+
+    Called on every path that produces a final answer, because "how did you
+    know?" can follow any of them — a date from the clock as easily as a CGPA
+    from a résumé. The tools recorded are the ones the agent reported actually
+    calling (`evidence`), not the ones it was offered; that difference is the
+    entire value of the record.
+    """
+    envelope = state.get("task_result") or {}
+    conversation_id = state.get("session_id") or ""
+    if not conversation_id:
+        return
+
+    # A turn that failed produced no answer, so it has no provenance — and
+    # recording an empty one would erase the record of the last answer that
+    # *did* succeed. A live run against an exhausted LLM quota did exactly
+    # that: an errored turn overwrote a good record with `sources=()`, so the
+    # following "how did you know?" reported nothing known about an answer the
+    # user had actually received.
+    #
+    # The test is the envelope's own status, deliberately NOT `state["error"]`.
+    # A conditional-edge function in LangGraph returns a route, not state, so
+    # the `state["error"] = None` that `decide_route` performs before sending a
+    # turn to `temporal`/`degraded`/`provenance` never reaches the node — those
+    # nodes run with the error flag still set precisely *because* they are the
+    # paths that answer correctly in spite of it. Reading it here suppressed
+    # the record for every degraded-mode answer, which a live run caught: the
+    # clock answered, and the next "how did you know?" claimed no record.
+    status = envelope.get("status")
+    if not envelope or status == "failed":
+        logger.debug("Not recording provenance for a failed turn (status=%s)", status)
+        return
+
+    category = state.get("query_category") or ""
+
+    # `memory_sources` is written by `decide_route`, which is a conditional-edge
+    # function — so like the error flag above, it never reaches the node. Rather
+    # than depend on that propagation, derive the sources from the category
+    # itself: the precedence table is the definition of which stores answer a
+    # category, so deriving it here yields the same list `decide_route` would
+    # have written. Without this the record kept `sources=()` and the clock's
+    # provenance read "an unrecorded source" for an answer that came, provably,
+    # from the clock.
+    sources = list(state.get("memory_sources") or [])
+    if not sources and category:
+        try:
+            sources = [s.value for s in sources_for(QueryCategory(category))]
+        except ValueError:
+            sources = []
+
+    try:
+        provenance.record(
+            conversation_id,
+            category=category,
+            sources=sources,
+            agent=envelope.get("agent") or state.get("current_agent") or "",
+            tools=[str(e) for e in (envelope.get("evidence") or [])],
+            answerability=state.get("answerability") or "",
+            question=state.get("user_input") or "",
+        )
+    except Exception as exc:  # never let bookkeeping break a delivered answer
+        logger.debug("Could not record provenance: %s", exc)
+
+
+@traceable(name="provenance_node", run_type="chain", tags=["workflow", "provenance"])
+async def provenance_node(state: AgentState) -> AgentState:
+    """
+    Answer "how did you know that?" from the record of the previous turn.
+
+    No model call and no retrieval — for the same reason `temporal_node` makes
+    neither. The question has exactly one true answer, it was written down when
+    the answer was given, and asking a model to reconstruct it produces a
+    fluent account of a lookup that may never have happened.
+
+    When nothing was recorded, this says so. An unrecorded provenance is a
+    NO_DATA about the assistant's own behaviour, and inventing one is the same
+    class of error as inventing a CGPA.
+    """
+    conversation_id = state.get("session_id") or ""
+    entry = provenance.last(conversation_id)
+    answer = entry.explain() if entry else provenance.NO_RECORD
+
+    log_step("memory_query", {
+        "intent": QueryCategory.PROVENANCE_QUERY.value,
+        "sources": ["conversation_current"],
+        "retrieval": False,
+        "answerability": "ANSWERABLE" if entry else "NO_DATA",
+        "clarification": False,
+        **({"explains": entry.summary()} if entry else {}),
+    })
+
+    state["task_result"] = {
+        "agent": "provenance",
+        "result": {"content": answer},
+        "status": "success" if entry else "partial",
+        "confidence": 1.0 if entry else 0.5,
+        "evidence": ["answer_provenance"],
+        "next_actions": [],
+        "goal": "explain where the previous answer came from",
+        "inputs": {"user_input": state.get("user_input", "")},
+        "constraints": {},
+        "task_id": "provenance",
+    }
+    state["display_text"] = answer
+    state["speech_text"] = answer
+    state["current_agent"] = "provenance"
+    if state.get("execution_path") is not None:
+        state["execution_path"].append("provenance")
+
+    # Deliberately NOT recorded as this turn's provenance: an explanation is not
+    # itself an answer anyone asks the origin of, and overwriting the record
+    # would make a second "how did you know?" explain the explanation.
+    return state
 
 
 # Categories whose answer is a stored value read back verbatim, with no
@@ -331,6 +451,9 @@ async def degraded_node(state: AgentState) -> AgentState:
     if state.get("execution_path") is not None:
         state["execution_path"].append("degraded")
 
+    # Bypasses `response`, so it records its own provenance — "how did you know?"
+    # follows a degraded answer as readily as any other.
+    _record_provenance(state)
     return state
 
 
@@ -376,6 +499,8 @@ async def temporal_node(state: AgentState) -> AgentState:
     if state.get("execution_path") is not None:
         state["execution_path"].append("temporal")
 
+    # Bypasses `response`, so it records its own provenance.
+    _record_provenance(state)
     return state
 
 
@@ -613,6 +738,18 @@ def decide_route(state: AgentState) -> str:
             state["error"] = None
             return "temporal"
 
+        if decision.category is QueryCategory.PROVENANCE_QUERY:
+            # Reads a record and formats it — no model, no retrieval, nothing
+            # that the upstream failure could have broken. Found by a live run
+            # against an exhausted LLM quota, where "how did you know?" came
+            # back as a planner error despite needing no planner at all.
+            logger.info(
+                "Explaining the previous answer's source from the record "
+                "despite an upstream failure: %s", state.get("error"),
+            )
+            state["error"] = None
+            return "provenance"
+
         if decision.category in _DEGRADED_ANSWERABLE:
             logger.info(
                 "Answering %s from stored records in degraded mode: %s",
@@ -671,12 +808,12 @@ def decide_route(state: AgentState) -> str:
 
 def route_after_init(
     state: AgentState,
-) -> Literal["clarification", "temporal", "degraded", "job", "email", "academic", "profile", "response"]:
+) -> Literal["clarification", "temporal", "degraded", "provenance", "job", "email", "academic", "profile", "response"]:
     """Graph edge for the routing decision. See `decide_route`."""
     route = decide_route(state)
     if route not in (
-        "clarification", "temporal", "degraded", "job", "email", "academic",
-        "profile", "response",
+        "clarification", "temporal", "degraded", "provenance", "job", "email",
+        "academic", "profile", "response",
     ):
         return "profile"
     return route
@@ -713,6 +850,7 @@ def create_workflow() -> StateGraph:
     workflow.add_node("clarification", clarification_node)
     workflow.add_node("temporal", temporal_node)
     workflow.add_node("degraded", degraded_node)
+    workflow.add_node("provenance", provenance_node)
 
     if settings.parallel_workflow_enabled:
         workflow.add_node("parallel_init", parallel_init_node)
@@ -725,6 +863,7 @@ def create_workflow() -> StateGraph:
                 "clarification": "clarification",
                 "temporal": "temporal",
                 "degraded": "degraded",
+                "provenance": "provenance",
                 "job": "job",
                 "email": "email",
                 "academic": "academic",
@@ -745,6 +884,7 @@ def create_workflow() -> StateGraph:
                 "clarification": "clarification",
                 "temporal": "temporal",
                 "degraded": "degraded",
+                "provenance": "provenance",
                 "job": "job",
                 "email": "email",
                 "academic": "academic",
@@ -758,6 +898,8 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("clarification", END)
     workflow.add_edge("temporal", END)
     workflow.add_edge("degraded", END)
+    # Reads a record and formats it; there is nothing to reflect on.
+    workflow.add_edge("provenance", END)
 
     # All specialists → reflect
     workflow.add_edge("job", "reflect")

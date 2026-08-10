@@ -90,8 +90,11 @@ def category_of(query, **kwargs):
         # user's institute calls the CGPA; its absence from the vocabulary is
         # the whole of the bug.
         ("What is my CPI?", QueryCategory.PROFILE_EDUCATION),
-        ("What is my current CPI?", QueryCategory.PROFILE_EDUCATION),
-        ("Can you tell what CPI is mentioned in my resume?", QueryCategory.PROFILE_EDUCATION),
+        # "current" and "on my résumé" are the same question about the same
+        # number right up until the two disagree, which is when it matters.
+        # Each now names the store that actually answers it.
+        ("What is my current CPI?", QueryCategory.ACADEMIC_CURRENT),
+        ("Can you tell what CPI is mentioned in my resume?", QueryCategory.DOCUMENT_RESUME),
         ("What is my SPI this semester?", QueryCategory.PROFILE_EDUCATION),
         # 3 & 4 — internships and experience
         ("Where did I do my internship?", QueryCategory.PROFILE_EXPERIENCE),
@@ -553,10 +556,21 @@ def test_a_now_marker_does_not_make_a_stored_fact_temporal():
     "current" appears in both "my current CPI" and "the current date". Only one
     of them is a question about the present moment, and treating the word as
     decisive is what routed a stored number to a clock that does not have it.
+
+    The now-marker does route a stored fact to ACADEMIC_CURRENT rather than
+    PROFILE_EDUCATION — that is the résumé/current split — but the property
+    under test is unchanged and asserted directly: it must never become a
+    question for the clock, and it must still be answered from memory.
     """
-    assert category_of("What is my current CPI?") is QueryCategory.PROFILE_EDUCATION
-    assert category_of("What is my current college?") is QueryCategory.PROFILE_EDUCATION
+    assert category_of("What is my current CPI?") is QueryCategory.ACADEMIC_CURRENT
+    assert category_of("What is my current college?") is QueryCategory.ACADEMIC_CURRENT
     assert category_of("What is the current date?") is QueryCategory.TEMPORAL_CURRENT
+
+    for stored in ("What is my current CPI?", "What is my current college?"):
+        decision = query_intent.classify(stored)
+        assert decision.category is not QueryCategory.TEMPORAL_CURRENT
+        assert MemorySource.TEMPORAL_TOOL not in decision.sources
+        assert decision.requires_retrieval is True
 
 
 # ═════════════════════════════════════════════════════════════════════════

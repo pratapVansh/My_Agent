@@ -95,6 +95,20 @@ class AgentState(TypedDict):
     profile_intent: Optional[str]             # Legacy profile label, drives tool choice
     followup_subject: Optional[str]           # Entity a follow-up refers back to
 
+    # The provenance of the answer just given — what produced it, so "how did
+    # you know?" reads a record instead of asking a model to reconstruct its
+    # own reasoning, which it cannot do and will invent. It lives in
+    # `app.memory.provenance` keyed by conversation rather than on this state:
+    # it must outlive the turn that wrote it in order to answer a question
+    # asked on the *next* one, and state does not survive that boundary.
+
+    # The observed verdict on what this turn's tools produced — ANSWERABLE,
+    # NO_DATA, TOOL_ERROR, PARTIALLY_ANSWERABLE. Derived from tool results
+    # rather than from the model's account of them, because "the lookup failed"
+    # and "there is nothing on file" are opposite claims that arrive looking
+    # identical. See app.memory.answerability.
+    answerability: Optional[str]
+
     # Task agent outputs — now uses TaskEnvelope
     task_result: Optional[TaskEnvelope]
     agent_reasoning: Optional[str]

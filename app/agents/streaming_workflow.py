@@ -163,6 +163,16 @@ async def run_streaming_workflow(
         from app.tools import time_tool
 
         answer = time_tool.answer_temporal_query(user_input)
+        from app.memory import provenance as _prov
+
+        _prov.record(
+            state.get("session_id") or "",
+            category=state.get("query_category") or "",
+            sources=["temporal_tool"],
+            agent="temporal",
+            tools=["current_datetime"],
+            question=user_input,
+        )
         yield {
             "type": "metadata",
             "selected_agent": "temporal",
@@ -174,6 +184,28 @@ async def run_streaming_workflow(
             "display_text": answer,
             "speech_text": answer,
             "agent": "temporal",
+            "success": True,
+        }
+        return
+
+    if route == "provenance":
+        # Read the record of the previous turn. Same answer the graph path
+        # gives, for the same reason: a spoken "how did you know?" must not be
+        # the one path where a model reconstructs its own sourcing.
+        from app.memory import provenance
+
+        answer = provenance.explain_last(state.get("session_id") or "")
+        yield {
+            "type": "metadata",
+            "selected_agent": "provenance",
+            "detected_intent": state.get("query_category"),
+            "execution_path": state.get("execution_path", []),
+        }
+        yield {
+            "type": "complete",
+            "display_text": answer,
+            "speech_text": answer,
+            "agent": "provenance",
             "success": True,
         }
         return
@@ -274,6 +306,22 @@ async def run_streaming_workflow(
             )
         except Exception as _e:
             logger.warning("Streaming workflow memory save failed: %s", _e)
+
+        # Record where this answer came from, so a spoken "how did you know?"
+        # on the very next turn reads a fact instead of reconstructing one.
+        try:
+            from app.memory import provenance
+
+            provenance.record(
+                session_id or "",
+                category=state.get("query_category") or "",
+                sources=state.get("memory_sources") or [],
+                agent=agent.name,
+                tools=[],
+                question=user_input,
+            )
+        except Exception as _e:
+            logger.debug("Could not record streaming provenance: %s", _e)
 
         yield {
             "type": "complete",
