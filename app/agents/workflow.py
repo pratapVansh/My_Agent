@@ -13,7 +13,13 @@ import asyncio
 from langgraph.graph import StateGraph, END
 
 logger = logging.getLogger(__name__)
-from app.agents import clarification_policy, profile_intent, query_intent
+from app.agents import (
+    clarification_policy,
+    confirmation,
+    grounding,
+    profile_intent,
+    query_intent,
+)
 from app.agents.state import AgentState
 from app.agents.planner_agent import planner_agent
 from app.agents.job_agent import job_agent
@@ -24,11 +30,21 @@ from app.agents.response_agent import response_agent
 from app.memory.memory_manager import memory_manager
 from app.memory import provenance
 from app.memory.sources import QueryCategory, sources_for
+from app.services import call_metrics
 from app.services.debug_logger import log_step
+from app.services.llm_errors import LLMErrorKind, classify_llm_error
 from app.services.langsmith_service import traceable
 from app.config import settings
 
-MAX_ITERATIONS = 3
+# Reflect passes per specialist, per plan step.
+#
+# Was 3. Each pass re-runs the *whole* specialist — its own reasoning loop of
+# up to three LLM calls — so the ceiling was nine calls for one plan step
+# before the planner and the response agent were counted. Two still recovers
+# the failure this loop exists for (a required tool the first attempt did not
+# call, which the injected failure context reliably fixes on the retry) at half
+# the worst-case cost.
+MAX_ITERATIONS = 2
 
 
 def _precategorise(state: AgentState) -> Optional[str]:
@@ -62,6 +78,19 @@ def _precategorise(state: AgentState) -> Optional[str]:
 # ─────────────────────────────────────────────
 @traceable(name="memory_node", run_type="chain", tags=["workflow", "memory"])
 async def memory_node(state: AgentState) -> AgentState:
+    """
+    Retrieval for the sequential branch (`parallel_workflow_enabled=false`).
+
+    Category scoping and retrieval-scope safety are applied here exactly as in
+    `parallel_init_node`, so the flag changes timing rather than behaviour.
+
+    One deliberate exception: `state["prefetched"]` is *not* adopted on this
+    path. A handover only arrives from `_escalate_to_tools`, and honouring it
+    here without the matching skip in `planner_node` would reuse the retrieval
+    while still paying for the planner — a half-applied optimisation that is
+    harder to reason about than not applying it at all. The parallel branch is
+    the default and does adopt it.
+    """
     user_id = state.get("user_id")
     session_id = state.get("session_id", "default_session")
     user_input = state.get("user_input", "")
@@ -75,9 +104,10 @@ async def memory_node(state: AgentState) -> AgentState:
     category = _precategorise(state)
 
     try:
-        await memory_manager.on_user_input(
-            user_id=user_id, session_id=session_id, user_message=user_input
-        )
+        if not state.get("skip_user_ingest"):
+            await memory_manager.on_user_input(
+                user_id=user_id, session_id=session_id, user_message=user_input
+            )
         memory_context, memory_prompt = await memory_manager.build_memory_prompt(
             user_id=user_id, session_id=session_id, query=user_input,
             memory_owner_id=state.get("memory_owner_id"),
@@ -114,14 +144,43 @@ async def parallel_init_node(state: AgentState) -> AgentState:
         state["memory_prompt"] = ""
         return state
 
+    # ── Work a caller already paid for ───────────────────────────────────────
+    # The streaming path retrieves memory and runs the planner, then escalates
+    # a turn that needs tools to this workflow — which used to run both again
+    # from scratch. `skip_user_ingest` suppressed the duplicate *write* but
+    # nothing suppressed the duplicate planner call or the duplicate retrieval
+    # fan-out, so an escalated spoken turn paid for its initialization twice.
+    if _adopt_prefetched(state):
+        await _settle_route(state)
+        return state
+
     category = _precategorise(state)
+
+    # ── Is the planner load-bearing on this turn? ────────────────────────────
+    # `_precategorise` has already run and is deterministic, so for a handful
+    # of categories the answer is known before the model is asked: the route is
+    # owned by the category and terminates without a specialist, which means
+    # every field the planner produces is discarded by `agent_for`. Asking
+    # anyway cost a full 120B call to answer "what time is it" from a clock.
+    planner_needed = query_intent.planner_is_load_bearing(category)
 
     try:
         async def memory_task():
             try:
-                await memory_manager.on_user_input(
-                    user_id=user_id, session_id=session_id, user_message=user_input
-                )
+                # Suppressed when the caller has already stored this utterance
+                # — see `run_workflow(skip_user_ingest=...)`.
+                #
+                # Still awaited, deliberately. The expensive half of this call
+                # (the Cohere embedding and the Qdrant upsert) is detached
+                # inside `on_user_input` itself; what remains is two Postgres
+                # writes that are ordering-critical — `on_agent_response` reads
+                # the user's message back out of the store to pair the two
+                # halves of the turn, so detaching the whole call here would
+                # race that read and pair the reply with nothing.
+                if not state.get("skip_user_ingest"):
+                    await memory_manager.on_user_input(
+                        user_id=user_id, session_id=session_id, user_message=user_input
+                    )
                 return await memory_manager.build_memory_prompt(
                     user_id=user_id, session_id=session_id, query=user_input,
                     memory_owner_id=state.get("memory_owner_id"),
@@ -133,15 +192,23 @@ async def parallel_init_node(state: AgentState) -> AgentState:
                 return {}, ""
 
         async def planner_task():
+            if not planner_needed:
+                logger.debug(
+                    "Skipping the planner for category %s — its route is already "
+                    "decided and its output would be discarded.", category,
+                )
+                return {}
             try:
-                return await planner_agent.execute(state)
+                with call_metrics.phase("planner"):
+                    return await planner_agent.execute(state)
             except Exception as e:
                 logger.error("Planner error: %s", e)
                 return state
 
-        (memory_context, memory_prompt), planner_state = await asyncio.gather(
-            memory_task(), planner_task()
-        )
+        with call_metrics.phase("init"):
+            (memory_context, memory_prompt), planner_state = await asyncio.gather(
+                memory_task(), planner_task()
+            )
 
         state["memory_context"] = memory_context
         state["memory_prompt"] = memory_prompt
@@ -159,7 +226,81 @@ async def parallel_init_node(state: AgentState) -> AgentState:
         state["memory_prompt"] = ""
         state["error"] = f"Initialization error: {str(e)}"
 
+    await _settle_route(state)
     return state
+
+
+# Fields a caller may hand over. Anything absent is simply not adopted, so a
+# partial handover degrades to computing the rest rather than to a broken turn.
+_PREFETCHABLE_FIELDS = (
+    "memory_context",
+    "memory_prompt",
+    "query_category",
+    "selected_agent",
+    "detected_intent",
+    "planner_confidence",
+    "needs_clarification",
+    "clarification_question",
+    "execution_plan",
+)
+
+
+def _adopt_prefetched(state: AgentState) -> bool:
+    """
+    Take over initialization a caller already performed. True if it was used.
+
+    Requires the memory prompt to be present, because that is the field whose
+    absence is indistinguishable from "retrieval returned nothing" — adopting a
+    handover without it would silently answer a personal question with no
+    memory and no way to tell that had happened. Everything else is optional.
+    """
+    prefetched = state.get("prefetched")
+    if not isinstance(prefetched, dict) or "memory_prompt" not in prefetched:
+        return False
+
+    for key in _PREFETCHABLE_FIELDS:
+        if key in prefetched:
+            state[key] = prefetched[key]
+
+    # Planner defaults the escalating caller may not have set, so the graph
+    # downstream reads the same shape it would from a normal init.
+    state.setdefault("execution_plan", [])
+    state["current_step_index"] = state.get("current_step_index") or 0
+    state["step_results"] = state.get("step_results") or {}
+
+    logger.info(
+        "Adopted prefetched initialization (category=%s, agent=%s) — planner and "
+        "retrieval not repeated.",
+        state.get("query_category"), state.get("selected_agent"),
+    )
+    return True
+
+
+async def _settle_route(state: AgentState) -> str:
+    """
+    Make the routing decision here, in a node, where its writes survive.
+
+    This is the whole fix for a class of bugs that all had the same shape. The
+    decision was being made in `route_after_init`, which LangGraph treats as a
+    conditional edge: it returns a route and its state mutations are dropped.
+    So `profile_intent`, `memory_sources`, `followup_subject` and the chosen
+    specialist were computed correctly and then thrown away, and three separate
+    downstream mechanisms silently degraded — the profile agent's deterministic
+    tool directive arrived empty, reflect retried the planner's stale choice
+    rather than the agent that failed, and nothing downstream could tell which
+    tools the turn was obliged to call.
+
+    Running it from the node costs one extra classification on the turns that
+    reach a specialist, which is microseconds of pure function, and buys a
+    decision that the rest of the graph can actually read.
+    """
+    try:
+        return await decide_route(state)
+    except Exception as exc:
+        # Routing must never be the thing that fails a turn. Falling through to
+        # `route_after_init` reproduces the previous behaviour exactly.
+        logger.warning("Could not settle the route in-node: %s", exc)
+        return ""
 
 
 # ─────────────────────────────────────────────
@@ -203,7 +344,13 @@ async def clarification_node(state: AgentState) -> AgentState:
 # ─────────────────────────────────────────────
 @traceable(name="planner_node", run_type="chain", tags=["workflow", "planner"])
 async def planner_node(state: AgentState) -> AgentState:
-    return await planner_agent.execute(state)
+    state = await planner_agent.execute(state)
+    # The sequential branch settles its route here for the same reason the
+    # parallel one does — see `_settle_route`. Keeping both branches identical
+    # is what stops `parallel_workflow_enabled` from changing behaviour rather
+    # than only timing.
+    await _settle_route(state)
+    return state
 
 
 @traceable(name="job_node", run_type="chain", tags=["workflow", "job"])
@@ -297,6 +444,46 @@ def _record_provenance(state: AgentState) -> None:
         )
     except Exception as exc:  # never let bookkeeping break a delivered answer
         logger.debug("Could not record provenance: %s", exc)
+
+
+@traceable(name="confirm_action_node", run_type="chain", tags=["workflow", "confirm"])
+async def confirm_action_node(state: AgentState) -> AgentState:
+    """
+    Approve or cancel an action the user was shown.
+
+    No model call. The decision was already made deterministically by
+    `confirmation.detect`, and the execution — if any — happens inside
+    `ActionGateway.confirm_and_execute`, which is the only code in the system
+    that invokes a confirmable tool. This node holds no tool callable and could
+    not run one if it tried.
+    """
+    outcome = await confirmation.resolve(state)
+
+    log_step("confirm_action", {
+        **outcome.summary(),
+        "intent": QueryCategory.CONFIRM_ACTION.value,
+    })
+
+    state["task_result"] = {
+        "agent": "confirm_action",
+        "result": {"content": outcome.text},
+        "status": "success",
+        "confidence": 1.0,
+        "evidence": ["action_gateway"],
+        "next_actions": [],
+        "goal": "approve or cancel a held action",
+        "inputs": {"user_input": state.get("user_input", "")},
+        "constraints": {},
+        "task_id": "confirm_action",
+    }
+    state["display_text"] = outcome.text
+    state["speech_text"] = outcome.text
+    state["current_agent"] = "confirm_action"
+    if state.get("execution_path") is not None:
+        state["execution_path"].append("confirm_action")
+
+    _record_provenance(state)
+    return state
 
 
 @traceable(name="provenance_node", run_type="chain", tags=["workflow", "provenance"])
@@ -524,12 +711,114 @@ async def reflect_node(state: AgentState) -> AgentState:
 
     confidence = task_result.get("confidence", 0.0)
 
+    # ── What "failed" means ──────────────────────────────────────────────────
+    #
+    # Every specialist computes `status = "success" if final_answer else
+    # "failed"`, and the reasoning loop substitutes a fallback sentence when the
+    # model produces nothing — so `final_answer` is never empty and the envelope
+    # was effectively always "success". The retry branch below could therefore
+    # only be reached by an agent raising, which made the entire learn-from-
+    # failure mechanism unreachable for the failure that actually happens: a
+    # tool that errored.
+    #
+    # `answerability` is the loop's own verdict on what the tools returned, and
+    # TOOL_ERROR means every tool it called failed. That is a failed attempt by
+    # any honest reading, and it is precisely the case a different strategy
+    # might recover from — a retry may pick different arguments or a different
+    # tool. NO_DATA deliberately does not qualify: an empty store is an answer,
+    # and retrying it just asks the same empty store again.
+    answerability = state.get("answerability") or ""
+    if status != "failed" and answerability == "TOOL_ERROR":
+        logger.info(
+            "Reflect: treating a TOOL_ERROR turn as failed so a retry can use a "
+            "different strategy (agent=%s)", task_result.get("agent"),
+        )
+        status = "failed"
+
+    # ── The tool was never called ────────────────────────────────────────────
+    #
+    # `grounding == "skipped"` means the category required a tool, the agent
+    # held it, and the model answered without it — so `grounding.enforce`
+    # replaced the answer with a refusal. That refusal is correct and must
+    # stay; what was missing is that the turn ended there. It is the *most*
+    # recoverable failure in the system: the tool exists and the data is
+    # sitting behind it, the model simply did not look. A retry re-enters the
+    # loop with `reflect_failure_context` injected, which is exactly the
+    # signal that makes the second attempt call the tool.
+    #
+    # Measured against `openai/gpt-oss-120b`, the first attempt skips a
+    # required tool often enough that without this the user sees "please ask
+    # again" on a question the agent could answer.
+    #
+    # Only SKIPPED. NO_DATA is an answer (the store really is empty) and
+    # FAILED is already covered by TOOL_ERROR above — retrying either just
+    # asks the same empty store or the same broken tool a second time.
+    if status != "failed" and (state.get("grounding") or "") == "skipped":
+        logger.info(
+            "Reflect: required tool was never called (grounding=skipped); "
+            "retrying so the tool actually runs (agent=%s)",
+            task_result.get("agent"),
+        )
+        status = "failed"
+
+    # ── The one failure that must never be retried ───────────────────────────
+    #
+    # A retry here re-runs the entire specialist — a fresh reasoning loop, up
+    # to `max_iterations` more model calls. When the reason the turn failed is
+    # that the provider is rate limiting us, that is the most expensive
+    # possible response to being told we are asking for too much: the retry
+    # lands in the same closed window, fails the same way, and each rejected
+    # request still counts against the account. The loop becomes a cause of the
+    # outage it is reacting to.
+    #
+    # A turn where every LLM attempt timed out and none returned is excluded
+    # for the same reason: a timeout is what queueing looks like from this
+    # side, and queueing is what rate limiting looks like before the provider
+    # gets round to saying so. Re-running a specialist against a provider that
+    # is not answering produces more unanswered calls. One slow call that a
+    # later iteration recovered from is *not* this case — see
+    # `llm_unreachable`, which requires that nothing came back at all.
+    #
+    # This is a *retry* gate only. The turn still routes to the response agent,
+    # still reports honestly, and the NO_DATA / TOOL_ERROR distinction below is
+    # untouched — an empty store and a broken tool still mean what they meant.
+    envelope = state.get("task_result") or {}
+    provider_exhausted = (
+        bool(state.get("rate_limited"))
+        or envelope.get("rate_limited") is True
+        or bool(state.get("llm_unreachable"))
+        or envelope.get("llm_unreachable") is True
+    )
+    if not provider_exhausted:
+        error_text = str(state.get("error") or "")
+        if error_text:
+            provider_exhausted = (
+                classify_llm_error(RuntimeError(error_text)) is LLMErrorKind.RATE_LIMITED
+            )
+
     log_step("REFLECT", {
         "status": status,
+        "answerability": answerability,
         "confidence": confidence,
         "iteration": iteration_count,
         "max": MAX_ITERATIONS,
+        "provider_exhausted": provider_exhausted,
     })
+
+    if status == "failed" and provider_exhausted:
+        logger.error(
+            "Reflect: not retrying a turn the model provider did not serve "
+            "(agent=%s, rate_limited=%s, llm_unreachable=%s). Re-running the "
+            "specialist would issue the same calls into the same conditions.",
+            task_result.get("agent"),
+            bool(state.get("rate_limited")) or envelope.get("rate_limited") is True,
+            bool(state.get("llm_unreachable")) or envelope.get("llm_unreachable") is True,
+        )
+        state["reflect_outcome"] = "done"
+        state["reflect_failure_context"] = None
+        if state.get("execution_path") is not None:
+            state["execution_path"].append(f"reflect_{iteration_count}_rate_limited")
+        return state
 
     # ── Fix 2: Reflect learns from failures ─────────────────────────────────
     if status == "failed" and iteration_count < MAX_ITERATIONS:
@@ -566,6 +855,26 @@ async def reflect_node(state: AgentState) -> AgentState:
     # ── Fix 1: Multi-step plan advancement ──────────────────────────────────
     execution_plan = state.get("execution_plan") or []
     current_step_index = state.get("current_step_index") or 0
+
+    # Some answers are finished when their agent returns, and a second step
+    # would not extend them — it would *replace* them, because each step's
+    # envelope overwrites the last. A live run showed a JOB_MATCH turn produce
+    # the evidence-backed match report and then advance to the profile agent,
+    # which paraphrased it into free prose; the rendered answer, its source ids
+    # and its structured verdict were all lost. The planner cannot prevent this
+    # because it never learns that routing overrode its agent choice, so the
+    # decision is made here from the category instead.
+    if query_intent.is_single_step(state.get("query_category")):
+        if len(execution_plan) > 1:
+            logger.info(
+                "Ignoring a %d-step plan for a single-step category (%s): the "
+                "answer is already complete.",
+                len(execution_plan), state.get("query_category"),
+            )
+        state["reflect_outcome"] = "done"
+        if state.get("execution_path") is not None:
+            state["execution_path"].append(f"reflect_{iteration_count}_done")
+        return state
 
     if status != "failed" and len(execution_plan) > 1 and current_step_index < len(execution_plan) - 1:
         # Current step succeeded and there are more steps to run
@@ -683,9 +992,20 @@ def _has_memory_signal(state: AgentState) -> bool:
     return bool((state.get("memory_prompt") or "").strip())
 
 
-def decide_route(state: AgentState) -> str:
+async def decide_route(state: AgentState) -> str:
     """
     The single routing decision, shared by the graph and the streaming path.
+
+    **Call this from a node, not from a conditional edge.** Everything it writes
+    to `state` — the category, the sources, the required tools, the specialist
+    it picked — is load-bearing downstream, and a LangGraph conditional-edge
+    function returns a route rather than state, so writes made from one are
+    discarded. That is not a theoretical hazard: it is why the profile agent's
+    "ROUTING DECISION (already made deterministically — follow it)" block
+    arrived with the decision missing from it in seven cases out of eight, and
+    why a failed job agent was retried as the profile agent.
+    `route_after_init` therefore *reads* `state["route"]` instead of computing
+    it, and the nodes that feed it call this first.
 
     Four things happen here, in this order, and the order is the design:
 
@@ -713,6 +1033,36 @@ def decide_route(state: AgentState) -> str:
     conversation_id = state.get("session_id") or ""
     turns = _conversation_turns(state)
 
+    # ── 0. A reply to an action already held for approval ────────────────────
+    # Ahead of classification, the planner, and every specialist — which is the
+    # point. "Yes" is a word a language model will happily reinterpret as a
+    # request to do something, and the one turn where that reinterpretation is
+    # unrecoverable is the turn that approves an irreversible action. So the
+    # decision is made here, deterministically, before any model output can
+    # influence it.
+    #
+    # Gated on an action actually being pending for this caller in this
+    # conversation: with nothing outstanding, "yes" is ordinary conversation
+    # and falls straight through to normal routing.
+    # Asynchronous because the answer now lives in Postgres rather than in this
+    # process — which is what lets a "yes" be answered by a worker that never
+    # saw the action proposed. LangGraph resolves coroutine path functions
+    # under `ainvoke`, which is how this graph is always run.
+    if await confirmation.should_intercept(state):
+        state["query_category"] = QueryCategory.CONFIRM_ACTION.value
+        state["memory_sources"] = [
+            s.value for s in sources_for(QueryCategory.CONFIRM_ACTION)
+        ]
+        state["required_tools"] = []
+        state["route"] = "confirm_action"
+        log_step("memory_query", {
+            "intent": QueryCategory.CONFIRM_ACTION.value,
+            "retrieval": False,
+            "agent": "confirm_action",
+            "pending": len(await confirmation.pending_for_state(state)),
+        })
+        return "confirm_action"
+
     decision = query_intent.classify(query, has_context=bool(turns), history=turns)
 
     if state.get("error"):
@@ -736,6 +1086,7 @@ def decide_route(state: AgentState) -> str:
                 "upstream failure: %s", state.get("error"),
             )
             state["error"] = None
+            state["route"] = "temporal"
             return "temporal"
 
         if decision.category is QueryCategory.PROVENANCE_QUERY:
@@ -748,6 +1099,7 @@ def decide_route(state: AgentState) -> str:
                 "despite an upstream failure: %s", state.get("error"),
             )
             state["error"] = None
+            state["route"] = "provenance"
             return "provenance"
 
         if decision.category in _DEGRADED_ANSWERABLE:
@@ -757,8 +1109,10 @@ def decide_route(state: AgentState) -> str:
             )
             state["degraded_reason"] = str(state.get("error"))
             state["error"] = None
+            state["route"] = "degraded"
             return "degraded"
 
+        state["route"] = "response"
         return "response"
 
     state["query_category"] = decision.category.value
@@ -769,17 +1123,43 @@ def decide_route(state: AgentState) -> str:
         # existing routing tests both read it.
         state["profile_intent"] = decision.profile_intent
 
+    # Which tools this category may not answer without. Written here so the
+    # specialist is handed the requirement rather than asked to infer it from a
+    # tool list, and so `execute_reasoning_loop` can check afterwards whether
+    # one of them actually ran. See `app.agents.grounding`.
+    #
+    # SCHEDULE_TEMPORAL is refined by its sub-intent, because that one category
+    # spans the timetable, the attendance log, the exam list and personal plans.
+    # Without the refinement, "what classes do I have tomorrow" counted as
+    # grounded once `get_plans` had run.
+    subintent = (
+        query_intent.schedule_intent(query)
+        if decision.category is QueryCategory.SCHEDULE_TEMPORAL else None
+    )
+    state["schedule_intent"] = subintent
+    state["required_tools"] = list(
+        grounding.required_tools(decision.category, subintent=subintent)
+    )
+
     # A standing request for fewer questions is recorded before any decision is
     # made, so it applies to the very turn it was expressed in.
     clarification_policy.note_user_message(conversation_id, query)
 
-    selected = query_intent.agent_for(decision, state.get("selected_agent"))
+    # The planner's plan shape is an input, not just an output: a compound
+    # request it decomposed into several steps owns its own first step. See
+    # `query_intent.agent_for`.
+    plan_steps = len(state.get("execution_plan") or [])
+
+    selected = query_intent.agent_for(
+        decision, state.get("selected_agent"), plan_steps=plan_steps,
+    )
 
     log_step("memory_query", {
         "query_chars": len(query),
         **decision.summary(),
         "retrieval": decision.requires_retrieval,
         "agent": selected,
+        "required_tools": state["required_tools"],
     })
 
     if state.get("needs_clarification"):
@@ -792,6 +1172,7 @@ def decide_route(state: AgentState) -> str:
                 "attempts": attempts,
                 "intent": decision.category.value,
             })
+            state["route"] = "clarification"
             return "clarification"
 
         log_step("CLARIFICATION SUPPRESSED", {
@@ -803,17 +1184,35 @@ def decide_route(state: AgentState) -> str:
         state["needs_clarification"] = False
         state["clarification_question"] = ""
 
+    # The specialist that will actually run, recorded as such.
+    #
+    # `selected_agent` used to hold only the planner's opinion, and this
+    # function overrules that opinion routinely — so `route_after_reflect`,
+    # which reads the field to decide who to retry, was retrying whoever the
+    # planner had originally named. A JOB_MATCH turn whose job agent failed was
+    # retried by the profile agent, which holds no `match_job` and no posting,
+    # while being handed a failure context that said the job agent had failed.
+    state["selected_agent"] = selected
+    state["route"] = selected
     return selected
 
 
-def route_after_init(
+async def route_after_init(
     state: AgentState,
-) -> Literal["clarification", "temporal", "degraded", "provenance", "job", "email", "academic", "profile", "response"]:
-    """Graph edge for the routing decision. See `decide_route`."""
-    route = decide_route(state)
+) -> Literal["clarification", "temporal", "degraded", "provenance", "confirm_action", "job", "email", "academic", "profile", "response"]:
+    """
+    Graph edge for the routing decision — a *reader*. See `decide_route`.
+
+    The decision was already made and recorded by the node that ran before
+    this, which is the only place its writes survive. Recomputing here is the
+    fallback for a node that could not settle it (and for `memory_node`, which
+    predates this arrangement); the answer is the same either way, but the
+    state it leaves behind is not.
+    """
+    route = state.get("route") or await decide_route(state)
     if route not in (
-        "clarification", "temporal", "degraded", "provenance", "job", "email",
-        "academic", "profile", "response",
+        "clarification", "temporal", "degraded", "provenance", "confirm_action",
+        "job", "email", "academic", "profile", "response",
     ):
         return "profile"
     return route
@@ -822,11 +1221,25 @@ def route_after_init(
 def route_after_reflect(state: AgentState) -> Literal["job", "email", "academic", "profile", "response"]:
     """
     Route from reflect:
-    - "retry"     → same specialist (failure context injected, Fix 2)
+    - "retry"     → the specialist that actually ran and failed
     - "next_step" → next specialist in execution plan (Fix 1)
     - "done"      → response agent
+
+    On a retry the agent is taken from the envelope first, because the envelope
+    is stamped by whichever specialist produced it. `selected_agent` is now
+    written by `decide_route` too, so the two normally agree — but the envelope
+    is the record of what happened rather than of what was decided, and a retry
+    must follow what happened. Retrying a different specialist than the one
+    that failed is not a retry; it hands a job-match failure to an agent with no
+    matcher, together with a failure context describing someone else's attempt.
     """
     outcome = state.get("reflect_outcome", "done")
+    if outcome == "retry":
+        envelope = state.get("task_result") or {}
+        ran = envelope.get("agent") or state.get("current_agent")
+        if ran in ("job", "email", "academic", "profile"):
+            return ran
+
     if outcome in ("retry", "next_step"):
         selected = state.get("selected_agent", "profile")
         if selected in ("job", "email", "academic", "profile"):
@@ -851,6 +1264,7 @@ def create_workflow() -> StateGraph:
     workflow.add_node("temporal", temporal_node)
     workflow.add_node("degraded", degraded_node)
     workflow.add_node("provenance", provenance_node)
+    workflow.add_node("confirm_action", confirm_action_node)
 
     if settings.parallel_workflow_enabled:
         workflow.add_node("parallel_init", parallel_init_node)
@@ -864,6 +1278,7 @@ def create_workflow() -> StateGraph:
                 "temporal": "temporal",
                 "degraded": "degraded",
                 "provenance": "provenance",
+                "confirm_action": "confirm_action",
                 "job": "job",
                 "email": "email",
                 "academic": "academic",
@@ -885,6 +1300,7 @@ def create_workflow() -> StateGraph:
                 "temporal": "temporal",
                 "degraded": "degraded",
                 "provenance": "provenance",
+                "confirm_action": "confirm_action",
                 "job": "job",
                 "email": "email",
                 "academic": "academic",
@@ -900,6 +1316,9 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("degraded", END)
     # Reads a record and formats it; there is nothing to reflect on.
     workflow.add_edge("provenance", END)
+    # Already executed (or refused) a decided action — a reflect retry here
+    # would be a second attempt at something the user approved once.
+    workflow.add_edge("confirm_action", END)
 
     # All specialists → reflect
     workflow.add_edge("job", "reflect")
@@ -939,6 +1358,9 @@ async def run_workflow(
     scopes: Optional[FrozenSet[str]] = None,
     memory_owner_id: Optional[str] = None,
     memory_visibilities: Optional[list] = None,
+    skip_user_ingest: bool = False,
+    timeout_seconds: Optional[float] = None,
+    prefetched: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Execute the multi-agent workflow.
@@ -948,6 +1370,21 @@ async def run_workflow(
             filter their tools against this set, so a restricted caller cannot
             reach privileged tools by asking for them. None means unrestricted
             and must only be used for internal/CLI invocation.
+        skip_user_ingest: Do not store the user's message again. Set only by a
+            caller that has already ingested this exact utterance — the
+            streaming workflow, when it escalates a turn *after* its own
+            `parallel_init_node` has run. Retrieval still happens; what is
+            suppressed is the write, so the thread does not end up holding the
+            same sentence twice.
+        timeout_seconds: Overall deadline for this run. Defaults to
+            `settings.workflow_timeout_seconds`; the voice worker passes the
+            shorter `voice_workflow_timeout_seconds` because a spoken turn's
+            caller has stopped listening long before the typed ceiling.
+        prefetched: Initialization results a caller has already paid for —
+            memory context, prompt, category, routing. Supplied by the
+            streaming workflow when it escalates a turn to tools, so the
+            planner call and the whole retrieval fan-out are not repeated. See
+            `parallel_init_node`.
 
     Returns:
         Final state with display_text and speech_text
@@ -971,6 +1408,8 @@ async def run_workflow(
         "memory_owner_id": memory_owner_id,
         "memory_visibilities": memory_visibilities,
         "conversation_history": conversation_history or [],
+        "skip_user_ingest": skip_user_ingest,
+        "prefetched": prefetched or None,
         "memory_context": None,
         "memory_prompt": None,
         "detected_intent": None,
@@ -983,6 +1422,9 @@ async def run_workflow(
         "memory_sources": None,
         "profile_intent": None,
         "followup_subject": None,
+        "route": None,
+        "required_tools": [],
+        "schedule_intent": None,
         "task_result": None,
         "agent_reasoning": None,
         "iteration_count": 0,
@@ -1005,26 +1447,75 @@ async def run_workflow(
     # Overall deadline. Reflect retries × reasoning iterations × per-call
     # timeouts can otherwise stack into several minutes of work continuing
     # server-side long after the client has given up waiting.
+    deadline = (
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else settings.workflow_timeout_seconds
+    )
+
+    # Everything this turn costs, counted rather than estimated. The audit that
+    # motivated the retry and retrieval work could only be written by reading
+    # the code and multiplying the layers together by hand; these counters make
+    # the same numbers observable per turn. See `app.services.call_metrics`.
+    metrics_scope = call_metrics.turn(initial_state["request_id"])
+    turn_metrics = metrics_scope.__enter__()
     try:
         final_state = await asyncio.wait_for(
             multi_agent_workflow.ainvoke(initial_state),
-            timeout=settings.workflow_timeout_seconds,
+            timeout=deadline,
         )
     except asyncio.TimeoutError:
         logger.error(
             "Workflow timed out after %.0fs (user=%s, request_id=%s)",
-            settings.workflow_timeout_seconds, user_id, initial_state["request_id"],
+            deadline, user_id, initial_state["request_id"],
         )
         timeout_message = (
             "That request took too long to complete. "
             "Please try again, or break it into smaller steps."
         )
+        # Closed here as well as on the success path: a timed-out turn is
+        # exactly the one whose cost is worth reading, and leaving the scope
+        # open would attribute the next turn's calls to this one.
+        metrics_scope.__exit__(None, None, None)
+        log_step("TURN_COST", turn_metrics.as_dict())
+        logger.info("Turn cost (timed out): %s", turn_metrics.as_dict())
         return {
             **initial_state,
             "display_text": timeout_message,
             "speech_text": timeout_message,
             "error": "workflow_timeout",
         }
+    else:
+        metrics_scope.__exit__(None, None, None)
+        log_step("TURN_COST", turn_metrics.as_dict())
+        logger.info("Turn cost: %s", turn_metrics.as_dict())
+    finally:
+        # Idempotent: `_current.reset` has already run on both paths above.
+        # This catches an unexpected exception escaping the graph, so the
+        # context var is never left pointing at a finished turn.
+        if call_metrics.current() is turn_metrics:
+            metrics_scope.__exit__(None, None, None)
+
+    # ── Who actually answered ────────────────────────────────────────────────
+    # `selected_agent` holds the planner's choice, and the planner is routinely
+    # overruled: `decide_route` picks the specialist from the deterministic
+    # category, and its state writes never reach the nodes because a LangGraph
+    # conditional-edge function returns a route rather than state. So a
+    # JOB_MATCH turn ran the job agent while this field still said "profile" —
+    # and that field is what the logs, the episode record and the client
+    # metadata all report.
+    #
+    # The envelope knows: every specialist stamps its own name on the result it
+    # produced, as do `temporal`, `provenance`, `degraded` and `confirm_action`.
+    # Corrected after the graph rather than inside it, so nothing the routing or
+    # reflect logic reads mid-run is disturbed.
+    envelope_agent = (final_state.get("task_result") or {}).get("agent")
+    if envelope_agent and envelope_agent != final_state.get("selected_agent"):
+        logger.debug(
+            "Reporting the agent that ran (%s) rather than the planner's "
+            "choice (%s)", envelope_agent, final_state.get("selected_agent"),
+        )
+        final_state["selected_agent"] = envelope_agent
 
     # Save agent response to memory
     try:

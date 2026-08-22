@@ -1,34 +1,98 @@
 """
-Timetable PDF parser.
-Extracts text from a PDF using PyPDF2, then uses Groq LLM to parse the
-timetable (any layout — grid, list, weekly view) into structured entries.
+Timetable PDF parser — deterministic, no model call.
+
+Extracts text with PyPDF2, then parses it with fixed rules: a line counts as
+one class only if it names a weekday *and* a time range. Everything else in
+that line — after the day and the time range are removed — becomes the
+subject, unless it also matches an explicit `Room:`/`Instructor:`-style label,
+in which case that piece is split out instead of left in the subject text.
+
+This is deliberately narrower than an LLM parse would be. It handles the
+common case of a timetable exported as one line of text per class
+("Monday 09:00-10:00 Data Structures Room 204 Dr. Sharma"), and it refuses
+anything that doesn't fit that shape rather than guessing at a layout it
+cannot actually read — a two-dimensional grid table, in particular, does not
+survive PyPDF2's text extraction in reading order and is exactly the kind of
+document `app/tools/timetable_source.py` exists to handle instead, by hand,
+with the source PDF's hash pinned so a different document cannot silently
+reuse the transcription.
+
+No entry here is inferred. A line that names a day and a time but nothing
+recognisable as a subject is skipped, not guessed at; a room or instructor is
+recorded only when the line labels it explicitly. The same discipline the
+memory layer applies to personal facts applies here to classes: absence of a
+clean parse is reported, never papered over.
 """
 from __future__ import annotations
 
 import io
-import json
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyPDF2 import PdfReader
 
-from app.services.groq_service import groq_service
 from app.tools.timetable_tool import TimetableInput
+
+_DAY_MAP: Dict[str, int] = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tues": 1, "tue": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thurs": 3, "thu": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+_DAY_RE = re.compile(
+    r"\b(monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thu"
+    r"|friday|fri|saturday|sat|sunday|sun)\b",
+    re.IGNORECASE,
+)
+
+# "9:00 - 10:00", "9 to 10 am", "09:00am-10:30am". Both sides are captured
+# whole (digits, optional minutes, optional meridiem) so `_normalize_time`
+# gets exactly what a person would read out loud, not a pre-split fragment.
+_TIME_RANGE_RE = re.compile(
+    # The optional whitespace before a meridiem lives *inside* that optional
+    # group, not next to it — otherwise `\s*` has nothing to backtrack out of
+    # when there is no "am"/"pm" to match, and "09:00 " (trailing space) ends
+    # up as the captured time instead of "09:00".
+    r"(\d{1,2}(?::\d{2})?(?:\s*(?:am|pm|a\.m\.|p\.m\.))?)"
+    r"\s*(?:-|to|–|—)\s*"
+    r"(\d{1,2}(?::\d{2})?(?:\s*(?:am|pm|a\.m\.|p\.m\.))?)",
+    re.IGNORECASE,
+)
+
+# Explicit labels only. "Room 204" inside a subject name is not the same
+# claim as "Room: 204" — the latter is the document telling the parser what a
+# field is; the former is the parser guessing, which this module does not do.
+_ROOM_RE = re.compile(
+    r"\b(?:room|location|venue|hall)\s*[:#]?\s*"
+    r"([A-Za-z0-9][A-Za-z0-9 \-]{0,30}?)"
+    r"(?=$|,|;|\.|\bInstructor\b|\bFaculty\b|\bTaught\b|\bDr\b|\bProf)",
+    re.IGNORECASE,
+)
+_INSTRUCTOR_RE = re.compile(
+    # No bare "." in the labelled branch's stop condition: a name captured
+    # here routinely contains one itself ("Instructor: Dr. Sharma"), and a
+    # period-terminated lookahead would cut the title off mid-name.
+    r"\b(?:instructor|faculty|taught\s+by)\s*[:#]?\s*"
+    r"([A-Za-z][A-Za-z.\-\' ]{1,50}?)(?=$|,|;)"
+    r"|(\bDr\.?\s+[A-Za-z][A-Za-z.\-\' ]{1,50}|\bProf\.?\s+[A-Za-z][A-Za-z.\-\' ]{1,50})",
+    re.IGNORECASE,
+)
 
 
 class TimetablePDFParser:
     """
     Two-step parser:
-      1. PyPDF2  → raw text
-      2. Groq LLM → structured JSON entries → List[TimetableInput]
-    """
+      1. PyPDF2 → raw text.
+      2. Fixed rules → structured entries → `List[TimetableInput]`.
 
-    _DAY_MAP: Dict[str, int] = {
-        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-        "friday": 4, "saturday": 5, "sunday": 6,
-        "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
-    }
+    No step here makes a network or model call — parsing a timetable never
+    blocks on an LLM being reachable, rate-limited, or right.
+    """
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -46,6 +110,9 @@ class TimetablePDFParser:
                 "parse_notes": str,
                 "filename": str,
             }
+
+        Still `async` even though nothing inside awaits: the signature is the
+        contract callers hold, and every caller already awaits it.
         """
         raw_text, num_pages = self._extract_text(pdf_bytes)
 
@@ -57,13 +124,15 @@ class TimetablePDFParser:
                 "pages": num_pages,
                 "raw_text_preview": "",
                 "parse_notes": (
-                    "No text could be extracted from the PDF. "
-                    "Make sure it is a text-based PDF, not a scanned image."
+                    "No text could be extracted from the PDF. Make sure it is a "
+                    "text-based PDF, not a scanned image — a scanned or "
+                    "image-only grid has no text layer for anything, model or "
+                    "not, to read."
                 ),
                 "filename": filename,
             }
 
-        raw_entries, parse_notes = await self._parse_with_llm(raw_text)
+        raw_entries, parse_notes = self._parse_deterministic(raw_text)
         timetable_inputs = self._to_timetable_inputs(raw_entries)
 
         return {
@@ -91,95 +160,77 @@ class TimetablePDFParser:
         except Exception:
             return "", 0
 
-    # ── Step 2: LLM parsing ───────────────────────────────────────────────────
+    # ── Step 2: deterministic, line-based parsing ─────────────────────────────
 
-    _SYSTEM_PROMPT = """You are a timetable parser. Extract every class/lecture from the raw text.
-
-Output ONLY a JSON object — no explanation, no markdown, just the JSON:
-{
-  "entries": [
-    {
-      "subject": "Data Structures",
-      "day": "Monday",
-      "start_time": "09:00",
-      "end_time": "10:00",
-      "location": "Room 204",
-      "instructor": "Dr. Sharma"
-    }
-  ],
-  "notes": "optional notes about the parse"
-}
-
-Rules:
-- "day" must be one of: Monday Tuesday Wednesday Thursday Friday Saturday Sunday
-- "start_time" and "end_time" must be 24-hour HH:MM format (e.g. "14:30")
-- If end_time is missing, add 1 hour to start_time
-- "location" and "instructor" are null when not mentioned
-- For grid timetables (days as columns, time-slots as rows): read each non-empty cell
-- Skip blank cells, breaks, lunch, free periods
-- Do NOT invent data — only extract what is written in the text
-- Output ONLY the raw JSON, nothing else"""
-
-    async def _parse_with_llm(self, raw_text: str) -> Tuple[List[Dict], str]:
+    def _parse_deterministic(self, raw_text: str) -> Tuple[List[Dict], str]:
         """
-        Call Groq with the extracted PDF text and return (entries, notes).
-        Truncates input to 4000 chars to avoid token limits.
-        """
-        text_to_send = raw_text[:4000]
+        One class per line: a weekday, a time range, and whatever remains.
 
-        try:
-            response = await groq_service.chat_completion(
-                messages=[
-                    {"role": "system", "content": self._SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Parse this timetable:\n\n{text_to_send}"},
-                ],
-                temperature=0.1,
-                max_tokens=2048,
+        A line missing either signal is not a class this parser can read and
+        is skipped outright — there is no partial-credit guess for "probably a
+        continuation of the class above" or "probably a header row".
+        """
+        entries: List[Dict] = []
+        non_blank_lines = 0
+        unmatched_lines = 0
+
+        for raw_line in raw_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            non_blank_lines += 1
+
+            day_match = _DAY_RE.search(line)
+            time_match = _TIME_RANGE_RE.search(line)
+            if not day_match or not time_match:
+                unmatched_lines += 1
+                continue
+
+            # Remove the matched day and time-range spans, in reverse order of
+            # position, so removing one does not shift the other's indices.
+            spans = sorted([day_match.span(), time_match.span()], reverse=True)
+            remainder = line
+            for start, end in spans:
+                remainder = remainder[:start] + " " + remainder[end:]
+
+            room = None
+            m = _ROOM_RE.search(remainder)
+            if m:
+                room = (m.group(1) or "").strip(" ,;:-.") or None
+                remainder = remainder[:m.start()] + " " + remainder[m.end():]
+
+            instructor = None
+            m = _INSTRUCTOR_RE.search(remainder)
+            if m:
+                instructor = (m.group(1) or m.group(2) or "").strip(" ,;:-.") or None
+                remainder = remainder[:m.start()] + " " + remainder[m.end():]
+
+            subject = re.sub(r"\s+", " ", remainder).strip(" ,;:-.")
+            if not subject:
+                unmatched_lines += 1
+                continue
+
+            entries.append({
+                "subject": subject,
+                "day": day_match.group(1),
+                "start_time": time_match.group(1),
+                "end_time": time_match.group(2),
+                "location": room,
+                "instructor": instructor,
+            })
+
+        notes = (
+            f"Parsed deterministically (no model call): {len(entries)} of "
+            f"{non_blank_lines} non-blank line(s) named a weekday and a time "
+            "range."
+        )
+        if unmatched_lines:
+            notes += (
+                f" {unmatched_lines} line(s) did not and were skipped — this "
+                "parser reads one class per line and cannot reconstruct a "
+                "two-dimensional grid table."
             )
-            content = response.get("content", "")
-            return self._extract_json(content)
-        except Exception as e:
-            return [], f"LLM call failed: {str(e)}"
-
-    # ── JSON extraction (4-strategy fallback) ─────────────────────────────────
-
-    def _extract_json(self, text: str) -> Tuple[List[Dict], str]:
-        """Try 4 strategies to parse JSON from LLM response."""
-        # 1. Raw text
-        try:
-            data = json.loads(text.strip())
-            return data.get("entries", []), data.get("notes", "Parsed successfully")
-        except Exception:
-            pass
-
-        # 2. ```json ... ``` block
-        m = re.search(r"```json\s*([\s\S]*?)\s*```", text)
-        if m:
-            try:
-                data = json.loads(m.group(1))
-                return data.get("entries", []), data.get("notes", "Parsed from json block")
-            except Exception:
-                pass
-
-        # 3. ``` ... ``` block
-        m = re.search(r"```\s*([\s\S]*?)\s*```", text)
-        if m:
-            try:
-                data = json.loads(m.group(1))
-                return data.get("entries", []), data.get("notes", "Parsed from code block")
-            except Exception:
-                pass
-
-        # 4. First { ... } in text
-        m = re.search(r"\{[\s\S]*\}", text)
-        if m:
-            try:
-                data = json.loads(m.group(0))
-                return data.get("entries", []), data.get("notes", "Parsed via substring fallback")
-            except Exception:
-                pass
-
-        return [], "Could not extract JSON from LLM response"
+        return entries, notes
 
     # ── Step 3: Convert to TimetableInput ─────────────────────────────────────
 
@@ -193,7 +244,7 @@ Rules:
                 continue
 
             day_raw = str(entry.get("day") or "").strip().lower()
-            day_int = self._DAY_MAP.get(day_raw, -1)
+            day_int = _DAY_MAP.get(day_raw, -1)
             if day_int == -1:
                 continue
 

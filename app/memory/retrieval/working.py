@@ -17,7 +17,7 @@ See docs/MEMORY_ARCHITECTURE.md §3.8.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 from app.memory.conversations import (
     DEFAULT_WINDOW_TURNS,

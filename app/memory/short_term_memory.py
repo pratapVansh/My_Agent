@@ -149,7 +149,7 @@ class ShortTermMemory:
     # Profile facts are injected verbatim into every agent's system prompt, so
     # anything stored here reaches an LLM (and any transcript or trace of it).
     # These checks are defence in depth, not a guarantee — the durable fix is an
-    # allowlist of permitted fact keys (see AUDIT_REPORT.md, M5).
+    # allowlist of permitted fact keys (see docs/AUDIT_REPORT.md, M5).
     _SENSITIVE_KEYS = frozenset({
         "password", "passwd", "pwd", "pass", "passphrase", "pin", "secret",
         "token", "auth", "credential", "credentials", "api_key", "apikey",

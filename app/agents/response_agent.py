@@ -7,6 +7,17 @@ import re
 from app.agents.base_agent import BaseAgent
 
 
+_AWAITING_APPROVAL_SPEECH = (
+    "It's ready, but I haven't sent it. Details are on screen — say yes to go "
+    "ahead, or no to drop it."
+)
+"""What a turn holding an action says out loud.
+
+Deliberately makes no claim about *what* was prepared. The recipient and the
+body are on screen, where they can be read carefully; a spoken paraphrase of
+them would be one more place an approval could be bound to the wrong thing."""
+
+
 class ResponseAgent(BaseAgent):
     """
     Response Agent handles:
@@ -46,8 +57,8 @@ class ResponseAgent(BaseAgent):
 
         # Handle missing task result
         if not task_result:
-            state["display_text"] = "I couldn't process your request. Please try again."
-            state["speech_text"] = "I couldn't process your request. Please try again."
+            state["display_text"] = "Something went wrong there. Try again?"
+            state["speech_text"] = "Something went wrong there. Try again?"
             state["current_agent"] = self.name
             if state.get("execution_path") is not None:
                 state["execution_path"].append(self.name)
@@ -62,21 +73,75 @@ class ResponseAgent(BaseAgent):
         detected_intent = state.get("detected_intent", "")
 
         # Format for display (richer formatting)
-        state["display_text"] = self._format_for_display(content, agent_name)
-
-        # Format for speech with task awareness
-        state["speech_text"] = await self._format_for_speech(
-            content=content,
-            output_mode=output_mode,
-            agent_name=agent_name,
-            detected_intent=detected_intent
+        state["display_text"] = self._format_for_display(
+            self._compose_multi_step(content, state), agent_name
         )
+
+        # ── A held action is not a finished one ──────────────────────────────
+        # Speech is summarised aggressively — an email turn is classified
+        # "long_generative" and spoken as "Your email draft is ready", which is
+        # the right précis of a draft and the wrong one of a send that is
+        # waiting for permission. Heard rather than read, that sentence says the
+        # work is done and asks for nothing, so a spoken turn could leave an
+        # irreversible action outstanding with the user believing it finished.
+        #
+        # The display text still carries the gateway's full preview — recipient,
+        # subject, body — so what is read is unchanged. What is spoken becomes a
+        # request rather than a summary, and it is a fixed sentence rather than
+        # a generated one: nothing here may describe an action, because
+        # describing it inaccurately is the failure being prevented.
+        if state.get("pending_actions"):
+            state["speech_text"] = "" if output_mode == "recruiter" else (
+                _AWAITING_APPROVAL_SPEECH
+            )
+        else:
+            # Format for speech with task awareness
+            state["speech_text"] = await self._format_for_speech(
+                content=content,
+                output_mode=output_mode,
+                agent_name=agent_name,
+                detected_intent=detected_intent
+            )
 
         state["current_agent"] = self.name
         if state.get("execution_path"):
             state["execution_path"].append(self.name)
 
         return state
+
+    def _compose_multi_step(self, content: str, state: Dict[str, Any]) -> str:
+        """
+        Put the earlier steps back into the answer.
+
+        Each step overwrites `task_result`, so a plan's final envelope is the
+        *last* step's and nothing else. For "check my attendance and email my
+        professor" that meant the user was told "Draft ready" and never saw the
+        attendance figure they had asked for — the first half of their request
+        was executed correctly and then discarded on the way out.
+
+        `step_results` already holds a summary of every completed step, written
+        by `reflect_node` as the plan advances. Nothing new is computed here;
+        the earlier results are simply not thrown away.
+
+        Single-step turns — the overwhelming majority — are returned untouched,
+        so this cannot change how an ordinary answer reads.
+        """
+        step_results = state.get("step_results") or {}
+        if not step_results:
+            return content
+
+        blocks = []
+        for key in sorted(step_results, key=lambda k: int(k) if str(k).isdigit() else 0):
+            step = step_results[key] or {}
+            summary = str(step.get("summary") or "").strip()
+            if summary:
+                blocks.append(summary)
+
+        if not blocks:
+            return content
+        if content.strip():
+            blocks.append(content.strip())
+        return "\n\n".join(blocks)
 
     def _format_for_display(self, content: str, agent_name: str) -> str:
         """
@@ -242,8 +307,19 @@ class ResponseAgent(BaseAgent):
         return text
 
     def _format_error_display(self, error: str) -> str:
-        """Format error message for display."""
-        return f"⚠️ **Error**: {error}\n\nPlease try rephrasing your request or try again later."
+        """
+        What is shown when the turn failed.
+
+        Deliberately not a decorated error block. A warning emoji and a bold
+        "Error:" label announce a *system fault* — which is how a chat product
+        reports trouble and not how an assistant does. The user does not need
+        the exception text; they need to know it did not work and that trying
+        again is worth it.
+
+        The detail still reaches the logs, where it is useful, rather than the
+        screen, where it is noise.
+        """
+        return "That didn't go through. Try again in a moment."
 
     def _format_error_speech(self, error: str) -> str:
         """Format error message for speech."""

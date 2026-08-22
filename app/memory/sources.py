@@ -78,6 +78,13 @@ class QueryCategory(str, Enum):
     while DOCUMENT_RESUME reads the document first and never lets a newer
     profile fact answer a question that named the résumé."""
 
+    CONFIRM_ACTION = "CONFIRM_ACTION"
+    """A reply approving or refusing an action already held for confirmation.
+
+    Reachable only when such an action exists for this caller and conversation.
+    "Yes" with nothing pending is ordinary conversation and is routed as such —
+    the category is a property of the situation, not of the word."""
+
     PROVENANCE_QUERY = "PROVENANCE_QUERY"
     """"How did you know that?" — a question about the *previous answer's*
     source, not a new question about the user. Answered from the provenance
@@ -95,6 +102,26 @@ class QueryCategory(str, Enum):
 
     GENERAL_KNOWLEDGE = "GENERAL_KNOWLEDGE"
     """"How do I build an AI agent" — answer it, do not interview the user."""
+
+    JOB_MATCH = "JOB_MATCH"
+    """"How well do I match this role?" — a question about the user answered by
+    comparing a posting against their evidenced profile.
+
+    Split from PROFILE_EXPERIENCE, which would otherwise claim it: the words are
+    about the user, but the answer is a computation over a *posting* the profile
+    agent has no access to and no tool for. Left as a personal question it
+    reached an agent that could only describe the résumé, and the model filled
+    the rest in — which is the exact failure `app.matching` exists to prevent."""
+
+    JOB_SEARCH = "JOB_SEARCH"
+    """"Find me AI engineer jobs" — a live lookup against a job board.
+
+    Split out for the same reason as JOB_MATCH, one step earlier: the words
+    carry no personal marker at all, so the classifier filed every job search
+    under GENERAL_KNOWLEDGE and the only thing that could reach `job_search`
+    was the planner agreeing to. When it did not, a language model answered
+    "here are some jobs you might like" out of its own head — postings that do
+    not exist, for a user who would then apply to them."""
 
     ACTION_REQUEST = "ACTION_REQUEST"
     """A complete instruction to do something in the world."""
@@ -247,6 +274,10 @@ SOURCE_PRECEDENCE: Dict[QueryCategory, Tuple[MemorySource, ...]] = {
     QueryCategory.PROVENANCE_QUERY: (
         MemorySource.CONVERSATION_CURRENT,
     ),
+    # The action being confirmed is already held in full; nothing is retrieved.
+    QueryCategory.CONFIRM_ACTION: (
+        MemorySource.CONVERSATION_CURRENT,
+    ),
     QueryCategory.TEMPORAL_CURRENT: (
         MemorySource.TEMPORAL_TOOL,
     ),
@@ -257,6 +288,23 @@ SOURCE_PRECEDENCE: Dict[QueryCategory, Tuple[MemorySource, ...]] = {
     ),
     QueryCategory.GENERAL_KNOWLEDGE: (
         MemorySource.GENERAL_KNOWLEDGE,
+    ),
+    # The résumé answers the candidate half; the posting arrives from a tool or
+    # from the conversation. Neither alone is sufficient, which is why this is
+    # not a PROFILE_* category.
+    QueryCategory.JOB_MATCH: (
+        MemorySource.RESUME_DOCUMENT,
+        MemorySource.SEMANTIC_MEMORY,
+        MemorySource.EXTERNAL_TOOL,
+        MemorySource.CONVERSATION_CURRENT,
+    ),
+    # The board is the only source of a posting. The résumé follows it, because
+    # a search is filtered by what the user can plausibly do — but nothing here
+    # can be answered without the tool.
+    QueryCategory.JOB_SEARCH: (
+        MemorySource.EXTERNAL_TOOL,
+        MemorySource.RESUME_DOCUMENT,
+        MemorySource.CONVERSATION_CURRENT,
     ),
     QueryCategory.ACTION_REQUEST: (
         MemorySource.EXTERNAL_TOOL,
@@ -300,6 +348,8 @@ def requires_retrieval(category: QueryCategory) -> bool:
         # Answered from the provenance recorded for the previous turn. Looking
         # it up again would report where the answer *would* come from now.
         QueryCategory.PROVENANCE_QUERY,
+        # The held action carries its own arguments and preview.
+        QueryCategory.CONFIRM_ACTION,
     )
 
 

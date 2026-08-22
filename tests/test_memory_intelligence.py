@@ -152,7 +152,7 @@ def test_resume_is_the_first_source_for_resume_backed_facts(query):
         "Which college do I study at?",
     ],
 )
-def test_personal_questions_never_reach_clarification(query):
+async def test_personal_questions_never_reach_clarification(query):
     """
     The acceptance list. Every one must retrieve even when the planner balked —
     the planner cannot see the store it is asking the user to substitute for.
@@ -162,7 +162,7 @@ def test_personal_questions_never_reach_clarification(query):
         needs_clarification=True,
         clarification_question="Could you be more specific?",
     )
-    assert route_after_init(s) == "profile"
+    assert await route_after_init(s) == "profile"
     assert s["needs_clarification"] is False
     assert s["clarification_question"] == ""
     assert "resume_document" in s["memory_sources"]
@@ -293,7 +293,7 @@ def test_a_project_followup_resolves_its_subject_from_the_conversation():
     assert decision.subject == "TRACE"
 
 
-def test_tell_me_more_about_that_is_retrieval_not_a_new_question():
+async def test_tell_me_more_about_that_is_retrieval_not_a_new_question():
     """13. The referential follow-up must not restart intent classification."""
     s = state(
         user_input="Tell me more about that project.",
@@ -301,7 +301,7 @@ def test_tell_me_more_about_that_is_retrieval_not_a_new_question():
         needs_clarification=True,
         clarification_question="Which project do you mean?",
     )
-    assert route_after_init(s) == "profile"
+    assert await route_after_init(s) == "profile"
     assert s["query_category"] == QueryCategory.CONVERSATION_FOLLOWUP.value
     assert s["followup_subject"] == "TRACE"
     assert s["needs_clarification"] is False
@@ -375,10 +375,10 @@ def test_date_questions_go_to_the_clock(query):
     assert decision.requires_retrieval is False
 
 
-def test_time_questions_go_to_the_clock():
+async def test_time_questions_go_to_the_clock():
     """15."""
     assert category_of("What time is it?") is QueryCategory.TEMPORAL_CURRENT
-    assert route_after_init(state(user_input="What time is it?")) == "temporal"
+    assert await route_after_init(state(user_input="What time is it?")) == "temporal"
 
 
 def test_the_clock_answers_without_a_model_call():
@@ -397,7 +397,7 @@ def test_the_clock_answers_without_a_model_call():
 @pytest.mark.parametrize(
     "query", ["What class do I have today?", "What class do I have tomorrow?"]
 )
-def test_schedule_questions_need_the_clock_and_memory_both(query):
+async def test_schedule_questions_need_the_clock_and_memory_both(query):
     """
     16 & 17. The timetable is memory; "today" is not.
 
@@ -411,22 +411,22 @@ def test_schedule_questions_need_the_clock_and_memory_both(query):
     assert MemorySource.EXTERNAL_TOOL in decision.sources
     assert decision.requires_retrieval is True
     # Timetable and attendance live in the academic agent, not profile.
-    assert route_after_init(state(user_input=query, selected_agent="profile")) == "academic"
+    assert await route_after_init(state(user_input=query, selected_agent="profile")) == "academic"
 
 
-def test_the_clock_survives_an_upstream_failure():
+async def test_the_clock_survives_an_upstream_failure():
     """
     A date needs neither the planner nor a model. When the LLM is rate-limited
     or down, withholding the one answer that requires nothing from it would be
     a self-inflicted outage.
     """
     s = state(user_input="What is today's date?", error="Planner error: 429")
-    assert route_after_init(s) == "temporal"
+    assert await route_after_init(s) == "temporal"
     assert s["error"] is None
 
     # Everything else genuinely needs what just broke.
     other = state(user_input="What is my CPI?", error="Planner error: 429")
-    assert route_after_init(other) == "response"
+    assert await route_after_init(other) == "response"
 
 
 @pytest.mark.parametrize(
@@ -441,7 +441,7 @@ def test_the_clock_survives_an_upstream_failure():
         ("Tell me how to build an AI agent.", "response"),
     ],
 )
-def test_stored_answers_survive_an_llm_outage(query, expected_route):
+async def test_stored_answers_survive_an_llm_outage(query, expected_route):
     """
     Observed live, with Groq returning 429 on every call: every question became
     an error page, including ones whose answer is a database row. A memory
@@ -449,13 +449,13 @@ def test_stored_answers_survive_an_llm_outage(query, expected_route):
     unavailable is not a memory system.
     """
     s = state(user_input=query, error="Planner error: 429 rate_limit_exceeded")
-    assert route_after_init(s) == expected_route
+    assert await route_after_init(s) == expected_route
 
 
-def test_degraded_mode_clears_the_error_it_recovered_from():
+async def test_degraded_mode_clears_the_error_it_recovered_from():
     """The turn succeeded, so it must not also render as a failure."""
     s = state(user_input="What is my name?", error="Planner error: 429")
-    route_after_init(s)
+    await route_after_init(s)
     assert s["error"] is None
     assert "429" in s["degraded_reason"]
 
@@ -586,7 +586,7 @@ def test_a_now_marker_does_not_make_a_stored_fact_temporal():
         "Explain how retrieval augmented generation works.",
     ],
 )
-def test_a_general_question_is_answered_not_scoped(query):
+async def test_a_general_question_is_answered_not_scoped(query):
     """
     18. The reported loop: "what type of AI agent?", then more questions.
 
@@ -601,7 +601,7 @@ def test_a_general_question_is_answered_not_scoped(query):
 
     s = state(user_input=query, needs_clarification=True,
               clarification_question="What type of agent do you want to build?")
-    assert route_after_init(s) != "clarification"
+    assert await route_after_init(s) != "clarification"
     assert s["needs_clarification"] is False
     assert "answered by retrieval" in s["clarification_reason"] or s["clarification_reason"]
 
@@ -619,7 +619,7 @@ def test_a_possessive_keeps_a_how_to_question_personal():
         ("Apply for it.", "Which listing?"),
     ],
 )
-def test_an_action_missing_a_parameter_still_clarifies(query, question):
+async def test_an_action_missing_a_parameter_still_clarifies(query, question):
     """19. A recipient is in no store. Asking is the only correct response."""
     decision = query_intent.classify(query, has_context=True)
     assert decision.category is QueryCategory.AMBIGUOUS_ACTION
@@ -627,37 +627,37 @@ def test_an_action_missing_a_parameter_still_clarifies(query, question):
 
     s = state(user_input=query, session_id="conv-action",
               needs_clarification=True, clarification_question=question)
-    assert route_after_init(s) == "clarification"
+    assert await route_after_init(s) == "clarification"
     assert s["clarification_reason"] == "action is missing a parameter no store holds"
 
 
-def test_only_one_clarification_per_conversation():
+async def test_only_one_clarification_per_conversation():
     """
     20. The budget. A second question about the same request means the first
     one did not unblock anything, and a third certainly will not.
     """
     first = state(user_input="Send this to him.", session_id="conv-1",
                   needs_clarification=True, clarification_question="Who?")
-    assert route_after_init(first) == "clarification"
+    assert await route_after_init(first) == "clarification"
 
     second = state(user_input="Schedule a meeting.", session_id="conv-1",
                    needs_clarification=True, clarification_question="When?")
-    assert route_after_init(second) == "profile"
+    assert await route_after_init(second) == "profile"
     assert "budget spent" in second["clarification_reason"]
 
 
-def test_the_budget_is_per_conversation():
+async def test_the_budget_is_per_conversation():
     """One conversation's spent budget must not silence another's."""
     spent = state(user_input="Send this to him.", session_id="conv-a",
                   needs_clarification=True, clarification_question="Who?")
-    assert route_after_init(spent) == "clarification"
+    assert await route_after_init(spent) == "clarification"
 
     other = state(user_input="Send this to him.", session_id="conv-b",
                   needs_clarification=True, clarification_question="Who?")
-    assert route_after_init(other) == "clarification"
+    assert await route_after_init(other) == "clarification"
 
 
-def test_asking_for_fewer_questions_disables_clarification():
+async def test_asking_for_fewer_questions_disables_clarification():
     """
     The user said "don't ask too many questions" and was asked again. Once
     stated, the preference holds for the conversation — it is a preference, not
@@ -669,20 +669,20 @@ def test_asking_for_fewer_questions_disables_clarification():
     assert not query_intent.asks_for_fewer_questions("what is my CGPA")
 
     opt_out = state(user_input="Don't ask too many questions.", session_id="conv-2")
-    route_after_init(opt_out)
+    await route_after_init(opt_out)
 
     follow = state(user_input="Send this to him.", session_id="conv-2",
                    needs_clarification=True, clarification_question="Who?")
-    assert route_after_init(follow) == "profile"
+    assert await route_after_init(follow) == "profile"
     assert "asked not to be questioned" in follow["clarification_reason"]
 
 
-def test_clarification_is_not_disabled_wholesale():
+async def test_clarification_is_not_disabled_wholesale():
     """The policy narrows clarification; it does not remove it."""
     s = state(user_input="Book it for Tuesday or Wednesday, whichever works",
               session_id="conv-3", needs_clarification=True,
               clarification_question="Which day?")
-    assert route_after_init(s) == "clarification"
+    assert await route_after_init(s) == "clarification"
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1012,7 +1012,7 @@ def test_a_fallback_result_is_marked_derived():
         "What are my projects?",
     ],
 )
-def test_personal_questions_are_not_routed_as_research(query):
+async def test_personal_questions_are_not_routed_as_research(query):
     """
     27. A personal fact is a retrieval from the user's own memory, and it went
     to a research path that could not possibly hold it.
@@ -1021,7 +1021,7 @@ def test_personal_questions_are_not_routed_as_research(query):
     assert decision.sources[0] is MemorySource.RESUME_DOCUMENT
     assert MemorySource.GENERAL_KNOWLEDGE not in decision.sources
     # Even when the planner picked the wrong specialist.
-    assert route_after_init(state(user_input=query, selected_agent="job")) == "profile"
+    assert await route_after_init(state(user_input=query, selected_agent="job")) == "profile"
 
 
 def test_resume_precedence_for_document_questions():
@@ -1050,7 +1050,7 @@ def test_general_knowledge_consults_no_memory_source():
 # 30. Voice and text share one decision path
 # ═════════════════════════════════════════════════════════════════════════
 
-def test_voice_and_text_reach_the_same_routing_decision():
+async def test_voice_and_text_reach_the_same_routing_decision():
     """
     30. The spoken path read `needs_clarification` straight off the planner, so
     every policy the graph applied was silently absent from voice turns.
@@ -1065,20 +1065,21 @@ def test_voice_and_text_reach_the_same_routing_decision():
     voice_state = state(user_input=query, session_id="shared-conv",
                         needs_clarification=True, clarification_question="Which?")
 
-    assert decide_route(text_state) == decide_route(voice_state) == "profile"
+    assert await decide_route(text_state) == "profile"
+    assert await decide_route(voice_state) == "profile"
     assert text_state["query_category"] == voice_state["query_category"]
     assert text_state["memory_sources"] == voice_state["memory_sources"]
 
 
-def test_the_clarification_budget_is_shared_across_modalities():
+async def test_the_clarification_budget_is_shared_across_modalities():
     """One conversation, one budget — whichever transport spends it."""
     spoken = state(user_input="Send this to him.", session_id="shared-conv",
                    needs_clarification=True, clarification_question="Who?")
-    assert decide_route(spoken) == "clarification"
+    assert await decide_route(spoken) == "clarification"
 
     typed = state(user_input="Apply for it.", session_id="shared-conv",
                   needs_clarification=True, clarification_question="Which?")
-    assert decide_route(typed) == "profile"
+    assert await decide_route(typed) == "profile"
 
 
 # ═════════════════════════════════════════════════════════════════════════

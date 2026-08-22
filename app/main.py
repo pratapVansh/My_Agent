@@ -4,6 +4,7 @@ Configures async FastAPI server with Groq integration and hybrid memory system.
 """
 import asyncio
 import logging
+import time
 from typing import Optional
 
 from fastapi import FastAPI
@@ -161,6 +162,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Memory worker shutdown error: %s", e)
 
+    # MCP servers are child processes this application spawned, so they are
+    # this application's to stop. Done before the memory cleanup below because
+    # a hung server must not be able to hold up closing the database pool.
+    try:
+        from app.mcp.client import close_all as close_mcp_servers
+
+        await asyncio.wait_for(close_mcp_servers(), timeout=10.0)
+    except Exception as e:
+        logger.warning("MCP shutdown error: %s", e)
+
     try:
         await memory_manager.cleanup()
         await voice_service.close()
@@ -205,17 +216,86 @@ async def root():
 @app.get("/health")
 async def health_check():
     """
-    Health check endpoint.
-    Verifies FastAPI and Groq API connectivity.
-    """
-    groq_healthy = await groq_service.health_check()
+    Liveness probe. Answers from this process only — no provider is called.
 
+    This used to issue a real `chat_completion` against `settings.groq_model`.
+    `render.yaml` points `healthCheckPath` here, so every platform probe spent
+    a request from the same Groq RPM/TPM budget the users are competing for,
+    forever, with no user attached to it — and the route is unauthenticated,
+    so anyone who found it could drive that spend at will.
+
+    A liveness probe answers one question: is this process able to serve? That
+    is answerable without leaving the process. Provider reachability is a
+    different question with a different cost, and it lives at /health/deep.
+    """
     return {
-        "status": "healthy" if groq_healthy else "degraded",
+        "status": "healthy",
         "api": "online",
-        "groq": "connected" if groq_healthy else "disconnected",
-        "model": settings.groq_model
+        "model": settings.groq_model,
     }
+
+
+# Provider probes are cached so that a platform health check pointed at the
+# deep endpoint — or a dashboard polling it — cannot turn into a continuous
+# drain on the Groq and Cohere quotas. One probe per minute is enough to
+# notice an outage; more than that only costs money.
+_DEEP_HEALTH_TTL_SECONDS = 60.0
+_deep_health_cache: dict[str, object] = {"at": 0.0, "result": None}
+_deep_health_lock = asyncio.Lock()
+
+
+async def _probe_providers() -> dict:
+    """Ask each provider whether it is reachable. Never raises."""
+    groq_healthy, cohere_healthy, qdrant_healthy = await asyncio.gather(
+        groq_service.health_check(),
+        cohere_service.health_check(),
+        qdrant_service.health_check(),
+        return_exceptions=True,
+    )
+
+    def _ok(value) -> bool:
+        return value is True
+
+    providers = {
+        "groq": "connected" if _ok(groq_healthy) else "disconnected",
+        "cohere": "connected" if _ok(cohere_healthy) else "disconnected",
+        "qdrant": "connected" if _ok(qdrant_healthy) else "disconnected",
+    }
+    all_ok = all(v == "connected" for v in providers.values())
+    return {
+        "status": "healthy" if all_ok else "degraded",
+        "api": "online",
+        "model": settings.groq_model,
+        **providers,
+    }
+
+
+@app.get("/health/deep")
+async def deep_health_check():
+    """
+    Provider reachability, memoized for ~60s.
+
+    The lock is what makes the cache worth having: several probes arriving
+    together would otherwise all miss and all issue their own round of provider
+    calls, which is the exact amplification this endpoint exists to avoid.
+    """
+    now = time.monotonic()
+    cached = _deep_health_cache.get("result")
+    if cached is not None and now - float(_deep_health_cache["at"]) < _DEEP_HEALTH_TTL_SECONDS:
+        return {**cached, "cached": True}
+
+    async with _deep_health_lock:
+        # Re-check under the lock: whoever held it may have just refreshed.
+        now = time.monotonic()
+        cached = _deep_health_cache.get("result")
+        if cached is not None and now - float(_deep_health_cache["at"]) < _DEEP_HEALTH_TTL_SECONDS:
+            return {**cached, "cached": True}
+
+        result = await _probe_providers()
+        _deep_health_cache["result"] = result
+        _deep_health_cache["at"] = time.monotonic()
+
+    return {**result, "cached": False}
 
 
 # Include routers

@@ -12,7 +12,7 @@ Design notes
 * Revocation is an in-process store keyed by `jti`. That is correct for the
   current single-worker deployment; running multiple instances requires a
   shared store (Redis) or the revocation list will not be seen by every worker.
-  See AUDIT_REPORT.md (M15) for the same constraint on LiveKit worker state.
+  See docs/AUDIT_REPORT.md (M15) for the same constraint on LiveKit worker state.
 """
 from __future__ import annotations
 

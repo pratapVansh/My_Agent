@@ -3,15 +3,18 @@ Upload a timetable PDF to the academic agent's schedule.
 
 Usage:
   python scripts/upload_timetable_pdf.py path/to/timetable.pdf --user-id vansh
-  python scripts/upload_timetable_pdf.py path/to/timetable.pdf --user-id vansh --keep-existing
+  python scripts/upload_timetable_pdf.py path/to/timetable.pdf --user-id vansh --semester 7
+  python scripts/upload_timetable_pdf.py path/to/timetable.pdf --user-id vansh --force
 
-By default, any previously stored timetable is replaced by the new one.
-Pass --keep-existing to append instead of replace.
+Always replaces: the previous timetable is atomically retired and the new one
+activated in its place — see `/api/v1/agents/tools/timetable/upload-pdf`.
+Uploading the exact same file twice is a no-op unless --force is passed.
 """
 import asyncio
 import sys
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import httpx
 
@@ -38,7 +41,8 @@ def print_separator(char: str = "=", width: int = 60) -> None:
 async def upload_timetable(
     pdf_path: str,
     user_id: str,
-    clear_existing: bool = True,
+    semester: Optional[str] = None,
+    force: bool = False,
     api_base: str = "http://localhost:8000",
 ) -> None:
     path = Path(pdf_path)
@@ -55,21 +59,23 @@ async def upload_timetable(
     print(f"\n  File   : {path.name}")
     print(f"  Size   : {file_size_kb:.1f} KB")
     print(f"  User   : {user_id}")
-    print(f"  Mode   : {'replace existing timetable' if clear_existing else 'append to existing timetable'}")
+    if semester:
+        print(f"  Semester: {semester}")
     print()
 
     endpoint = f"{api_base}/api/v1/agents/tools/timetable/upload-pdf"
 
-    print("Uploading and parsing...")
+    print("Uploading and parsing (no model call is made)...")
+
+    data = {"user_id": user_id, "force": str(force).lower()}
+    if semester:
+        data["semester"] = semester
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         with open(path, "rb") as f:
             response = await client.post(
                 endpoint,
-                data={
-                    "user_id": user_id,
-                    "clear_existing": str(clear_existing).lower(),
-                },
+                data=data,
                 files={"file": (path.name, f, "application/pdf")},
             )
 
@@ -84,17 +90,28 @@ async def upload_timetable(
 
     result = response.json()
 
+    if not result.get("changed"):
+        print_separator()
+        print("  NO CHANGE — this file is already your active timetable")
+        print_separator()
+        print(f"  {result.get('message')}")
+        print_separator()
+        return
+
     print_separator()
     print("  TIMETABLE UPLOADED SUCCESSFULLY")
     print_separator()
-    print(f"  File              : {result.get('filename')}")
-    print(f"  Pages in PDF      : {result.get('pages_in_pdf')}")
-    print(f"  Entries parsed    : {result.get('entries_parsed')}")
-    print(f"  Entries stored    : {result.get('entries_stored')}")
-    if result.get("old_entries_cleared"):
-        print(f"  Old entries cleared: {result.get('old_entries_cleared')}")
+    print(f"  File               : {result.get('filename')}")
+    print(f"  Upload id          : {result.get('upload_id')}")
+    print(f"  Pages in PDF       : {result.get('pages_in_pdf')}")
+    print(f"  Entries parsed     : {result.get('entries_parsed')}")
+    print(f"  Entries stored     : {result.get('entries_stored')}")
+    if result.get("entries_skipped"):
+        print(f"  Entries skipped    : {result.get('entries_skipped')} — {result.get('skipped')}")
+    if result.get("old_entries_retired"):
+        print(f"  Old entries retired: {result.get('old_entries_retired')}")
     if result.get("parse_notes"):
-        print(f"  Notes             : {result.get('parse_notes')}")
+        print(f"  Notes              : {result.get('parse_notes')}")
     print()
     print("  Your timetable is ready. Try asking:")
     print('    "What classes do I have today?"')
@@ -115,20 +132,23 @@ async def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Upload and replace existing timetable (default):
-    python scripts/upload_timetable_pdf.py sem5_timetable.pdf --user-id vansh
+  Upload and activate as the current timetable:
+    python scripts/upload_timetable_pdf.py sem7_timetable.pdf --user-id vansh --semester 7
 
-  Upload and keep existing entries too:
-    python scripts/upload_timetable_pdf.py sem5_timetable.pdf --user-id vansh --keep-existing
+  Reload the same file again even though nothing changed:
+    python scripts/upload_timetable_pdf.py sem7_timetable.pdf --user-id vansh --force
         """,
     )
     parser.add_argument("pdf_path", help="Path to your timetable PDF file")
     parser.add_argument("--user-id", required=True, help="Your user ID (e.g. vansh)")
     parser.add_argument(
-        "--keep-existing",
+        "--semester", default=None, help="Semester label, e.g. '7' — not read from the PDF"
+    )
+    parser.add_argument(
+        "--force",
         action="store_true",
         default=False,
-        help="Append new entries instead of replacing the existing timetable",
+        help="Reload even if this exact file is already the active timetable",
     )
     args = parser.parse_args()
 
@@ -138,7 +158,8 @@ Examples:
     await upload_timetable(
         pdf_path=args.pdf_path,
         user_id=args.user_id.strip().lower(),
-        clear_existing=not args.keep_existing,
+        semester=args.semester,
+        force=args.force,
         api_base=api_base,
     )
 

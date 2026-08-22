@@ -1,7 +1,7 @@
 # Memory System — Architecture Redesign
 
 **Status:** Proposed · **Author:** Architecture review · **Date:** 2026-08-07
-**Supersedes:** the memory sections of `AUDIT_REPORT.md`
+**Supersedes:** the memory sections of `docs/AUDIT_REPORT.md`
 **Scope:** `app/memory/`, memory-adjacent parts of `app/agents/`, `app/routes/agent_routes.py`, `app/services/{qdrant,cohere,chunking}_service.py`
 
 ---

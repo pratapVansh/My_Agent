@@ -68,6 +68,25 @@ class AgentState(TypedDict):
     # lets the recruiter view read the owner's public records.
     memory_visibilities: Optional[list]
 
+    # Set by a caller that has already stored this utterance, so the memory
+    # node retrieves but does not write. The streaming workflow sets it when it
+    # escalates a turn after its own init has run; without it the same sentence
+    # lands in the conversation thread twice.
+    skip_user_ingest: Optional[bool]
+
+    # Initialization a caller already performed and is handing over, so it is
+    # not paid for twice. The streaming path retrieves memory and runs the
+    # planner, then escalates a turn to the tool workflow — which used to run
+    # both again from scratch. `parallel_init_node` adopts these instead.
+    # Keys: memory_context, memory_prompt, query_category, selected_agent,
+    # detected_intent, planner_confidence, execution_plan.
+    prefetched: Optional[Dict[str, Any]]
+
+    # Set when the model provider rate-limited this turn. Read by `reflect_node`
+    # so a closed rate-limit window is never answered by re-running the whole
+    # specialist — the single most expensive response available to it.
+    rate_limited: Optional[bool]
+
     # Authorization: capabilities of the authenticated caller, propagated from
     # the verified JWT. Specialist agents filter their tool registries against
     # this, so a restricted caller cannot reach privileged tools through
@@ -95,6 +114,23 @@ class AgentState(TypedDict):
     profile_intent: Optional[str]             # Legacy profile label, drives tool choice
     followup_subject: Optional[str]           # Entity a follow-up refers back to
 
+    # The graph edge this turn takes, settled by a *node* so the decision and
+    # everything decided alongside it survives. A LangGraph conditional-edge
+    # function returns a route and its state writes are discarded, which is why
+    # this is recorded rather than recomputed at the edge.
+    route: Optional[str]
+
+    # The tools this category may not answer without — "at least one of these".
+    # Written at the routing edge, rendered into the specialist's directive, and
+    # checked after the reasoning loop by `app.agents.grounding`. An empty list
+    # means the category needs no particular lookup.
+    required_tools: Optional[List[str]]
+
+    # Which academic capability a SCHEDULE_TEMPORAL turn wants: timetable,
+    # attendance, exams or plans. One category covers four tables, and the
+    # required tools differ per table.
+    schedule_intent: Optional[str]
+
     # The provenance of the answer just given — what produced it, so "how did
     # you know?" reads a record instead of asking a model to reconstruct its
     # own reasoning, which it cannot do and will invent. It lives in
@@ -109,9 +145,28 @@ class AgentState(TypedDict):
     # identical. See app.memory.answerability.
     answerability: Optional[str]
 
+    # Whether this turn's answer actually rests on a lookup — satisfied,
+    # no_data, failed, skipped, or not_required. Written by the reasoning loop
+    # (see app.agents.grounding) and read by `reflect_node`, which retries a
+    # `skipped` turn: the tool was there and the model did not call it, which
+    # is the most recoverable failure the system has.
+    #
+    # Declared here because LangGraph only propagates keys the state schema
+    # names. An undeclared key written by a node is silently dropped before the
+    # next one runs, so leaving this out does not fail loudly — it just makes
+    # the retry never fire.
+    grounding: Optional[str]
+
     # Task agent outputs — now uses TaskEnvelope
     task_result: Optional[TaskEnvelope]
     agent_reasoning: Optional[str]
+
+    # Actions this turn prepared and did not perform — the PENDING_CONFIRMATION
+    # results the gateway returned in place of a consequential tool call.
+    # Written by the reasoning loop itself rather than by each agent, so a turn
+    # that held something cannot reach the response layer looking like a turn
+    # that completed it. Empty on every ordinary turn.
+    pending_actions: Optional[List[Any]]
 
     # Multi-step plan execution (Fix 1: True Agentic Planning)
     execution_plan: Optional[List[Dict[str, Any]]]  # Ordered steps: [{step, agent, goal}, ...]

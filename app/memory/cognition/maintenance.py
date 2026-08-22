@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Set
 from uuid import UUID
 import logging
 

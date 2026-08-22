@@ -6,7 +6,7 @@ Stores results in the agent's attendance database so the academic
 agent can report accurate percentages.
 
 Usage:
-  python scripts/scrape_erp_attendance.py --user-id vansh --rollno 23IT3048 --password YOUR_PASSWORD
+  python scripts/scrape_erp_attendance.py --user-id vansh --rollno YOUR_ROLLNO --password YOUR_PASSWORD
 
 Options:
   --headless        Run browser invisibly (default: visible so you can watch)
@@ -15,6 +15,7 @@ Options:
 """
 
 import asyncio
+import os
 import sys
 import argparse
 from datetime import date
@@ -622,22 +623,39 @@ async def main() -> None:
         epilog="""
 Examples:
   # Basic (browser visible so you can watch):
-  python scripts/scrape_erp_attendance.py --user-id vansh --rollno 23IT3048 --password YOUR_PASS
+  python scripts/scrape_erp_attendance.py --user-id vansh --rollno YOUR_ROLLNO --password YOUR_PASS
 
   # Run headless (no browser window):
-  python scripts/scrape_erp_attendance.py --user-id vansh --rollno 23IT3048 --password YOUR_PASS --headless
+  python scripts/scrape_erp_attendance.py --user-id vansh --rollno YOUR_ROLLNO --password YOUR_PASS --headless
 
   # Preview data without saving:
-  python scripts/scrape_erp_attendance.py --user-id vansh --rollno 23IT3048 --password YOUR_PASS --dry-run
+  python scripts/scrape_erp_attendance.py --user-id vansh --rollno YOUR_ROLLNO --password YOUR_PASS --dry-run
         """,
     )
-    parser.add_argument("--user-id",   required=True, help="Your agent user ID (e.g. vansh)")
-    parser.add_argument("--rollno",    required=True, help="Your ERP roll number (e.g. 23IT3048)")
-    parser.add_argument("--password",  required=True, help="Your ERP password")
+    parser.add_argument("--user-id",   required=True, help="Your agent user ID")
+    # Credentials default to the environment so an unattended run (Task
+    # Scheduler, cron) never has to put them on a command line, where they are
+    # visible to any process listing on the machine and end up in shell history.
+    parser.add_argument(
+        "--rollno", default=os.environ.get("ERP_ROLLNO"),
+        help="ERP roll number (default: $ERP_ROLLNO)",
+    )
+    parser.add_argument(
+        "--password", default=os.environ.get("ERP_PASSWORD"),
+        help="ERP password (default: $ERP_PASSWORD)",
+    )
     parser.add_argument("--headless",  action="store_true", default=False, help="Run browser invisibly")
     parser.add_argument("--keep-old",  action="store_true", default=False, help="Keep previously scraped ERP records (default: replace them)")
     parser.add_argument("--dry-run",   action="store_true", default=False, help="Print data but do not save to database")
     args = parser.parse_args()
+
+    missing = [
+        flag for flag, value in (("--rollno/$ERP_ROLLNO", args.rollno),
+                                 ("--password/$ERP_PASSWORD", args.password))
+        if not (value or "").strip()
+    ]
+    if missing:
+        parser.error("missing credential(s): " + ", ".join(missing))
 
     user_id = args.user_id.strip().lower()
     headless = args.headless

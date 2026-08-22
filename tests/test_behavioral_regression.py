@@ -397,7 +397,7 @@ def _routing_state(query, **extra):
     return base
 
 
-def test_provenance_is_answerable_when_the_language_model_is_down():
+async def test_provenance_is_answerable_when_the_language_model_is_down():
     """
     Found live: "how did you know?" came back as a planner error.
 
@@ -408,18 +408,18 @@ def test_provenance_is_answerable_when_the_language_model_is_down():
     from app.agents.workflow import decide_route
 
     state = _routing_state("How did you know?", error="Groq API error: 429")
-    assert decide_route(state) == "provenance"
+    assert await decide_route(state) == "provenance"
     # The error is cleared, so the turn actually proceeds rather than falling
     # through to the generic failure response.
     assert not state.get("error")
 
 
-def test_the_clock_is_still_answerable_when_the_model_is_down():
+async def test_the_clock_is_still_answerable_when_the_model_is_down():
     """The same property for the sibling case, so the fix generalises."""
     from app.agents.workflow import decide_route
 
     state = _routing_state("What is today's date?", error="Groq API error: 429")
-    assert decide_route(state) == "temporal"
+    assert await decide_route(state) == "temporal"
     assert not state.get("error")
 
 

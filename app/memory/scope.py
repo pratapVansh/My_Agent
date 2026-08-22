@@ -21,7 +21,7 @@ See docs/MEMORY_ARCHITECTURE.md §1.8 and §3.4.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 from app.auth.models import Principal
 from app.config import settings

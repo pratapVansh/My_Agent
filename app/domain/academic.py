@@ -91,7 +91,7 @@ class AcademicRepository:
                 await session.rollback()
                 logger.debug(
                     "Attendance upsert unavailable (missing unique index?); "
-                    "falling back to insert. Run the migration in AUDIT_REPORT.md."
+                    "falling back to insert. Run the migration in docs/AUDIT_REPORT.md."
                 )
                 attendance = Attendance(
                     user_id=user_id,
@@ -151,8 +151,14 @@ class AcademicRepository:
         location: Optional[str] = None,
         instructor: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        schedule_upload_id: Optional[str] = None,
     ) -> str:
-        """Store a timetable entry. day_of_week is 0=Monday .. 6=Sunday."""
+        """Store a timetable entry. day_of_week is 0=Monday .. 6=Sunday.
+
+        `schedule_upload_id` links the row to the document it was read from, so
+        an answer can name its source. None for entries added conversationally,
+        which have no document behind them.
+        """
         async with self.async_session_maker() as session:
             entry = Timetable(
                 user_id=user_id,
@@ -163,6 +169,9 @@ class AcademicRepository:
                 location=location,
                 instructor=instructor,
                 meta_data=metadata,  # Uses meta_data column
+                schedule_upload_id=(
+                    uuid.UUID(schedule_upload_id) if schedule_upload_id else None
+                ),
             )
             session.add(entry)
             await session.commit()
@@ -197,9 +206,30 @@ class AcademicRepository:
                     "location": entry.location,
                     "instructor": entry.instructor,
                     "metadata": entry.meta_data,  # Read from meta_data column
+                    "schedule_upload_id": (
+                        str(entry.schedule_upload_id)
+                        if entry.schedule_upload_id else None
+                    ),
                 }
                 for entry in entries
             ]
+
+    async def has_timetable(self, user_id: str) -> bool:
+        """
+        Whether this user has any active timetable at all.
+
+        The distinction that keeps an honest answer honest: no rows for Friday
+        means "no classes on Friday", but no rows for *any* day means "I have no
+        timetable stored", and those are different sentences. Without this the
+        two collapse and an empty database reads as a free week.
+        """
+        async with self.async_session_maker() as session:
+            result = await session.execute(
+                select(Timetable.id)
+                .where(and_(Timetable.user_id == user_id, Timetable.is_active == True))
+                .limit(1)
+            )
+            return result.first() is not None
 
     async def clear_timetable(self, user_id: str) -> int:
         """
@@ -248,13 +278,18 @@ class AcademicRepository:
         user_id: str,
         upcoming_only: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Retrieve exam schedule. upcoming_only=True returns only future exams."""
-        from datetime import date as date_cls
+        """Retrieve exam schedule. upcoming_only=True returns only future exams.
+
+        "Upcoming" is measured against the assistant's configured timezone
+        rather than the host's: a server still on yesterday would keep offering
+        an exam the user has already sat.
+        """
+        from app.tools import time_tool
 
         async with self.async_session_maker() as session:
             query = select(Exam).where(Exam.user_id == user_id)
             if upcoming_only:
-                query = query.where(Exam.exam_date >= date_cls.today())
+                query = query.where(Exam.exam_date >= time_tool.today())
             query = query.order_by(Exam.exam_date, Exam.start_time)
             result = await session.execute(query)
             rows = result.scalars().all()
@@ -300,15 +335,18 @@ class AcademicRepository:
         plan_date: Optional[date] = None,
         include_done: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Retrieve plans. If plan_date is None, returns all future plans."""
-        from datetime import date as date_cls
+        """Retrieve plans. If plan_date is None, returns all future plans.
+
+        Same clock as everything else — see `retrieve_exams`.
+        """
+        from app.tools import time_tool
 
         async with self.async_session_maker() as session:
             query = select(Plan).where(Plan.user_id == user_id)
             if plan_date:
                 query = query.where(Plan.plan_date == plan_date)
             else:
-                query = query.where(Plan.plan_date >= date_cls.today())
+                query = query.where(Plan.plan_date >= time_tool.today())
             if not include_done:
                 query = query.where(Plan.is_done == False)
             query = query.order_by(Plan.plan_date, Plan.priority)

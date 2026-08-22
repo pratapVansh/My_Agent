@@ -3,7 +3,7 @@ Qdrant-based Long-term Memory Implementation.
 Stores persistent information with Cohere embeddings and text chunking.
 """
 from qdrant_client.models import PointStruct
-from typing import List, Dict, Any, Optional, Tuple
+from typing import AbstractSet, List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 import asyncio
 import uuid
@@ -1565,7 +1565,8 @@ class LongTermMemoryQdrant:
         self,
         user_id: str,
         query: str,
-        limit: int = 5
+        limit: int = 5,
+        sections: Optional[AbstractSet[str]] = None,
     ) -> Dict[str, Any]:
         """
         Search across all collections for relevant information.
@@ -1575,6 +1576,13 @@ class LongTermMemoryQdrant:
             user_id: User identifier
             query: Search query
             limit: Maximum results per collection
+            sections: Which prompt sections this question can actually use, as
+                `MemoryManager.sections_for` computed them. A lookup whose
+                section is not in the set is skipped rather than performed and
+                discarded — `retrieve_skills` and `retrieve_projects` are a
+                Cohere embedding and a Qdrant query each, and `retrieve_resume`
+                walks every résumé chunk. None means "all", the historical
+                behaviour.
 
         Returns:
             Dictionary with results from each collection. `skills` and
@@ -1585,12 +1593,34 @@ class LongTermMemoryQdrant:
         try:
             log_step("USER QUERY", {"user_id": user_id, "query": query})
 
+            want_skills = sections is None or "skills" in sections
+            want_projects = sections is None or "projects" in sections
+            want_resume = sections is None or "resume" in sections
+
+            async def _skip_result() -> RetrievalResult:
+                # NO_DATA, not ERROR: nothing failed. The section simply cannot
+                # appear in this question's prompt, and NO_DATA is the status
+                # the formatter already renders as absent rather than as broken.
+                return RetrievalResult.no_data()
+
+            async def _skip_resume():
+                return None
+
             # Run all three primary lookups in parallel (~200ms gain)
             skills, projects, resume = await asyncio.gather(
-                self.retrieve_skills(user_id, query, limit),
-                self.retrieve_projects(user_id, query, limit),
-                self.retrieve_resume(user_id),
+                self.retrieve_skills(user_id, query, limit)
+                if want_skills else _skip_result(),
+                self.retrieve_projects(user_id, query, limit)
+                if want_projects else _skip_result(),
+                self.retrieve_resume(user_id) if want_resume else _skip_resume(),
             )
+
+            # A skipped lookup must not trigger the résumé fallback below —
+            # that would reinstate the cost this parameter exists to avoid.
+            if not want_skills:
+                skills = RetrievalResult.ok([])
+            if not want_projects:
+                projects = RetrievalResult.ok([])
 
             # Fall back to resume chunks only when the dedicated collection is
             # genuinely empty. A failed lookup (ERROR) is deliberately *not*

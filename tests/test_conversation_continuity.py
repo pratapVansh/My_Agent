@@ -155,9 +155,9 @@ def test_no_memory_signal_when_every_source_is_empty():
     )
 
 
-def test_a_personal_question_with_memory_is_answered_not_questioned():
+async def test_a_personal_question_with_memory_is_answered_not_questioned():
     """The exact reported failure: "What is my name?" → clarifying question."""
-    route = route_after_init(state(
+    route = await route_after_init(state(
         user_input="What is my name?",
         needs_clarification=True,
         clarification_question="Which name do you mean?",
@@ -167,7 +167,7 @@ def test_a_personal_question_with_memory_is_answered_not_questioned():
     assert route == "profile"
 
 
-def test_suppressing_clarification_clears_the_question_from_state():
+async def test_suppressing_clarification_clears_the_question_from_state():
     """Otherwise the response agent could still render the stale question."""
     s = state(
         user_input="What is my college?",
@@ -175,13 +175,13 @@ def test_suppressing_clarification_clears_the_question_from_state():
         clarification_question="Which college?",
         memory_context={"chat_history": [{"role": "user", "content": "earlier"}]},
     )
-    route_after_init(s)
+    await route_after_init(s)
     assert s["needs_clarification"] is False
     assert s["clarification_question"] == ""
 
 
-def test_a_personal_question_routes_to_the_planners_agent_not_always_profile():
-    route = route_after_init(state(
+async def test_a_personal_question_routes_to_the_planners_agent_not_always_profile():
+    route = await route_after_init(state(
         user_input="What classes do I have tomorrow?",
         needs_clarification=True,
         memory_context={"chat_history": [{"role": "user", "content": "earlier turn"}]},
@@ -190,9 +190,9 @@ def test_a_personal_question_routes_to_the_planners_agent_not_always_profile():
     assert route == "academic"
 
 
-def test_clarification_still_fires_when_a_parameter_is_genuinely_missing():
+async def test_clarification_still_fires_when_a_parameter_is_genuinely_missing():
     """"Email him about it" — no referent, and no self-reference to recover one."""
-    route = route_after_init(state(
+    route = await route_after_init(state(
         user_input="Send him an email about it",
         needs_clarification=True,
         clarification_question="Who should I email?",
@@ -201,7 +201,7 @@ def test_clarification_still_fires_when_a_parameter_is_genuinely_missing():
     assert route == "clarification"
 
 
-def test_an_empty_store_is_not_a_reason_to_interrogate_the_user():
+async def test_an_empty_store_is_not_a_reason_to_interrogate_the_user():
     """
     POLICY CHANGE (was: clarification fires when memory is empty).
 
@@ -212,7 +212,7 @@ def test_an_empty_store_is_not_a_reason_to_interrogate_the_user():
     little is stored. Retrieval now runs regardless and the agent reports an
     empty result honestly. See tests/test_answer_first_routing.py.
     """
-    route = route_after_init(state(
+    route = await route_after_init(state(
         user_input="What is my name?",
         needs_clarification=True,
         clarification_question="Which name?",
@@ -221,10 +221,10 @@ def test_an_empty_store_is_not_a_reason_to_interrogate_the_user():
     assert route == "profile"
 
 
-def test_errors_still_short_circuit_to_the_response_agent():
-    assert route_after_init(state(error="boom", needs_clarification=True)) == "response"
+async def test_errors_still_short_circuit_to_the_response_agent():
+    assert await route_after_init(state(error="boom", needs_clarification=True)) == "response"
 
 
-def test_normal_routing_is_unchanged_when_no_clarification_is_requested():
-    assert route_after_init(state(user_input="find me jobs", selected_agent="job")) == "job"
-    assert route_after_init(state(user_input="hello", selected_agent="nonsense")) == "profile"
+async def test_normal_routing_is_unchanged_when_no_clarification_is_requested():
+    assert await route_after_init(state(user_input="find me jobs", selected_agent="job")) == "job"
+    assert await route_after_init(state(user_input="hello", selected_agent="nonsense")) == "profile"

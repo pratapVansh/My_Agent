@@ -91,7 +91,7 @@ async def test_the_economics_question_is_never_sent_to_clarification():
     working = await builder.build("vansh", "c1")
 
     assert _is_self_referential(ECONOMICS_QUESTION)
-    route = route_after_init({
+    route = await route_after_init({
         "user_input": ECONOMICS_QUESTION,
         "needs_clarification": True,
         "clarification_question": "Which class do you mean?",

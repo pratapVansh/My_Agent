@@ -16,6 +16,7 @@ bcrypt>=4.1.0
 
 # Async support
 httpx==0.27.2
+# Transitive: deepgram-sdk requires it. Not imported directly.
 aiofiles==24.1.0
 
 # Utilities
@@ -24,23 +25,25 @@ aiofiles==24.1.0
 # configured timezone silently falls back to the host clock, which on a
 # datacentre host means answering "what is today's date" in the wrong day.
 tzdata>=2024.1
+# Required by FastAPI to parse multipart uploads. Not imported directly.
 python-multipart==0.0.12
 tavily-python==0.5.2
 playwright==1.53.0
 deepgram-sdk==4.1.0
+# Transitive: uvicorn[standard] and deepgram-sdk. Pinned to keep the
+# WebSocket protocol version used by /agents/stream explicit.
 websockets==15.0.1
 PyPDF2==3.0.1
 
 # LangGraph and LangChain
 langgraph==0.2.50
+# Transitive: required by langgraph, pinned so the version is explicit.
 langchain-core==0.3.28
-langchain-groq==0.2.1
 langsmith==0.1.142
 
 # Memory Systems
 asyncpg==0.30.0
 sqlalchemy[asyncio]==2.0.36
-psycopg2-binary==2.9.10
 
 # Vector Database and Embeddings (Cloud-based RAG)
 cohere>=5.0.0
@@ -50,3 +53,11 @@ tiktoken>=0.5.0
 # LiveKit WebRTC (Phase 0 — token generation SDK only)
 livekit-api>=1.0.0
 livekit>=1.0.0
+# MCP (stdio transport only — see app/mcp/).
+mcp>=2.0.0
+# Pinned because installing `mcp` pulls starlette>=1.0, which is incompatible
+# with fastapi 0.115 (`Router.__init__() got an unexpected keyword argument
+# 'on_startup'`) and breaks the application at import. Only the stdio
+# transport is used, so the newer starlette buys nothing here. Revisit
+# together with a fastapi upgrade, not on its own.
+starlette>=0.37.2,<0.39.0

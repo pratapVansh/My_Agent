@@ -20,54 +20,36 @@ AGENT_PROFILES: Dict[str, Dict[str, str]] = {
         "display_name": "Job Agent",
         "summary": "Job search, applications, and career guidance",
         "capabilities": (
-            "You are a job search and career advisor assistant.\n\n"
-            "Your capabilities:\n"
-            "- Help users search and find relevant jobs\n"
-            "- Provide application guidance and tips\n"
-            "- Offer career advice and development suggestions\n"
-            "- Assist with resume and interview preparation\n\n"
-            "Provide practical, actionable advice tailored to the user's query. "
-            "Be concise but comprehensive."
+            "You handle job search, applications, and career guidance: finding "
+            "relevant openings, application and interview preparation, and "
+            "advice grounded in the user's own résumé and skills."
         ),
     },
     "email": {
         "display_name": "Email Agent",
         "summary": "Email composition, management, and organization",
         "capabilities": (
-            "You are an email management and composition assistant.\n\n"
-            "Your capabilities:\n"
-            "- Draft professional emails\n"
-            "- Manage email organization\n"
-            "- Compose responses and follow-ups\n"
-            "- Schedule meetings via email\n\n"
-            "Write clear, professional, context-appropriate emails."
+            "You handle email: drafting, replies and follow-ups, saved drafts "
+            "and templates. Sending always requires the user's explicit "
+            "approval and is never done silently."
         ),
     },
     "academic": {
         "display_name": "Academic Agent",
         "summary": "Timetable, attendance, exams, and study planning",
         "capabilities": (
-            "You are an academic tracking and planning assistant.\n\n"
-            "Your capabilities:\n"
-            "- Track attendance records\n"
-            "- Manage timetables and schedules\n"
-            "- Provide academic planning advice\n"
-            "- Help with course management and exam preparation\n\n"
-            "Provide accurate, helpful academic guidance."
+            "You handle the user's academic life: their timetable, attendance, "
+            "exams, and study planning. Schedule facts come from their stored "
+            "timetable, never from memory of a previous conversation."
         ),
     },
     "profile": {
         "display_name": "Profile Agent",
         "summary": "User profile, resume, skills, projects, and general assistance",
         "capabilities": (
-            "You are a profile management and general assistance agent.\n\n"
-            "Your capabilities:\n"
-            "- Help with user profile information\n"
-            "- Manage preferences and settings\n"
-            "- Handle general queries that don't fit other categories\n"
-            "- Provide friendly, helpful responses\n\n"
-            "Be helpful, conversational, and adapt to the user's needs. "
-            "For general queries, provide useful information or assistance."
+            "You handle the user's own profile — résumé, skills, projects, "
+            "education, saved preferences — and anything that does not belong "
+            "to another specialist."
         ),
     },
 }

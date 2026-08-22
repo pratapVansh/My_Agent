@@ -3,6 +3,7 @@ API routes for multi-agent system.
 REST handles normal operations, while WebSocket is reserved for response streaming.
 """
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
@@ -16,10 +17,10 @@ from app.agents.streaming_workflow import run_streaming_workflow
 from app.tools.job_search_tool import job_search_tool
 from app.tools.email_draft_tool import email_draft_tool
 from app.tools.attendance_tool import attendance_tool
-from app.tools.timetable_tool import timetable_tool, TimetableInput
+from app.tools.timetable_tool import timetable_tool, TimetableInput, validate_entries
 from app.tools.timetable_pdf_parser import timetable_pdf_parser
 from app.memory.memory_manager import memory_manager
-from app.domain.academic import academic_repository
+from app.domain.schedule import schedule_repository
 from app.services.url_guard import UnsafeURLError
 from app.auth.dependencies import (
     authenticate_websocket,
@@ -435,26 +436,32 @@ async def suggest_classes(
 
 @router.post("/tools/timetable/upload-pdf")
 async def upload_timetable_pdf(
-    user_id: Optional[str] = Form(default=None, description="Deprecated and ignored"),
-    clear_existing: bool = Form(
-        default=True,
-        description="If true, deactivates your old timetable before storing the new one"
-    ),
     file: UploadFile = File(..., description="PDF file of your semester timetable"),
+    semester: Optional[str] = Form(
+        default=None, description="Semester label, e.g. '7' — not read from the PDF"
+    ),
+    force: bool = Form(
+        default=False,
+        description="Reload even if this exact file is already the active timetable",
+    ),
+    user_id: Optional[str] = Form(default=None, description="Deprecated and ignored"),
     principal: Principal = Depends(require_scope(Scope.TIMETABLE_WRITE)),
 ):
     """
-    Upload a PDF timetable for the current semester.
+    Upload a new semester timetable PDF and make it the active timetable.
 
-    Workflow:
-    1. Extract text from the PDF using PyPDF2
-    2. Send the text to Groq LLM to parse into structured entries
-       (handles any layout: grid, list, weekly view)
-    3. Optionally clear the previous timetable (clear_existing=true by default)
-    4. Store all parsed entries in PostgreSQL
+    Deterministic only — no model call is made anywhere in this path.
 
-    Upload a new PDF any time your timetable changes — the old one is safely
-    soft-deleted (not permanently removed) before the new one is stored.
+    1. Extract text (PyPDF2) and parse it with fixed rules: a line counts as a
+       class only if it names a weekday and a time range. A scanned PDF (no
+       text layer) or a genuine grid table (rows/columns, not one line per
+       class) is refused with a clear reason rather than guessed at.
+    2. Hash the file and compare it against the *currently active* timetable's
+       source document. An identical re-upload is a no-op unless `force`.
+    3. Atomically retire every active class and upload record for this user
+       and activate the new set in a single transaction — the database is
+       never left with both timetables active at once, and a failure at any
+       point leaves the previous timetable exactly as it was.
     """
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -465,7 +472,22 @@ async def upload_timetable_pdf(
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    # Parse the PDF into structured entries
+    content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+
+    active = await schedule_repository.active_upload(user_id)
+    if active and active["content_hash"] == content_hash and not force:
+        return {
+            "success": True,
+            "changed": False,
+            "upload_id": active["id"],
+            "message": (
+                f"'{file.filename}' is already your active timetable "
+                f"(uploaded {active['created_at']}). Nothing changed. Pass "
+                "force=true to reload it anyway."
+            ),
+        }
+
+    # Parse the PDF into structured entries — no model call.
     parse_result = await timetable_pdf_parser.parse(
         pdf_bytes=pdf_bytes,
         filename=file.filename,
@@ -482,28 +504,51 @@ async def upload_timetable_pdf(
             },
         )
 
-    # Clear old timetable if requested
-    cleared_count = 0
-    if clear_existing:
-        cleared_count = await academic_repository.clear_timetable(user_id=user_id)
+    valid, skipped = validate_entries(parse_result["entries"])
 
-    # Store all parsed entries
-    entries = parse_result["entries"]
-    store_result = await timetable_tool.store_timetable(user_id=user_id, entries=entries)
+    # Retire the old timetable and activate the new one, atomically. Nothing
+    # here can leave the database with both active at once — see
+    # `ScheduleRepository.replace_active_timetable`.
+    result = await schedule_repository.replace_active_timetable(
+        user_id,
+        filename=file.filename,
+        content_hash=content_hash,
+        valid_entries=valid,
+        skipped=skipped,
+        semester=semester,
+        page_count=parse_result["pages"],
+        parse_notes=parse_result["parse_notes"],
+        ingest_method="pdf_parser",
+    )
+
+    if not result["success"]:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "No entries in this PDF passed validation — your previous "
+                    "timetable is unchanged."
+                ),
+                "parse_notes": parse_result["parse_notes"],
+                "skipped": result["skipped"],
+            },
+        )
 
     return {
         "success": True,
+        "changed": True,
         "filename": file.filename,
+        "upload_id": result["upload_id"],
         "pages_in_pdf": parse_result["pages"],
         "entries_parsed": parse_result["entry_count"],
-        "entries_stored": store_result["stored_count"],
-        "old_entries_cleared": cleared_count,
+        "entries_stored": result["stored_count"],
+        "entries_skipped": result["skipped_count"],
+        "skipped": result["skipped"],
+        "old_entries_retired": result["deactivated_rows"],
         "parse_notes": parse_result["parse_notes"],
-        "stored_ids": store_result["stored_ids"],
         "message": (
-            f"Successfully imported {store_result['stored_count']} classes from "
-            f"'{file.filename}'. "
-            + (f"Replaced {cleared_count} old entries." if cleared_count else "")
+            f"Activated {result['stored_count']} classes from '{file.filename}', "
+            f"retiring {result['deactivated_rows']} old entries."
         ),
     }
 
@@ -1352,6 +1397,14 @@ async def stream_response(websocket: WebSocket):
                             "detected_intent": chunk.get("detected_intent"),
                             "execution_path": chunk.get("execution_path", []),
                             "planner_confidence": chunk.get("planner_confidence"),
+                            # Present only when the turn was taken off the
+                            # tool-free path. A client that sees `route` here
+                            # knows the following `final` was produced by tools
+                            # and that no `display_chunk` frames are coming.
+                            "route": chunk.get("route"),
+                            "escalation_reason": chunk.get("escalation_reason"),
+                            "tools_used": chunk.get("tools_used", []),
+                            "answerability": chunk.get("answerability"),
                         })
 
                     elif chunk_type == "token":

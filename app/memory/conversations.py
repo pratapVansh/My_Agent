@@ -15,12 +15,12 @@ See docs/MEMORY_ARCHITECTURE.md §3.8.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import logging
 
-from sqlalchemy import and_, desc, func, select, update as sa_update
+from sqlalchemy import and_, desc, select, update as sa_update
 
 from app.db.session import async_session_maker
 from app.memory.models import ConversationORM, TurnORM

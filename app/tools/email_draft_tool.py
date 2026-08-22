@@ -5,7 +5,7 @@ Generates personalized email drafts and never sends them.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List
+from typing import Any, Dict
 import logging
 
 from app.memory.memory_manager import memory_manager

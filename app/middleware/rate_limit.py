@@ -11,7 +11,7 @@ Design notes
   path prefix so expensive endpoints get a tighter limit than ordinary reads.
 * Deliberately dependency-free: no Redis, no new packages. State is per process,
   which is correct for the current single-worker deployment. Running multiple
-  workers or instances requires a shared store — see AUDIT_REPORT.md (M15).
+  workers or instances requires a shared store — see docs/AUDIT_REPORT.md (M15).
 * Limits are generous enough that normal interactive use is never throttled.
 """
 from __future__ import annotations

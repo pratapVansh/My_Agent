@@ -53,7 +53,8 @@ from app.services.deepgram_bridge import DeepgramBridge
 from app.agents.streaming_workflow import run_streaming_workflow
 from app.agents.workflow import run_workflow
 from app.agents.hybrid_router import ROUTE_TOOL, determine_route
-from app.agents import interruption
+from app.agents import confirmation, interruption
+from app.agents.actions import action_gateway
 from app.memory.memory_manager import memory_manager
 from app.services.langsmith_service import configure_langsmith
 from app.services.tts_streamer import SpokenChunk, tts_streamer
@@ -70,6 +71,11 @@ _DATA_TOPIC = "agent-response"
 
 # Tolerate a couple of transient reconnects before telling the user STT is down.
 _STT_FAILURES_BEFORE_NOTIFY = 3
+
+# How often a tool turn asserts liveness while `run_workflow` is running. Well
+# inside `voice_turn_stall_seconds` so a single slow tick cannot be mistaken
+# for a stall, and slow enough that it is not a meaningful source of traffic.
+_TOOL_TURN_HEARTBEAT_SECONDS = 2.0
 
 # How long the room may sit empty before the worker exits. Workers are started
 # on demand by /livekit/token and are process-local, so one that never exits is
@@ -380,14 +386,57 @@ async def main(
         progress.touch()
 
         if route == ROUTE_TOOL:
-            result = await run_workflow(
-                user_input=transcript,
-                user_id=state.identity,
-                session_id=state.session_id,
-                conversation_history=list(state.history),
-                output_mode="user",
-                scopes=scopes,
+            # ── Why this needs a heartbeat ───────────────────────────────────
+            #
+            # `watch_for_stall` cancels a turn that has stopped making
+            # progress, and that design is right: a fixed wall-clock deadline
+            # would cut a long spoken answer mid-sentence. But it can only see
+            # what `progress.touch()` reports, and the streaming path touches
+            # on every token while this one is a single opaque await.
+            #
+            # So a tool turn reported progress twice — once before the call and
+            # once after — and anything in between that took longer than
+            # `voice_turn_stall_seconds` (20 s) was cancelled as "stalled"
+            # while `run_workflow` was still working through its own budget.
+            # Two deadlines, never reconciled, and the shorter one had no way
+            # to tell work from silence.
+            #
+            # The heartbeat closes that gap: liveness is asserted for as long
+            # as the workflow is genuinely running, and a workflow that hangs
+            # still stops reporting when the task ends. The stall threshold is
+            # left where it is — raising it would have hidden the bug rather
+            # than fixing it, and would have made genuinely frozen turns take
+            # longer to notice.
+            async def workflow_heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(_TOOL_TURN_HEARTBEAT_SECONDS)
+                    progress.touch()
+                    await publish({"type": "working", "transcript": transcript})
+
+            heartbeat = asyncio.create_task(
+                workflow_heartbeat(), name=f"tool-heartbeat-{state.identity}"
             )
+            heartbeat.add_done_callback(_log_task_failure)
+            try:
+                result = await run_workflow(
+                    user_input=transcript,
+                    user_id=state.identity,
+                    session_id=state.session_id,
+                    conversation_history=list(state.history),
+                    output_mode="user",
+                    scopes=scopes,
+                    # A spoken turn's deadline, not the typed one. The caller is
+                    # waiting on audio; 120 s of server-side work produces an
+                    # answer nobody is still listening for.
+                    timeout_seconds=settings.voice_workflow_timeout_seconds,
+                )
+            finally:
+                # Cancelled unconditionally, including when the turn itself is
+                # cancelled by a barge-in or by the watchdog. A heartbeat that
+                # outlived its turn would keep asserting progress for a turn
+                # that no longer exists, which is the one thing that would make
+                # the stall watchdog unable to do its job at all.
+                heartbeat.cancel()
             progress.touch()
             display_text = result.get("display_text") or ""
             speech_text = result.get("speech_text") or display_text
@@ -700,6 +749,28 @@ async def main(
 
         async def on_turn(transcript: str) -> None:
             await publish({"type": "utterance_end", "transcript": transcript})
+
+            # An outstanding confirmation changes what these words mean.
+            # "No", "cancel" and "stop" are all stop commands *and* all
+            # rejections, and while an action is waiting on the user the second
+            # reading is the right one: they are refusing the action, not
+            # asking the assistant to stop talking. Swallowing it as a barge-in
+            # would leave the action pending and the refusal unrecorded, so the
+            # utterance is passed through to the same confirmation route text
+            # uses. Interruption still applies to everything else.
+            awaiting_confirmation = bool(
+                await action_gateway.pending_for(state.session_id, identity)
+            )
+            if awaiting_confirmation and confirmation.detect(transcript) is not (
+                confirmation.ConfirmationIntent.NONE
+            ):
+                logger.info(
+                    "Confirmation reply from %s while an action is pending: %r",
+                    identity, transcript[:40],
+                )
+                await cancel_turn(state)
+                spawn(start_turn(state, transcript), f"start-turn-{identity}")
+                return
 
             # A bare stop command is not a question. Cancelling the turn and
             # then handing "stop" to the language model produces a reply *to

@@ -25,6 +25,23 @@ FORCE_CLARIFICATION_BELOW = 0.35
 _PLANNER_HISTORY_TURNS = 4
 _PLANNER_HISTORY_CHARS = 300
 
+# Was 500, and that was the direct cause of the malformed JSON in the logs.
+#
+# `openai/gpt-oss-120b` is a reasoning model: it thinks on a separate internal
+# channel and bills that thinking from *this* budget. The object requested below
+# is not small — intent, agent, confidence, a clarification question and a
+# multi-step execution_plan — so once reasoning had taken its share there was
+# frequently not enough left to close the JSON. The response came back truncated
+# mid-object, `json.loads` raised, and `_parse_response` quietly fell back to
+# routing everything to the profile agent.
+#
+# The same failure was already diagnosed and fixed one module over: see the
+# `_ROUTER_MAX_TOKENS` note in `hybrid_router`, which records that a tight cap
+# on a reasoning model "is spent entirely on reasoning and returns empty
+# content". Generation still stops at the closing brace, so a generous ceiling
+# costs nothing on a well-formed response.
+_PLANNER_MAX_TOKENS = 1500
+
 
 class PlannerAgent(BaseAgent):
     """
@@ -62,7 +79,12 @@ class PlannerAgent(BaseAgent):
             response = await self.call_groq(
                 messages=messages,
                 temperature=0.2,
-                max_tokens=500
+                max_tokens=_PLANNER_MAX_TOKENS,
+                # Constrained decoding, so the model cannot emit a preamble or
+                # a fenced block around the object. `_parse_response` still
+                # strips both, because this is the belt and that is the braces
+                # — but with this set the braces stop being load-bearing.
+                response_format={"type": "json_object"},
             )
 
             routing = self._parse_response(response)
@@ -99,12 +121,28 @@ class PlannerAgent(BaseAgent):
             return state
 
     def _recent_history_messages(self, state: Dict[str, Any]) -> list:
-        """Recent conversation turns, trimmed, for context-aware routing."""
-        raw_history = state.get("conversation_history") or []
+        """
+        Recent conversation turns, trimmed, for context-aware routing.
+
+        Shares `persona.recent_turns` with the specialists so the component
+        deciding *which agent handles this turn* sees the same conversation
+        the chosen agent will. It previously read only `conversation_history`,
+        which the web chat never sends — so every typed follow-up was routed
+        in a vacuum, and "email him about that" was classified with no idea
+        who "him" was or what "that" referred to.
+        """
+        from app.agents import persona
+
+        raw_history = persona.recent_turns(state)
         return [
             {"role": turn["role"], "content": str(turn.get("content", ""))[:_PLANNER_HISTORY_CHARS]}
             for turn in raw_history[-_PLANNER_HISTORY_TURNS:]
-            if turn.get("role") in ("user", "assistant") and turn.get("content")
+            # `isinstance` because these rows now come from the conversation
+            # store as well as from the caller. A malformed row must cost
+            # context, never the routing decision.
+            if isinstance(turn, dict)
+            and turn.get("role") in ("user", "assistant")
+            and turn.get("content")
         ]
 
     def _build_system_prompt(self) -> str:
@@ -270,12 +308,26 @@ Example — multi step:
             }
 
         except Exception as exc:
-            # Logged (not silent) so a drift in the routing model's output
-            # format shows up as misrouting warnings instead of an invisible
-            # slide into always choosing the default agent.
-            logger.warning(
-                "Planner returned unparseable routing output (%s); defaulting to profile. "
-                "First 200 chars: %.200s",
+            # ERROR, not WARNING, and deliberately so.
+            #
+            # This branch does not fail a turn — it silently reroutes it. Every
+            # job, email and academic request that lands here is answered by the
+            # profile agent instead, which holds none of the tools those
+            # requests need. That is a misroute wearing the costume of a
+            # successful turn, and at WARNING it never surfaced: the symptom
+            # reported from production was "the planner sometimes returns
+            # malformed JSON", diagnosed from the model's output rather than
+            # from this log line, because nobody was looking at WARNING.
+            #
+            # Deliberately *not* repaired by asking the model again. A second
+            # call to fix the first one doubles the cost of the turn at exactly
+            # the moment the provider is most likely to be the thing that broke
+            # it. `response_format` plus an adequate token budget prevents the
+            # failure; this is what happens when prevention did not.
+            logger.error(
+                "Planner returned unparseable routing output (%s); falling back to "
+                "the profile agent, which may be the wrong specialist for this "
+                "request. Raw response (first 400 chars): %.400s",
                 exc, response,
             )
             return {

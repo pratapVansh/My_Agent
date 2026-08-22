@@ -15,9 +15,9 @@ from qdrant_client.models import (
     CreateFieldIndex
 )
 from typing import List, Dict, Any, Optional
-import uuid
 import logging
 from app.config import settings
+from app.services.call_metrics import record_qdrant_op
 from app.services.debug_logger import log_step
 
 logger = logging.getLogger(__name__)
@@ -146,6 +146,7 @@ class QdrantService:
                 logger.warning("No points to upsert")
                 return True
 
+            record_qdrant_op()
             await self.client.upsert(
                 collection_name=collection_name,
                 points=points
@@ -199,6 +200,7 @@ class QdrantService:
                 ]
                 query_filter = Filter(must=conditions)
 
+            record_qdrant_op()
             results = await self.client.query_points(
                 collection_name=collection_name,
                 query=query_vector,
@@ -398,6 +400,7 @@ class QdrantService:
 
                 page_size = _SCROLL_PAGE_SIZE if remaining is None else min(_SCROLL_PAGE_SIZE, remaining)
 
+                record_qdrant_op()
                 points, next_offset = await self.client.scroll(
                     collection_name=collection_name,
                     scroll_filter=scroll_filter,

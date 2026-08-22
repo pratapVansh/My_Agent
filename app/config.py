@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     # starts; startup calls validate_required_keys() to fail fast with a clear
     # message, and tests can import modules without a populated .env.
     groq_api_key: Optional[str] = None
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
     groq_temperature: float = 0.7
     groq_max_tokens: int = 2048
 
@@ -93,6 +93,24 @@ class Settings(BaseSettings):
     memory_worker_poll_seconds: float = 30.0
     memory_embedding_batch_size: int = 32
 
+    # Which model the background worker uses for extraction and summarisation.
+    #
+    # None keeps the user-facing `groq_model`, which is the historical
+    # behaviour and stays the default — extraction quality is a correctness
+    # property of the memory system, and it is not something to trade away on
+    # a guess.
+    #
+    # It is a knob because the cost is measurable and lands in the wrong place:
+    # one extraction call is ~1,500 tokens, which is ~19% of a minute on the
+    # measured 8,000 TPM free tier, spent with no user waiting for it. Since
+    # the worker now queues through the same limiter as user turns, a spoken
+    # turn can wait behind background work.
+    #
+    # Set it to a smaller model (e.g. `openai/gpt-oss-20b`) if that trade suits
+    # your tier — and check extraction quality afterwards, because that is the
+    # thing being traded.
+    memory_worker_model: Optional[str] = None
+
     # Turns off the legacy per-utterance vector write. Kept ON by default
     # because the *legacy* prompt still reads that data — flipping this before
     # the Phase 6 read cutover would remove a served signal without its
@@ -133,7 +151,6 @@ class Settings(BaseSettings):
     # Voice: Deepgram STT
     deepgram_api_key: Optional[str] = None
     deepgram_model: str = "nova-2"
-    deepgram_streaming_enabled: bool = False
     deepgram_utterance_end_ms: int = 1000  # Deepgram API strictly requires a minimum of 1000ms
     deepgram_vad_events: bool = True
     # Trailing silence before Deepgram marks a final result `speech_final`.
@@ -178,11 +195,8 @@ class Settings(BaseSettings):
     livekit_api_key: Optional[str] = None
     livekit_api_secret: Optional[str] = None
 
-    # Voice Agent Optimization Feature Flags
-    streaming_stt_enabled: bool = True
-    parallel_workflow_enabled: bool = True  # Run memory + planner concurrently (~200-300ms gain)
-    binary_audio_enabled: bool = False
-    vad_enabled: bool = True
+    # Run memory retrieval and planning concurrently (~200-300ms gain).
+    parallel_workflow_enabled: bool = True
 
     # CORS — restrict in production (comma-separated origins in .env)
     allowed_origins: List[str] = ["http://localhost:3000", "http://localhost:3001"]
@@ -205,11 +219,54 @@ class Settings(BaseSettings):
     rate_limit_expensive_per_minute: int = 5     # scraping, token minting
     rate_limit_auth_per_minute: int = 10         # login/guest — brute-force guard
 
+    # ── Groq back-pressure ───────────────────────────────────────────────
+    # The HTTP rate limiter above caps requests per client per minute. It knows
+    # nothing about the fan-out each of those requests triggers: one turn can
+    # be a planner call, three reasoning iterations and a reflect retry, and
+    # several turns can be in flight at once alongside the background memory
+    # worker. Without a gate in front of the provider those all burst together
+    # and the account answers 429 — which the retry layers then amplify.
+    #
+    # These two numbers convert that burst into a queue. Concurrency bounds how
+    # many requests are open at once; the token budget bounds how much work is
+    # admitted per minute, estimated from prompt size before the call is made.
+    groq_limiter_enabled: bool = True
+    groq_max_concurrency: int = 4
+
+    # ── This number must match your Groq account, or the gate does nothing ──
+    #
+    # 8,000 is the measured `on_demand` (free tier) limit for
+    # `openai/gpt-oss-120b`, read from a live 429 rather than from the docs:
+    #
+    #   "Rate limit reached for model `openai/gpt-oss-120b` ... service tier
+    #    `on_demand` on tokens per minute (TPM): Limit 8000, Used 5486,
+    #    Requested 3523"
+    #
+    # This was previously 24,000 — three times the account's actual capacity.
+    # A budget above the real limit is not conservative, it is inert: every
+    # request passes the gate and is then rejected by the provider, which is
+    # the exact behaviour the limiter exists to prevent. Set it *at or below*
+    # what your tier grants.
+    #
+    # Sizing note, because the headroom here is thinner than it looks: one
+    # planner call is ~3,500 tokens against this 8,000 budget, so roughly two
+    # calls fit in a minute. On this tier the limiter will genuinely queue.
+    # Raise this after upgrading the tier — do not raise it to make queuing
+    # stop, which only moves the rejection back to the provider.
+    groq_tokens_per_minute: int = 8_000
+
     # ── Workflow execution ───────────────────────────────────────────────
     # Ceiling on a single end-to-end agent run. Without it, reflect retries ×
     # reasoning iterations × per-call timeouts can stack into several minutes
     # while the client has long since disconnected.
     workflow_timeout_seconds: float = 120.0
+
+    # A spoken turn has a much shorter useful life than a typed one: the stall
+    # watchdog gives up on silence at `voice_turn_stall_seconds`, and a caller
+    # waiting on audio has usually given up well before the text deadline. Kept
+    # separate rather than lowering the global value, because the typed path
+    # legitimately runs longer multi-step plans.
+    voice_workflow_timeout_seconds: float = 35.0
 
     # ── Outbound network safety ──────────────────────────────────────────
     # Server-side fetches driven by user-supplied URLs (ERP scraping) must not

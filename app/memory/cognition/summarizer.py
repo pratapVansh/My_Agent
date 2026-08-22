@@ -15,9 +15,10 @@ See docs/MEMORY_ARCHITECTURE.md §3.8.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 import logging
 
+from app.config import settings
 from app.memory.conversations import (
     DEFAULT_WINDOW_TURNS,
     Conversation,
@@ -154,6 +155,8 @@ class ConversationSummarizer:
             ],
             temperature=0.3,
             max_tokens=250,
+            # None keeps the user-facing default; see `memory_worker_model`.
+            model=settings.memory_worker_model,
         )
 
         updated = (response.get("content") or "").strip()

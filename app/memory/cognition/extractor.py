@@ -21,6 +21,7 @@ import logging
 import re
 
 from app.memory.kinds import MemoryKind
+from app.config import settings
 from app.services.groq_service import groq_service
 
 logger = logging.getLogger(__name__)
@@ -201,6 +202,9 @@ class MemoryExtractor:
             # Extraction is a reading task, not a creative one.
             temperature=0.1,
             max_tokens=900,
+            # None keeps the user-facing default; see `memory_worker_model`.
+            # This work has no user waiting on it but shares their TPM budget.
+            model=settings.memory_worker_model,
         )
         candidates = parse_extraction(response.get("content", ""))
 

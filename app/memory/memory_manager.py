@@ -5,7 +5,7 @@ Provides clean interface for storage and retrieval.
 """
 import logging
 from typing import Dict, Any, List, Optional
-from datetime import date, time
+from datetime import time
 import asyncio
 
 from app.memory.long_term_memory_qdrant import long_term_memory_qdrant
@@ -136,15 +136,43 @@ class MemoryManager:
         if not decision.store:
             return
 
-        try:
-            await self.smart.extract_and_store(
+        # ── Off the critical path ────────────────────────────────────────────
+        # This is an embedding plus a vector upsert — a full Cohere round trip
+        # — and it used to be awaited *before* retrieval ran, so every turn
+        # paid for it in latency the user experienced as the assistant being
+        # slow to answer. Nothing in this turn reads it back: the utterance it
+        # stores is the one the caller just sent, which the state already
+        # carries, and retrieval scores against records written by earlier
+        # turns.
+        #
+        # The two Postgres writes above stay awaited, because those *are* read
+        # back within the turn — `on_agent_response` pairs the reply with the
+        # user's message by reading it out of the store.
+        _spawn_shadow(
+            self._extract_and_store_quietly(
                 user_id=user_id,
-                messages=[{"role": "user", "content": user_message}],
+                user_message=user_message,
                 metadata={
                     **(metadata or {}),
                     "importance": decision.importance,
                     "explicit": decision.explicit,
                 },
+            ),
+            f"smart-extract-{user_id}",
+        )
+
+    async def _extract_and_store_quietly(
+        self,
+        user_id: str,
+        user_message: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Vector-write half of `on_user_input`, run detached. Never raises."""
+        try:
+            await self.smart.extract_and_store(
+                user_id=user_id,
+                messages=[{"role": "user", "content": user_message}],
+                metadata=metadata,
             )
         except Exception as e:
             logger.warning("Smart memory extraction failed: %s", e)
@@ -209,11 +237,36 @@ class MemoryManager:
             })
             return
 
-        # Two independent stores with no shared transaction. The Postgres write
-        # above is authoritative for conversation history; if the vector write
-        # fails, that turn is missing from semantic recall while chat history
-        # still has it. store_memory() returns None on failure (and logs), so
-        # surface the divergence here too rather than letting it pass silently.
+        # Detached for the same reason as the user-input half: an embedding and
+        # a vector upsert that nothing in this turn reads back. Awaited, it sat
+        # at the tail of `run_workflow` — after the answer was already final —
+        # and delayed handing that answer to the caller by a Cohere round trip.
+        #
+        # The Postgres write above remains authoritative for conversation
+        # history and is still awaited, so the divergence reported below is
+        # still "chat history has it, semantic memory does not" rather than a
+        # turn that is missing from both.
+        _spawn_shadow(
+            self._store_reply_vector(user_id, session_id, agent_response, metadata),
+            f"store-reply-vector-{user_id}",
+        )
+
+    async def _store_reply_vector(
+        self,
+        user_id: str,
+        session_id: str,
+        agent_response: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """
+        Legacy per-utterance vector write for the reply, run detached.
+
+        Two independent stores with no shared transaction. The Postgres write is
+        authoritative for conversation history; if this fails, the turn is
+        missing from semantic recall while chat history still has it.
+        `store_memory()` returns None on failure (and logs), so the divergence
+        is surfaced here rather than passing silently.
+        """
         point_id = await self.smart.store_memory(
             user_id=user_id,
             text=agent_response,
@@ -348,63 +401,142 @@ class MemoryManager:
                 user_id, session_id, exc,
             )
 
+    @staticmethod
+    def _retrieval_scope_key(
+        memory_owner_id: Optional[str],
+        visibilities,
+        category: Optional[str],
+    ) -> str:
+        """
+        The identity of *what is being read*, for the cache key.
+
+        Three things make two retrievals for the same user id different, and
+        all three must be in the key:
+
+        **Whose memory** — `memory_owner_id`. A guest session reads the owner's
+        public records, not its own; the owner reads their own at every
+        visibility. `RetrievalScope` exists precisely because those are
+        different questions, and a key naming only the caller cannot tell them
+        apart. `memory_cache`'s own docstring anticipated this and left the
+        `scope` parameter unused because no caller passed one. This is that
+        caller.
+
+        **At what visibility** — the same owner id read as owner and read as
+        guest must not share an entry, or the first owner turn to populate the
+        cache serves private context to the next guest out of it.
+
+        **For which category** — added by the section-aware retrieval below.
+        Two questions with identical text but different categories now fetch
+        different sources, and a TEMPORAL turn's context (chat history only)
+        must not be served to a PROFILE_SKILLS turn as though it were complete.
+        """
+        vis = ""
+        if visibilities:
+            try:
+                vis = ",".join(sorted(str(getattr(v, "value", v)) for v in visibilities))
+            except TypeError:
+                vis = str(visibilities)
+        return f"owner={memory_owner_id or ''}|vis={vis}|cat={category or ''}"
+
     async def retrieve_context(
         self,
         user_id: str,
         session_id: str,
         query: Optional[str] = None,
         include_episodes: bool = True,
+        category: Optional[str] = None,
+        memory_owner_id: Optional[str] = None,
+        visibilities=None,
     ) -> Dict[str, Any]:
         """
         Retrieve relevant memory context for agent injection.
         Uses caching to reduce latency.
 
+        `category` is a `QueryCategory` value. When supplied, only the sources
+        that can appear in the prompt for that kind of question are fetched.
+        This used to be applied one step too late: `format_context_for_prompt`
+        dropped the irrelevant sections *after* `retrieve_context` had paid for
+        them, so "what time is it" ran two semantic searches, a résumé scroll
+        and up to two fallbacks, then rendered none of them. Passing None keeps
+        the historical behaviour of fetching everything.
+
         Args:
             user_id: User identifier
             session_id: Session identifier
             query: Optional query for semantic search
+            category: Optional QueryCategory value that narrows the sources
+            memory_owner_id: Whose records to read, when not the caller's own
+            visibilities: Which visibility levels the caller may read
 
         Returns:
             Dictionary with all relevant memories
         """
+        allowed = self.sections_for(category)
+        scope_key = self._retrieval_scope_key(memory_owner_id, visibilities, category)
+
+        # Which of the five lookups can actually reach the prompt. A source
+        # that `format_context_for_prompt` will discard is not worth a network
+        # round trip, and for the semantic ones it is a Cohere call and a
+        # Qdrant query each.
+        want_chat = "chat_history" in allowed
+        want_prefs = "preferences" in allowed
+        want_profile = "profile_facts" in allowed
+        want_episodes = include_episodes and "episodes" in allowed
+        # search_all is one call that fills three sections plus their statuses;
+        # it runs if any of them is wanted.
+        want_long_term = bool(
+            allowed & {"skills", "projects", "resume", "status"}
+        )
+
         # Try cache first. `get` returns a copy, so overwriting the volatile
         # sections below cannot corrupt the entry for the next reader — it used
         # to hand back its own storage, and every hit mutated it.
-        cached = memory_cache.get(user_id, query)
+        cached = memory_cache.get(user_id, query, scope=scope_key)
         if cached:
             # Always fetch fresh chat history and profile facts — never stale
-            cached["chat_history"] = await self.short_term.get_recent_context(
-                user_id=user_id,
-                session_id=session_id,
-                last_n=10
+            cached["chat_history"] = (
+                await self.short_term.get_recent_context(
+                    user_id=user_id, session_id=session_id, last_n=10
+                )
+                if want_chat else []
             )
-            cached["profile_facts"] = await self.short_term.get_profile_facts(user_id=user_id)
+            cached["profile_facts"] = (
+                await self.short_term.get_profile_facts(user_id=user_id)
+                if want_profile else []
+            )
             return cached
 
         # Retrieve all memory sources in parallel
         async def _get_chat():
+            if not want_chat:
+                return []
             return await self.short_term.get_recent_context(
                 user_id=user_id, session_id=session_id, last_n=10
             )
 
         async def _get_prefs():
+            if not want_prefs:
+                return []
             return await self.smart.retrieve_preferences(
                 user_id=user_id, query=query, limit=5
             )
 
         async def _get_long_term():
-            if query:
+            if query and want_long_term:
                 log_step("USER QUERY", {"user_id": user_id, "query": query})
                 return await self.long_term.search_all(
-                    user_id=user_id, query=query, limit=3
+                    user_id=user_id, query=query, limit=3,
+                    sections=allowed,
                 )
             return {}
 
         async def _get_profile():
+            if not want_profile:
+                return []
             return await self.short_term.get_profile_facts(user_id=user_id)
 
         async def _get_episodes():
-            if include_episodes:
+            if want_episodes:
                 return await self.short_term.get_recent_episodes(user_id=user_id, limit=4)
             return []
 
@@ -428,7 +560,7 @@ class MemoryManager:
             "profile_facts": profile_facts,
             "episodes": episodes,
         }
-        memory_cache.set(user_id, cache_data, query)
+        memory_cache.set(user_id, cache_data, query, scope=scope_key)
 
         return context
 
@@ -456,7 +588,16 @@ class MemoryManager:
         Returns (context, prompt) so callers keep access to the raw context.
         """
         context = await self.retrieve_context(
-            user_id=user_id, session_id=session_id, query=query
+            user_id=user_id,
+            session_id=session_id,
+            query=query,
+            # All three were already in scope here and none of them reached the
+            # retrieval layer. `category` is why simple questions ran the whole
+            # fan-out; the other two are why the cache key could not distinguish
+            # an owner's read from a guest's. See `_retrieval_scope_key`.
+            category=category,
+            memory_owner_id=memory_owner_id,
+            visibilities=visibilities,
         )
         prompt = self.format_context_for_prompt(context, category=category)
 

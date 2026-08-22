@@ -8,7 +8,7 @@ into a proxy for reaching things the caller cannot reach directly.
 
 This module answers one question: is it safe for *this server* to fetch that
 URL? It does not answer whether the caller is authorised to ask — that is an
-authentication concern (see AUDIT_REPORT.md, C1).
+authentication concern (see docs/AUDIT_REPORT.md, C1).
 """
 from __future__ import annotations
 

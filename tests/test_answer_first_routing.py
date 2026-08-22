@@ -177,20 +177,20 @@ def test_a_bare_followup_without_history_is_not_forced_into_retrieval():
         "Tell me about my internship.",
     ],
 )
-def test_acceptance_queries_never_reach_clarification(query):
+async def test_acceptance_queries_never_reach_clarification(query):
     """The acceptance list: every one must retrieve, even if the planner balked."""
-    assert route_after_init(state(
+    assert await route_after_init(state(
         user_input=query, needs_clarification=True,
         clarification_question="Could you provide more context?",
     )) == "profile"
 
 
-def test_retrieval_is_attempted_even_when_memory_is_empty():
+async def test_retrieval_is_attempted_even_when_memory_is_empty():
     """
     An empty store is not a reason to interrogate the user about their own name.
     Retrieval runs; if it finds nothing the agent reports that honestly.
     """
-    assert route_after_init(state(
+    assert await route_after_init(state(
         user_input="What is my name?",
         needs_clarification=True,
         memory_context={},
@@ -198,40 +198,40 @@ def test_retrieval_is_attempted_even_when_memory_is_empty():
     )) == "profile"
 
 
-def test_the_resume_followup_routes_to_retrieval_not_clarification():
-    assert route_after_init(with_history(
+async def test_the_resume_followup_routes_to_retrieval_not_clarification():
+    assert await route_after_init(with_history(
         user_input="I think it was mentioned in my resume.",
         needs_clarification=True,
         clarification_question="Which resume detail do you mean?",
     )) == "profile"
 
 
-def test_a_project_followup_routes_to_retrieval():
-    assert route_after_init(with_history(
+async def test_a_project_followup_routes_to_retrieval():
+    assert await route_after_init(with_history(
         user_input="Tell me more about TRACE.",
         needs_clarification=True,
     )) == "profile"
 
 
-def test_the_suppressed_question_is_cleared_from_state():
+async def test_the_suppressed_question_is_cleared_from_state():
     s = state(user_input="What is my CGPA?", needs_clarification=True,
               clarification_question="Which CGPA?")
-    route_after_init(s)
+    await route_after_init(s)
     assert s["needs_clarification"] is False
     assert s["clarification_question"] == ""
     assert s["profile_intent"] == PROFILE_CGPA
 
 
-def test_academic_questions_keep_their_agent():
+async def test_academic_questions_keep_their_agent():
     """Timetable and attendance belong to academic, not profile retrieval."""
-    assert route_after_init(state(
+    assert await route_after_init(state(
         user_input="What classes do I have tomorrow?",
         selected_agent="academic", needs_clarification=True,
     )) == "academic"
 
 
-def test_a_personal_question_overrides_a_mistaken_agent_choice():
-    assert route_after_init(state(
+async def test_a_personal_question_overrides_a_mistaken_agent_choice():
+    assert await route_after_init(state(
         user_input="What company did I intern at?", selected_agent="job",
     )) == "profile"
 
@@ -248,9 +248,9 @@ def test_a_personal_question_overrides_a_mistaken_agent_choice():
         ("Apply to that one.", "Which listing?"),
     ],
 )
-def test_operational_requests_missing_a_parameter_still_clarify(query, question):
+async def test_operational_requests_missing_a_parameter_still_clarify(query, question):
     """A recipient or a date is not in any store — asking is the only option."""
-    assert route_after_init(state(
+    assert await route_after_init(state(
         user_input=query, needs_clarification=True, clarification_question=question,
     )) == "clarification"
 
@@ -264,34 +264,34 @@ def test_operational_requests_missing_a_parameter_still_clarify(query, question)
         ("Email it to her.", "Who is the recipient?"),
     ],
 )
-def test_an_action_with_a_referential_word_still_clarifies_mid_conversation(query, question):
+async def test_an_action_with_a_referential_word_still_clarifies_mid_conversation(query, question):
     """
     The dangerous overlap: "send this to him" carries a referential word and has
     prior turns, so a naive follow-up rule claims it. But its missing recipient
     is not in any store — retrieval cannot help and asking is correct.
     """
-    assert route_after_init(with_history(
+    assert await route_after_init(with_history(
         user_input=query, needs_clarification=True, clarification_question=question,
     )) == "clarification"
 
 
-def test_an_informational_followup_is_still_retrieval_mid_conversation():
+async def test_an_informational_followup_is_still_retrieval_mid_conversation():
     """The counterpart: "tell me" is informational, so it must NOT clarify."""
-    assert route_after_init(with_history(
+    assert await route_after_init(with_history(
         user_input="Tell me more about that project.", needs_clarification=True,
     )) == "profile"
 
 
-def test_clarification_is_not_disabled_wholesale():
-    assert route_after_init(state(
+async def test_clarification_is_not_disabled_wholesale():
+    assert await route_after_init(state(
         user_input="Book it for Tuesday or Wednesday, whichever works",
         needs_clarification=True, clarification_question="Which day?",
     )) == "clarification"
 
 
-def test_errors_still_short_circuit_to_the_response_agent():
-    assert route_after_init(state(error="boom", needs_clarification=True)) == "response"
+async def test_errors_still_short_circuit_to_the_response_agent():
+    assert await route_after_init(state(error="boom", needs_clarification=True)) == "response"
 
 
-def test_ordinary_routing_is_untouched_when_nothing_needs_clarifying():
-    assert route_after_init(state(user_input="find me jobs", selected_agent="job")) == "job"
+async def test_ordinary_routing_is_untouched_when_nothing_needs_clarifying():
+    assert await route_after_init(state(user_input="find me jobs", selected_agent="job")) == "job"

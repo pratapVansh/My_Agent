@@ -40,7 +40,7 @@ class LiveKitTokenResponse(BaseModel):
     room_name: str
 
 
-# Room -> worker task. Process-local; see AUDIT_REPORT.md (M15) for the
+# Room -> worker task. Process-local; see docs/AUDIT_REPORT.md (M15) for the
 # shared-state requirement before running more than one instance.
 active_workers: Dict[str, asyncio.Task] = {}
 

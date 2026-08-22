@@ -3,13 +3,42 @@ Academic Agent - Handles academic and educational tasks.
 Returns a TaskEnvelope for structured coordination.
 """
 from typing import Dict, Any
-from datetime import datetime, date as date_cls, time as time_cls
+from datetime import datetime
 from app.agents.base_agent import BaseAgent
 from app.agents.state import make_envelope
 from app.auth.models import Scope
+from app.tools.contract import Effect
+from app.tools import time_tool
 from app.tools.timetable_tool import timetable_tool, TimetableInput
 from app.memory.memory_manager import memory_manager
 from app.domain.academic import academic_repository
+
+
+def _render_schedule(tool_results) -> "str | None":
+    """
+    The deterministic answer for a turn that read the timetable, or None.
+
+    Reads the *last* schedule result rather than the first: a loop that called
+    `get_schedule` twice — for "today and tomorrow" — should answer about what
+    it looked at most recently, and a first-call-wins rule would silently drop
+    the second half of the question. Turns that touched no schedule tool return
+    None and keep the model's text.
+    """
+    from app.tools import schedule_query
+
+    for result in reversed(list(tool_results)):
+        if getattr(result, "tool", "") not in ("get_schedule", "get_next_class"):
+            continue
+        payload = getattr(result, "raw", None)
+        if not isinstance(payload, dict):
+            # The contract wrapped a non-dict return. Nothing to render from,
+            # and inventing a schedule sentence here would be the exact failure
+            # this function exists to prevent.
+            continue
+        rendered = schedule_query.render_from_tool_result(payload)
+        if rendered:
+            return rendered
+    return None
 
 
 class AcademicAgent(BaseAgent):
@@ -28,6 +57,13 @@ class AcademicAgent(BaseAgent):
         base_system_prompt = """You are an academic assistant with full control over the user's schedule, attendance, and exams.
 
 Your capabilities:
+0. **get_schedule** — the user's actual classes for a day, range, subject or time.
+   This is THE tool for "what classes do I have tomorrow", "what's my schedule
+   on Friday", "when is Generative AI", "do I have a class at 10am".
+   **Pass the user's own word for the day** ("today", "tomorrow", "Friday") in
+   `when`. Never compute a date or a weekday yourself — the tool does that
+   against the real clock, and your arithmetic is not the source of truth.
+0b. **get_next_class** — the next class from right now. Takes no arguments.
 1. **class_suggestions** — show timetable with attendance risk flags (< 75% = high risk).
 2. **add_timetable_entry** — add a new class to the schedule via voice (e.g. "Add Physics Monday 9am to 11am Room 204").
 3. **mark_attendance** — record today's (or any date's) attendance for a subject.
@@ -69,19 +105,49 @@ Always confirm after storing data."""
             return None
 
         def _parse_date_str(val: str):
+            """
+            Resolve a date phrase against the assistant's configured timezone.
+
+            Every `date.today()` here used to be the *host's* date while
+            `time_tool` used the configured one. In a datacentre those are
+            different dates for several hours a day, so an attendance record
+            marked at 11pm local landed on the wrong day — the exact error
+            `time_tool`'s own docstring warns about. There is one clock now.
+            """
             if not val:
-                return date_cls.today()
+                return time_tool.today()
             val = val.strip().lower()
-            if val in ("today", "now"):
-                return date_cls.today()
+            relative = time_tool.resolve_relative_day(val)
+            if relative is not None:
+                return relative
             for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
                 try:
                     return datetime.strptime(val, fmt).date()
                 except Exception:
                     continue
-            return date_cls.today()
+            return time_tool.today()
 
         # ── Tool implementations ───────────────────────────────────────────
+
+        async def tool_get_schedule(tool_input: Dict[str, Any]):
+            """
+            The classes on a day, read from the stored timetable.
+
+            `when` is passed through verbatim — the user's own word. Every date
+            calculation happens inside the tool against the configured clock, so
+            the model is never asked what "tomorrow" means.
+            """
+            return await timetable_tool.get_schedule(
+                user_id=user_id,
+                when=str(tool_input.get("when") or "today"),
+                subject=(str(tool_input["subject"]).strip()
+                         if tool_input.get("subject") else None),
+                at_time=(str(tool_input["at_time"]).strip()
+                         if tool_input.get("at_time") else None),
+            )
+
+        async def tool_get_next_class(tool_input: Dict[str, Any]):
+            return await timetable_tool.get_next_class(user_id=user_id)
 
         async def tool_class_suggestions(tool_input: Dict[str, Any]):
             day_of_week = tool_input.get("day_of_week")
@@ -229,7 +295,7 @@ Always confirm after storing data."""
                 f"Upcoming exams:\n{exams_text}\n\n"
                 f"Class timetable:\n{timetable_text}\n\n"
                 f"Attendance risk (lower % = higher risk):\n{risk_text}\n\n"
-                f"Today: {date_cls.today().isoformat()}\n\n"
+                f"Today: {time_tool.today().isoformat()}\n\n"
                 f"Rules: Prioritise subjects with low attendance and near exams. "
                 f"Schedule 1–2 hour study blocks in free time slots. "
                 f"Output as a plain-text day-by-day schedule."
@@ -293,12 +359,38 @@ Always confirm after storing data."""
             }
 
         tools = {
+            "get_schedule": {
+                "description": (
+                    "THE tool for any question about which classes the user has. "
+                    "Pass the user's own words for the day in `when` — 'today', "
+                    "'tomorrow', 'Friday', 'this week', or a date like "
+                    "'2026-08-14'. Do NOT work out the date yourself; the tool "
+                    "resolves it. "
+                    "Args: when (str, default 'today'), subject (str, optional — "
+                    "filters to one subject), at_time (str, optional e.g. "
+                    "'10:00' or '10 am')."
+                ),
+                "callable": tool_get_schedule,
+                "effect": Effect.READ,
+                "scope": Scope.TIMETABLE_READ.value,
+            },
+            "get_next_class": {
+                "description": (
+                    "The user's next upcoming class, from the current time "
+                    "onwards. Use for 'what is my next class' / 'what do I have "
+                    "next'. Args: none — the tool reads the clock itself."
+                ),
+                "callable": tool_get_next_class,
+                "effect": Effect.READ,
+                "scope": Scope.TIMETABLE_READ.value,
+            },
             "class_suggestions": {
                 "description": (
                     "Show timetable with per-subject attendance risk flags. "
                     "Args: day_of_week (int 0–6, optional), low_attendance_threshold (float, default 75)."
                 ),
                 "callable": tool_class_suggestions,
+                "effect": Effect.READ,
                 "scope": Scope.TIMETABLE_READ.value,
             },
             "add_timetable_entry": {
@@ -308,6 +400,7 @@ Always confirm after storing data."""
                     "start_time (str e.g. '09:00'), end_time (str), location (str), instructor (str)."
                 ),
                 "callable": tool_add_timetable_entry,
+                "effect": Effect.LOCAL_WRITE,
                 "scope": Scope.TIMETABLE_WRITE.value,
             },
             "mark_attendance": {
@@ -316,11 +409,13 @@ Always confirm after storing data."""
                     "Args: subject (str), status (present|absent|late), date (str e.g. 'today' or '2024-03-15'), notes (str)."
                 ),
                 "callable": tool_mark_attendance,
+                "effect": Effect.LOCAL_WRITE,
                 "scope": Scope.ATTENDANCE_WRITE.value,
             },
             "get_attendance_summary": {
                 "description": "Show per-subject attendance percentage and risk level. Args: none.",
                 "callable": tool_get_attendance_summary,
+                "effect": Effect.READ,
                 "scope": Scope.ATTENDANCE_READ.value,
             },
             "add_exam": {
@@ -330,11 +425,13 @@ Always confirm after storing data."""
                     "start_time (str, optional), location (str), exam_type (exam|midterm|final|quiz|assignment), notes (str)."
                 ),
                 "callable": tool_add_exam,
+                "effect": Effect.LOCAL_WRITE,
                 "scope": Scope.TIMETABLE_WRITE.value,
             },
             "get_upcoming_exams": {
                 "description": "List all upcoming exams sorted by date. Args: none.",
                 "callable": tool_get_upcoming_exams,
+                "effect": Effect.READ,
                 "scope": Scope.TIMETABLE_READ.value,
             },
             "generate_study_schedule": {
@@ -343,6 +440,9 @@ Always confirm after storing data."""
                     "timetable, and attendance risk. Args: none."
                 ),
                 "callable": tool_generate_study_schedule,
+                # Reads the timetable and composes a plan; storing it is
+                # save_plan's job, not this one's.
+                "effect": Effect.READ,
                 "scope": Scope.TIMETABLE_READ.value,
             },
             "save_plan": {
@@ -352,6 +452,7 @@ Always confirm after storing data."""
                     "description (str, optional), priority (high|medium|low)."
                 ),
                 "callable": tool_save_plan,
+                "effect": Effect.LOCAL_WRITE,
                 "scope": Scope.TIMETABLE_WRITE.value,
             },
             "get_plans": {
@@ -361,6 +462,7 @@ Always confirm after storing data."""
                     "include_done (bool, default false)."
                 ),
                 "callable": tool_get_plans,
+                "effect": Effect.READ,
                 "scope": Scope.TIMETABLE_READ.value,
             },
             "mark_plan_done": {
@@ -369,6 +471,7 @@ Always confirm after storing data."""
                     "Args: plan_id (str — from get_plans response)."
                 ),
                 "callable": tool_mark_plan_done,
+                "effect": Effect.LOCAL_WRITE,
                 "scope": Scope.TIMETABLE_WRITE.value,
             },
         }
@@ -383,6 +486,23 @@ Always confirm after storing data."""
 
             final_answer = loop_result["final_answer"]
             tools_used = loop_result["tools_used"]
+
+            # ── The timetable answers for itself ──────────────────────────────
+            #
+            # When a schedule tool ran, the reply is rendered from the rows it
+            # returned rather than from the model's account of them. Same
+            # arrangement as a held action's preview: the model's version is not
+            # checked against the data, it is simply not the thing delivered.
+            #
+            # A timetable answer is a list of times with subjects attached, and
+            # every word of paraphrase drift is a class the user might turn up
+            # late to — or miss entirely. There is nothing here a model adds.
+            #
+            # `grounding` has already guaranteed that *a* schedule tool ran for
+            # a timetable question; this decides what the user reads when it did.
+            rendered = _render_schedule(loop_result.get("tool_results") or [])
+            if rendered is not None:
+                final_answer = rendered
 
             confidence = self._compute_confidence(
                 final_answer=final_answer,
@@ -405,6 +525,10 @@ Always confirm after storing data."""
             )
 
             state["task_result"] = envelope
+            # See job_agent: the loop computes this for every agent, and it is
+            # what separates "no classes today" from "the timetable store is
+            # unreachable".
+            state["answerability"] = loop_result.get("answerability") or ""
             state["agent_reasoning"] = (
                 f"Academic query processed. intent={intent}, "
                 f"iterations={loop_result['iterations']}, tools={tools_used}, "

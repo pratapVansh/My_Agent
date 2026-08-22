@@ -13,7 +13,7 @@ See docs/MEMORY_ARCHITECTURE.md §3.6.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, Optional, Sequence
 from uuid import UUID
 import math
 

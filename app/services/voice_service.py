@@ -12,7 +12,7 @@ from typing import Any, AsyncGenerator, Dict, Optional
 import asyncio
 
 import httpx
-from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
+from deepgram import DeepgramClient, DeepgramClientOptions, LiveOptions
 
 from app.config import settings
 

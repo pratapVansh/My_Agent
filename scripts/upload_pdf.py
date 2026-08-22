@@ -149,8 +149,8 @@ async def main():
         print(f"    python scripts/upload_pdf.py path/to/your/folder/ --user-id your_user_id")
         print()
         print("Examples:")
-        print(f"    python scripts/upload_pdf.py C:/Users/iamch/Documents/my_resume.pdf --user-id user_123")
-        print(f"    python scripts/upload_pdf.py C:/Users/iamch/Documents/my_pdfs/ --user-id user_123")
+        print(f"    python scripts/upload_pdf.py path/to/resume.pdf --user-id user_123")
+        print(f"    python scripts/upload_pdf.py path/to/pdf_folder/ --user-id user_123")
         print()
         sys.exit(1)
 

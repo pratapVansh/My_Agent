@@ -8,7 +8,9 @@ from typing import Dict, Any, Optional
 from app.agents import profile_intent as profile_intent_module
 from app.agents.base_agent import BaseAgent
 from app.agents.state import make_envelope
+from app.agents.confirmable_tools import build_forget_preference_tool
 from app.auth.models import Scope
+from app.tools.contract import Effect
 from app.memory import identity as identity_module
 from app.memory.long_term_memory_qdrant import long_term_memory_qdrant
 from app.memory.memory_manager import memory_manager
@@ -451,16 +453,6 @@ Rules:
             return {"success": True, "id": record_id, "key": key, "value": value,
                     "message": f"Saved: {key} = {value}"}
 
-        async def tool_forget_preference(tool_input: Dict[str, Any]):
-            """Delete a specific profile fact by key."""
-            key = str(tool_input.get("key", "")).strip().lower().replace(" ", "_")
-            if not key:
-                return {"success": False, "reason": "'key' is required."}
-            deleted = await memory_manager.forget_profile_fact(user_id=user_id, key=key)
-            if deleted:
-                return {"success": True, "message": f"Forgotten: {key}"}
-            return {"success": False, "message": f"No memory found for key '{key}'."}
-
         async def tool_list_my_memories(tool_input: Dict[str, Any]):
             """Return all stored profile facts for this user."""
             facts = await memory_manager.get_profile_facts(user_id=user_id)
@@ -477,6 +469,7 @@ Rules:
                     "question about the user's actual name. Args: none."
                 ),
                 "callable": tool_get_identity,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "recall_explicit_memory": {
@@ -487,6 +480,7 @@ Rules:
                     "the user's own name. Args: none."
                 ),
                 "callable": tool_recall_explicit_memory,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_current_datetime": {
@@ -497,6 +491,7 @@ Rules:
                     "date or time question from memory. Args: none."
                 ),
                 "callable": tool_get_current_datetime,
+                "effect": Effect.READ,
             },
             "get_profile_summary": {
                 "description": (
@@ -504,6 +499,7 @@ Rules:
                     "Use for 'summarize my experience', 'who am I', 'tell me about myself'. Args: none."
                 ),
                 "callable": tool_get_profile_summary,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_skills": {
@@ -512,6 +508,7 @@ Rules:
                     "Use for 'what skills do I have', 'what technologies do I know'. Args: limit (int, default 15)."
                 ),
                 "callable": tool_get_skills,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_projects": {
@@ -523,6 +520,7 @@ Rules:
                     "'voice assistant', so the most relevant project ranks first."
                 ),
                 "callable": tool_get_projects,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_resume": {
@@ -531,6 +529,7 @@ Rules:
                     "Use for 'show my resume', 'what's in my resume'. Args: none."
                 ),
                 "callable": tool_get_resume,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_experience": {
@@ -541,6 +540,7 @@ Rules:
                     "'what companies have I worked with'. Args: none."
                 ),
                 "callable": tool_get_experience,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_education": {
@@ -550,6 +550,7 @@ Rules:
                     "'what branch am I in', 'what degree am I pursuing'. Args: none."
                 ),
                 "callable": tool_get_education,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_achievements": {
@@ -559,6 +560,7 @@ Rules:
                     "have I won'. Args: none."
                 ),
                 "callable": tool_get_achievements,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "get_strengths": {
@@ -567,6 +569,7 @@ Rules:
                     "Use for 'what are my strengths', 'what am I good at', 'what are my strong points'. Args: none."
                 ),
                 "callable": tool_get_strengths,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_READ.value,
             },
             "remember_preference": {
@@ -577,17 +580,16 @@ Rules:
                     "source (str: explicit|inferred, default explicit), confidence (float 0–1, default 1.0)."
                 ),
                 "callable": tool_remember_preference,
+                # Writes to the user's own profile and is undone by
+                # forget_preference — reversible, so not confirmable.
+                "effect": Effect.LOCAL_WRITE,
                 "scope": Scope.PROFILE_WRITE.value,
             },
-            "forget_preference": {
-                "description": (
-                    "Delete a specific stored preference by key. "
-                    "Use when user says 'forget my preference for X', 'don't remember X'. "
-                    "Args: key (str)."
-                ),
-                "callable": tool_forget_preference,
-                "scope": Scope.PROFILE_WRITE.value,
-            },
+            # Built by the shared factory in `confirmable_tools`, so what this
+            # agent offers and what a stored action is reconstructed through
+            # cannot drift apart. Removes a stored fact with no undo — the only
+            # DESTRUCTIVE tool reachable from a conversation.
+            "forget_preference": build_forget_preference_tool(user_id),
             "list_my_memories": {
                 "description": (
                     "List all stored profile facts and preferences. "
@@ -595,6 +597,7 @@ Rules:
                     "Args: none."
                 ),
                 "callable": tool_list_my_memories,
+                "effect": Effect.READ,
                 "scope": Scope.PROFILE_WRITE.value,
             },
         }
@@ -678,7 +681,18 @@ Rules:
         sources = state.get("memory_sources") or []
         subject = state.get("followup_subject")
 
-        required = profile_intent_module.tools_for(legacy)
+        # What the turn is *required* to call, decided deterministically at the
+        # routing edge and checked afterwards by `app.agents.grounding`. Named
+        # here so the instruction the model receives and the rule it will be
+        # held to are the same list — telling it to call one tool and then
+        # enforcing another would be a trap rather than a directive.
+        #
+        # The legacy profile-intent mapping is the fallback: it covers the
+        # PROFILE_* shapes, while `required_tools` also covers the categories
+        # that have no legacy label (DOCUMENT_RESUME, EXPLICIT_MEMORY).
+        required = list(state.get("required_tools") or [])
+        if not required:
+            required = profile_intent_module.tools_for(legacy)
         if category == QueryCategory.EXPLICIT_MEMORY.value:
             required = ["recall_explicit_memory"]
 
@@ -695,8 +709,10 @@ Rules:
             lines.append(f"- Consult these sources in order: {', '.join(sources)}")
         if required:
             lines.append(
-                f"- Call {' then '.join(required)} FIRST, before saying anything "
-                f"about what you do or do not have."
+                f"- Call {' or '.join(required)} FIRST, before saying anything "
+                f"about what you do or do not have. This is not advice: if none "
+                f"of them runs, your answer is discarded and the user is told "
+                f"the lookup did not happen."
             )
         if subject:
             lines.append(
