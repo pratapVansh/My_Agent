@@ -31,6 +31,7 @@ from app.memory.memory_manager import memory_manager
 from app.memory import provenance
 from app.memory.sources import QueryCategory, sources_for
 from app.services import call_metrics
+from app.services import deadline as _deadline
 from app.services.debug_logger import log_step
 from app.services.llm_errors import LLMErrorKind, classify_llm_error
 from app.services.langsmith_service import traceable
@@ -157,12 +158,21 @@ async def parallel_init_node(state: AgentState) -> AgentState:
     category = _precategorise(state)
 
     # ── Is the planner load-bearing on this turn? ────────────────────────────
-    # `_precategorise` has already run and is deterministic, so for a handful
-    # of categories the answer is known before the model is asked: the route is
-    # owned by the category and terminates without a specialist, which means
-    # every field the planner produces is discarded by `agent_for`. Asking
-    # anyway cost a full 120B call to answer "what time is it" from a clock.
-    planner_needed = query_intent.planner_is_load_bearing(category)
+    # `_precategorise` has already run and is deterministic, so for a good many
+    # turns the answer is known before the model is asked: the route is owned
+    # by the category, the required lookup is named, and the sentence asks for
+    # one thing — which means every field the planner produces is discarded by
+    # `agent_for` or duplicated by `required_tools`. Asking anyway cost a full
+    # 120B call to answer "what time is it" from a clock, and another ~3,500
+    # tokens of an 8,000 TPM budget to answer "what is my name" from a lookup
+    # that had already been decided on.
+    #
+    # The utterance is passed as well as the category, because the one thing
+    # the planner uniquely provides is a multi-step plan and only the text can
+    # say whether this turn has a second step. See `planner_is_load_bearing`.
+    planner_needed = query_intent.planner_is_load_bearing(
+        category, text=user_input, history=_conversation_turns(state),
+    )
 
     try:
         async def memory_task():
@@ -193,11 +203,28 @@ async def parallel_init_node(state: AgentState) -> AgentState:
 
         async def planner_task():
             if not planner_needed:
-                logger.debug(
-                    "Skipping the planner for category %s — its route is already "
-                    "decided and its output would be discarded.", category,
+                logger.info(
+                    "Skipping the planner for category %s — the route is already "
+                    "decided, the required lookup is already named, and its "
+                    "output would be discarded.", category,
                 )
-                return {}
+                # The fields the graph reads afterwards, filled deterministically
+                # rather than left absent. `detected_intent` reaches the
+                # specialist's prompt and the episode record, so an empty one
+                # would be a visible regression in what the logs say happened;
+                # the category is a better description of the goal than the
+                # planner's paraphrase of it anyway.
+                #
+                # `needs_clarification` is False by construction: these are the
+                # turns whose answer is a named lookup, and there is no missing
+                # parameter to ask the user about. "What is my name" is a
+                # retrieval task, never an ambiguous one.
+                return {
+                    "detected_intent": user_input,
+                    "planner_confidence": 1.0,
+                    "needs_clarification": False,
+                    "clarification_question": "",
+                }
             try:
                 with call_metrics.phase("planner"):
                     return await planner_agent.execute(state)
@@ -1460,10 +1487,19 @@ async def run_workflow(
     metrics_scope = call_metrics.turn(initial_state["request_id"])
     turn_metrics = metrics_scope.__enter__()
     try:
-        final_state = await asyncio.wait_for(
-            multi_agent_workflow.ainvoke(initial_state),
-            timeout=deadline,
-        )
+        # The same number the `wait_for` below enforces, published so the layers
+        # underneath can read it. They all used to wait on their own private
+        # ceilings — up to 20 s for Groq token budget, up to 15 s honouring a
+        # Retry-After — and two of those in sequence exceed a spoken turn's
+        # whole 35 s budget. The turn then expired *while sleeping*, having
+        # produced nothing, and the fix looked like "raise the timeout" when it
+        # was really "stop sleeping past the point of no return".
+        # See `app.services.deadline`.
+        with _deadline.budget(deadline):
+            final_state = await asyncio.wait_for(
+                multi_agent_workflow.ainvoke(initial_state),
+                timeout=deadline,
+            )
     except asyncio.TimeoutError:
         logger.error(
             "Workflow timed out after %.0fs (user=%s, request_id=%s)",

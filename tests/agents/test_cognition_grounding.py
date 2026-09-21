@@ -204,6 +204,19 @@ async def test_a_skipped_tool_cannot_produce_a_personal_fact(
 
     The memory prompt is deliberately populated with a plausible résumé line, so
     this proves the rule is "the tool ran", not "there was nothing to copy".
+
+    What is asserted changed with `app.agents.prefetch`, and the distinction
+    matters. This test used to read `evidence == []` as "no tool ran", which was
+    a fair proxy while the *model* was the only thing that could call one. It no
+    longer is: the required lookup is now performed before the model is asked,
+    so a turn where the model invents an answer may legitimately carry evidence
+    the model did not fetch.
+
+    The invariant the audit was actually about is unchanged and is now asserted
+    directly — the model's sentence is replaced, and it is replaced because the
+    lookup did not support it. `grounding` on the result is the verdict
+    `grounding.enforce` reached, and `may_state_a_fact` being false is exactly
+    "the answer the user sees is not the one the model wrote".
     """
     result = await _turn(monkeypatch, utterance, {
         "planner": [_plan(agent)],
@@ -215,7 +228,9 @@ async def test_a_skipped_tool_cannot_produce_a_personal_fact(
     assert "9.1" not in answer, utterance
     assert "Google" not in answer, utterance
     assert "Kubernetes" not in answer, utterance
-    assert result["task_result"]["evidence"] == []
+
+    verdict = grounding.Grounding(result["grounding"])
+    assert not verdict.may_state_a_fact, (utterance, verdict)
 
 
 async def test_what_do_you_know_about_me_reaches_the_memory_tool():

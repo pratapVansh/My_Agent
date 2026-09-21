@@ -10,15 +10,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from app.config import settings
+from app.config import is_placeholder, settings
 from app.memory.memory_manager import memory_manager
 from app.domain.jobs import jobs_repository
 from app.memory.short_term_memory import short_term_memory
 from app.services.langsmith_service import traceable
 
 logger = logging.getLogger(__name__)
+
+# Tavily's own default is 60s. A job search is one leg of a turn that already
+# has a workflow deadline over it, so waiting a full minute on a hung provider
+# spends the whole budget and returns nothing either way.
+_TAVILY_TIMEOUT_SECONDS = 20
+
+NO_KEY_MESSAGE = (
+    "Job search is unavailable: Set TAVILY_API_KEY in .env "
+    "(get a key at https://tavily.com). No search was performed."
+)
 
 
 class JobSearchTool:
@@ -38,7 +48,23 @@ class JobSearchTool:
 
         Returns:
             Dict with results, skills used, and seen_count (deduplicated)
+
+            On failure: {"success": False, "error": "<reason>"}, which the tool
+            contract reads as ERROR and the agent reports as TOOL_ERROR. That
+            distinction is the point — an unreachable job board must never be
+            delivered as "there are no jobs matching that".
         """
+        # Checked before anything else runs. An unusable key makes the rest of
+        # this method pointless work — a Cohere embed and several Qdrant
+        # queries — and the honest answer is the same either way.
+        if is_placeholder(settings.tavily_api_key):
+            logger.error(
+                "Job search refused: TAVILY_API_KEY is %s",
+                "not set" if not (settings.tavily_api_key or "").strip()
+                else "still the .env.example placeholder",
+            )
+            return {"tool": "job_search", "success": False, "error": NO_KEY_MESSAGE}
+
         # Fetch user skills from Qdrant
         user_skills = await self._fetch_user_skills(user_id)
 
@@ -49,7 +75,16 @@ class JobSearchTool:
         seen_urls = await jobs_repository.get_bookmarked_urls(user_id)
 
         # Search Tavily
-        raw_results = await self._search_with_tavily(search_query=search_query, max_results=max_results * 2)
+        raw_results, search_error = await self._search_with_tavily(
+            search_query=search_query, max_results=max_results * 2
+        )
+        if search_error:
+            return {
+                "tool": "job_search",
+                "success": False,
+                "error": search_error,
+                "query": search_query,
+            }
 
         # Filter: min score + must look like a job + not already seen
         filtered = self._filter_results(raw_results, min_score=min_score, seen_urls=seen_urls)
@@ -135,25 +170,81 @@ class JobSearchTool:
             base = f"{base} {top_skills}"
         return f"{base} site:linkedin.com OR site:indeed.com OR site:wellfound.com"
 
-    async def _search_with_tavily(self, search_query: str, max_results: int) -> List[Dict[str, Any]]:
-        if not settings.tavily_api_key:
-            logger.warning("TAVILY_API_KEY is not configured — job search returns no results")
-            return []
+    async def _search_with_tavily(
+        self, search_query: str, max_results: int
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        Call Tavily. Returns (results, error) — exactly one of them is meaningful.
+
+        The two-value return is what keeps "the board had nothing" apart from
+        "the board was unreachable". Returning `[]` for both, as this used to,
+        collapses them into one sentence the user reads as fact: *there are no
+        such jobs*. That is a claim about the world made from a network
+        failure, which is the one thing this codebase is built not to do.
+
+        Every branch names a cause the user can act on. A rate limit is not an
+        expired key is not a timeout, and telling someone "search failed" when
+        the real answer is "your free tier is used up" costs them an afternoon.
+        """
+        from tavily import AsyncTavilyClient
+        from tavily.errors import (
+            InvalidAPIKeyError,
+            MissingAPIKeyError,
+            UsageLimitExceededError,
+        )
+
         try:
-            from tavily import AsyncTavilyClient
             client = AsyncTavilyClient(api_key=settings.tavily_api_key)
             response = await client.search(
                 query=search_query,
                 max_results=max_results,
                 search_depth="advanced",
                 include_raw_content=False,
+                timeout=_TAVILY_TIMEOUT_SECONDS,
             )
-            return response.get("results", [])
-        except Exception as e:
-            # Degrade gracefully for the user, but make the cause visible:
-            # an expired key otherwise looks identical to "no jobs found".
-            logger.error("Tavily search failed: %s", e, exc_info=True)
-            return []
+            results = response.get("results") or []
+            logger.info(
+                "Tavily returned %d result(s) for query=%r", len(results), search_query[:120]
+            )
+            return results, None
+
+        except (MissingAPIKeyError, InvalidAPIKeyError):
+            # The key is present but the provider rejected it. Distinct from
+            # the placeholder case caught in `search_jobs` — this one means the
+            # value was typed in and is wrong, revoked, or expired.
+            logger.error("Tavily rejected the API key")
+            return [], (
+                "Job search is unavailable: Tavily rejected TAVILY_API_KEY. "
+                "Check that the key in .env is current."
+            )
+
+        except UsageLimitExceededError as exc:
+            logger.error("Tavily usage limit hit: %s", exc)
+            return [], (
+                "Job search is rate limited: the Tavily account has hit its "
+                "usage limit. Try again later."
+            )
+
+        except asyncio.TimeoutError:
+            logger.error("Tavily search timed out after %ss", _TAVILY_TIMEOUT_SECONDS)
+            return [], (
+                f"Job search timed out after {_TAVILY_TIMEOUT_SECONDS}s. "
+                "Tavily did not respond; nothing was searched."
+            )
+
+        except Exception as exc:
+            # httpx raises its own timeout and transport errors, which are not
+            # asyncio.TimeoutError. Named rather than swallowed so a connection
+            # problem does not read as an empty job board.
+            name = type(exc).__name__
+            if "Timeout" in name:
+                logger.error("Tavily search timed out: %s", exc)
+                return [], (
+                    f"Job search timed out after {_TAVILY_TIMEOUT_SECONDS}s. "
+                    "Tavily did not respond; nothing was searched."
+                )
+            logger.error("Tavily search failed: %s", exc, exc_info=True)
+            return [], f"Job search failed: could not reach Tavily ({name})."
 
     def _filter_results(
         self,

@@ -17,6 +17,15 @@ import { Identity, ensureSession, hasScope, logout } from "@/lib/auth";
 import { RemoteTrack, Room, RoomEvent, Track } from "livekit-client";
 import { ListeningIndicator, SpeakingIndicator, ThinkingIndicator } from "./StatusIndicator";
 import { CloseChatModal, ClearChatModal } from "./ChatModals";
+import { MessageList } from "./MessageList";
+import { MemoryPanel } from "./MemoryPanel";
+import {
+  AGENT_LABELS,
+  createConversationSessionId,
+  loadStoredConversationId,
+  storeConversationId,
+  uid,
+} from "@/lib/conversation";
 
 type ChatShellProps = {
   mode: ChatMode;
@@ -24,66 +33,6 @@ type ChatShellProps = {
   subtitle: string;
 };
 
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-const AGENT_LABELS: Record<string, string> = {
-  job: "Job Agent",
-  email: "Email Agent",
-  academic: "Research Agent",
-  profile: "Profile Agent",
-  planner: "Planner",
-  response: "Formatter",
-  clarification: "Clarifying",
-};
-
-function createConversationSessionId() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return `session_${crypto.randomUUID()}`;
-  }
-  return `session_${uid()}_${Date.now()}`;
-}
-
-// The conversation id is persisted so a refresh, a browser restart, or a
-// navigation away and back resumes the same thread. Previously it was minted
-// fresh on every mount and never stored, so the server — which scopes chat
-// history by exactly this id — saw each page load as a brand-new conversation
-// and the thread was silently lost.
-//
-// Scoped per mode so the owner and recruiter views keep separate threads.
-function conversationStorageKey(mode: ChatMode) {
-  return `my_agent.conversation_id.${mode}`;
-}
-
-function loadStoredConversationId(mode: ChatMode): string | null {
-  if (typeof window === "undefined") return null;
-  try {
-    return window.localStorage.getItem(conversationStorageKey(mode));
-  } catch {
-    // Private browsing and some embedded webviews deny storage access. A
-    // non-resumable session is a degraded experience, not a broken one.
-    return null;
-  }
-}
-
-function storeConversationId(mode: ChatMode, conversationId: string) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(conversationStorageKey(mode), conversationId);
-  } catch {
-    /* storage unavailable — continue without persistence */
-  }
-}
-
-function clearStoredConversationId(mode: ChatMode) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.removeItem(conversationStorageKey(mode));
-  } catch {
-    /* storage unavailable */
-  }
-}
 
 export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
   const router = useRouter();
@@ -927,124 +876,13 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
             </div>
           )}
 
-          {/* Messages */}
-          <div className="flex-1 overflow-y-auto p-6 space-y-4">
-            {messages.length === 0 && (
-              <div className="flex flex-col items-center justify-center h-full text-center space-y-4">
-                <div className={`w-20 h-20 rounded-3xl bg-gradient-to-br ${colors.gradient} flex items-center justify-center shadow-xl`}>
-                  <svg className="w-10 h-10 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                  </svg>
-                </div>
-                <div>
-                  <h2 className="text-2xl font-bold text-white mb-2">Start a Conversation</h2>
-                  <p className="text-white/60 max-w-md">
-                    {mode === "user"
-                      ? "Tap the microphone button below and speak. Your voice assistant is ready to help!"
-                      : "Type a message or use voice input to begin chatting."}
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {messages.map((msg, idx) => (
-              <article
-                key={msg.id}
-                className={`flex items-start gap-3 animate-slide-up ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-              >
-                {msg.role === "assistant" && (
-                  <div className={`w-10 h-10 rounded-full bg-gradient-to-br ${colors.gradient} flex items-center justify-center flex-shrink-0 shadow-lg`}>
-                    <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                    </svg>
-                  </div>
-                )}
-
-                <div className={`max-w-[75%] ${msg.role === "user" ? "order-first" : ""}`}>
-                  {/* Agent label badge */}
-                  {msg.role === "assistant" && msg.agentName && (
-                    <div className="mb-1 flex items-center gap-1.5">
-                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-gradient-to-r ${colors.gradient} text-white/80`}>
-                        <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                        </svg>
-                        {AGENT_LABELS[msg.agentName] ?? msg.agentName}
-                      </span>
-                    </div>
-                  )}
-
-                  <div
-                    className={`rounded-2xl px-5 py-3 ${
-                      msg.role === "user"
-                        ? `bg-gradient-to-br ${colors.gradient} text-white shadow-lg`
-                        : "glass-strong text-white"
-                    }`}
-                  >
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed">{msg.text}</p>
-                  </div>
-
-                  {/* Rich job cards */}
-                  {msg.role === "assistant" && msg.jobResults && msg.jobResults.length > 0 && (
-                    <div className="mt-2 space-y-2">
-                      {msg.jobResults.map((job, i) => (
-                        <div key={i} className="glass rounded-xl p-3 border border-white/10">
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="flex-1 min-w-0">
-                              <h4 className="text-sm font-semibold text-white truncate">{job.title}</h4>
-                              {job.snippet && (
-                                <p className="text-xs text-white/55 mt-1 line-clamp-2">{job.snippet}</p>
-                              )}
-                            </div>
-                            {job.rank_score !== undefined && (
-                              <span className="text-[10px] text-white/40 flex-shrink-0 mt-0.5">
-                                {Math.round(job.rank_score * 100)}% match
-                              </span>
-                            )}
-                          </div>
-                          {job.url && (
-                            <a
-                              href={job.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className={`mt-2 inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-gradient-to-r ${colors.gradient} text-white text-xs font-medium hover:opacity-90 transition-opacity`}
-                            >
-                              Apply →
-                            </a>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {msg.role === "user" && (
-                  <div className={`w-10 h-10 rounded-full bg-gradient-to-br ${colors.accentGradient} flex items-center justify-center flex-shrink-0 shadow-lg`}>
-                    <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                    </svg>
-                  </div>
-                )}
-              </article>
-            ))}
-
-            {/* Thinking state lives in the status bar above: the mic now stays
-                open across a turn, so a duplicate indicator keyed on
-                !isListening could never render anyway. */}
-            {partialAssistantMessage && (
-              <article className={`flex items-start gap-4 flex-row`}>
-                <div className={`w-10 h-10 rounded-full bg-gradient-to-br ${colors.gradient} flex items-center justify-center flex-shrink-0 shadow-lg`}>
-                  <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                  </svg>
-                </div>
-                <div className={`flex-1 glass-strong rounded-2xl p-4 max-w-[85%] border border-white/20 shadow-xl prose prose-invert`}>
-                  <p className="text-white text-[15px] leading-relaxed m-0">{partialAssistantMessage}</p>
-                </div>
-              </article>
-            )}
-
-            <div ref={messagesEndRef} />
-          </div>
+          <MessageList
+            messages={messages}
+            partialAssistantMessage={partialAssistantMessage}
+            messagesEndRef={messagesEndRef}
+            mode={mode}
+            colors={colors}
+          />
 
           {/* Input footer */}
           <footer className={`${colors.surface} px-6 py-4 border-t border-white/10`}>
@@ -1132,83 +970,15 @@ export default function ChatShell({ mode, title, subtitle }: ChatShellProps) {
 
       </div>
 
-      {/* Memory Panel */}
-      {showMemoryPanel && (
-        <div className="fixed inset-0 z-50 flex justify-end" onClick={() => setShowMemoryPanel(false)}>
-          <div
-            className="relative h-full w-80 glass-strong shadow-2xl border-l border-white/10 flex flex-col"
-            onClick={e => e.stopPropagation()}
-          >
-            {/* Panel header */}
-            <div className={`px-5 py-4 border-b border-white/10 flex items-center justify-between ${colors.surface}`}>
-              <div className="flex items-center gap-2">
-                <svg className={`w-5 h-5 ${colors.text}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                </svg>
-                <span className="text-white font-semibold text-sm">Memory</span>
-              </div>
-              <button
-                onClick={() => setShowMemoryPanel(false)}
-                className="p-1.5 rounded-lg glass hover:glass-strong transition-all text-white/60 hover:text-white"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-
-            {/* Facts list */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-2">
-              {memoryLoading && (
-                <div className="flex items-center justify-center py-8">
-                  <svg className="w-5 h-5 animate-spin text-white/40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                </div>
-              )}
-
-              {!memoryLoading && profileFacts.length === 0 && (
-                <div className="text-center py-8">
-                  <p className="text-white/40 text-sm">No profile facts saved yet.</p>
-                  <p className="text-white/30 text-xs mt-1">The AI learns from your conversations.</p>
-                </div>
-              )}
-
-              {!memoryLoading && profileFacts.map((fact) => (
-                <div key={fact.key} className="glass rounded-xl p-3 flex items-start justify-between gap-2 group">
-                  <div className="flex-1 min-w-0">
-                    <p className="text-[10px] text-white/40 uppercase tracking-wide font-medium">{fact.key.replace(/_/g, " ")}</p>
-                    <p className="text-sm text-white mt-0.5 break-words">{fact.value}</p>
-                    {fact.source && (
-                      <p className="text-[10px] text-white/30 mt-1">{fact.source}</p>
-                    )}
-                  </div>
-                  <button
-                    onClick={() => forgetFact(fact.key)}
-                    className="flex-shrink-0 p-1.5 rounded-lg text-white/20 hover:text-red-400 hover:bg-red-400/10 transition-all opacity-0 group-hover:opacity-100"
-                    title="Forget this"
-                  >
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                    </svg>
-                  </button>
-                </div>
-              ))}
-            </div>
-
-            {/* Refresh button */}
-            <div className={`px-4 py-3 border-t border-white/10 ${colors.surface}`}>
-              <button
-                onClick={() => void loadProfileFacts()}
-                disabled={memoryLoading}
-                className="w-full py-2 rounded-xl glass hover:glass-strong transition-all text-white/60 hover:text-white text-xs disabled:opacity-50"
-              >
-                Refresh
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <MemoryPanel
+        showMemoryPanel={showMemoryPanel}
+        setShowMemoryPanel={setShowMemoryPanel}
+        profileFacts={profileFacts}
+        memoryLoading={memoryLoading}
+        forgetFact={forgetFact}
+        loadProfileFacts={loadProfileFacts}
+        colors={colors}
+      />
 
       {/* Modals */}
       <CloseChatModal

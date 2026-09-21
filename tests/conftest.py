@@ -73,3 +73,61 @@ def pending_store():
     finally:
         store.reset()
         action_gateway.use_pending_store(previous)
+
+
+class SMTPContactedInTests(BaseException):
+    """
+    A test opened a real SMTP connection. See `_no_real_smtp`.
+
+    Deliberately a `BaseException`. `EmailSenderService.send_email` ends in a
+    bare `except Exception`, which would otherwise catch this and turn a test
+    that reached a mail server into a quiet `{"success": False}` — the failure
+    would be contained but invisible, which is how the original bug survived.
+    Inheriting from `BaseException` puts it past every ordinary handler in the
+    application, so the test fails loudly and names the cause.
+    """
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_real_smtp():
+    """
+    Make the suite's offline guarantee structural rather than a convention.
+
+    Every email test stubs the send — at `_send_sync`, at the tool callable, or
+    through `register_confirmable`. Each of those is a stub a test has to
+    remember, and one test forgot: `test_a_token_is_consumed_even_when_execution
+    _fails` passed a failing callable in a spec, but the gateway rebuilds the
+    callable from the tool *name*, so the **real** `send_email` ran. With
+    placeholder credentials the real send returned an error and the assertion
+    held for the wrong reason. Once `.env` held working credentials the same
+    test sent live mail to `a@b.com` and then failed.
+
+    So the guarantee is enforced one layer below every one of those doubles, at
+    the socket boundary itself. Nothing in the suite constructs `smtplib.SMTP`,
+    so replacing it costs nothing and cannot mask a stub that is working; it
+    only fires for a path that would otherwise have reached a mail server.
+
+    Session-scoped and autouse: a guard a test can opt out of is not a guard.
+    """
+    import smtplib
+
+    def _refuse(kind):
+        def _blocked(*args, **kwargs):
+            host = args[0] if args else kwargs.get("host", "?")
+            raise SMTPContactedInTests(
+                f"This test tried to open a real SMTP connection "
+                f"({kind} to {host!r}). The suite runs offline.\n"
+                f"Stub the send instead — `_send_sync` for the service, or "
+                f"`tests.support.register_confirmable` when the gateway will "
+                f"resolve `send_email` by name."
+            )
+        return _blocked
+
+    originals = {name: getattr(smtplib, name) for name in ("SMTP", "SMTP_SSL")}
+    for name in originals:
+        setattr(smtplib, name, _refuse(name))
+    try:
+        yield
+    finally:
+        for name, value in originals.items():
+            setattr(smtplib, name, value)

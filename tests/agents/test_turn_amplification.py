@@ -155,15 +155,66 @@ def test_a_provenance_question_does_not_need_the_planner():
         "SOMETHING_UNRECOGNISED",
     ],
 )
-def test_everything_else_keeps_the_planner(category):
+def test_a_category_alone_is_not_enough_to_skip_the_planner(category):
     """
-    The skip set is deliberately narrow.
+    Called with a category and nothing else, only the narrow set may skip.
 
-    A category that still runs a specialist can still carry a genuine
-    multi-step plan, and an unrecognised category falls through to
-    planner-driven routing — so both must answer True.
+    The second rule needs the utterance — it turns on whether the sentence asks
+    for one thing — so a caller that supplies no text must get the conservative
+    answer. This is also the backwards-compatibility guarantee for every
+    existing caller of the one-argument form.
     """
     assert query_intent.planner_is_load_bearing(category)
+
+
+@pytest.mark.parametrize("text", [
+    "what is my name",
+    "what is my CGPA",
+    "what are my skills",
+    "find me machine learning jobs",
+    "what classes do I have tomorrow",
+])
+def test_a_single_lookup_asked_for_once_does_not_need_the_planner(text):
+    """
+    The turn is fully determined before the model is asked anything.
+
+    Three conditions hold together for each of these: `agent_for` returns the
+    same specialist whatever the planner might say, `grounding.required_tools`
+    names what the answer must come from, and the sentence contains one
+    request. Nothing the planner could produce is read — so producing it costs
+    ~3,500 tokens of an 8,000 TPM budget for output that is thrown away.
+    """
+    category = query_intent.classify(text).category.value
+    assert not query_intent.planner_is_load_bearing(category, text=text), text
+
+
+@pytest.mark.parametrize("text", [
+    # Compound: the second clause is a second task, and a multi-step plan is
+    # the one thing only the planner produces.
+    "check my attendance and email my professor",
+    "what are my projects then draft a cover letter",
+    # No required tool: nothing names what this turn must call, so the
+    # planner's routing is still the decision.
+    "hello there",
+    "explain how transformers work",
+    # A conversation follow-up — answered from context, not from a lookup.
+    "what did I just tell you",
+])
+def test_anything_less_determined_still_runs_the_planner(text):
+    category = query_intent.classify(text).category.value
+    assert query_intent.planner_is_load_bearing(category, text=text), text
+
+
+def test_a_list_is_not_a_plan():
+    """
+    "and" alone must not be read as a second step.
+
+    Requiring a conjunction *and* a task verb is what keeps "my skills and
+    projects" — one lookup, two nouns — from paying for a planner call it has
+    no use for.
+    """
+    assert not query_intent.looks_compound("what are my skills and projects")
+    assert query_intent.looks_compound("what are my skills and email them to me")
 
 
 async def test_the_planner_is_skipped_for_a_clock_question(monkeypatch):
@@ -189,12 +240,53 @@ async def test_the_planner_is_skipped_for_a_clock_question(monkeypatch):
     assert state["route"] == "temporal"
 
 
-async def test_the_planner_still_runs_for_an_ordinary_question(monkeypatch):
+async def test_the_planner_is_skipped_for_a_settled_personal_question(monkeypatch):
+    """
+    "What is my name" reached the planner, and every field it produced was
+    discarded: `agent_for` sends a personal question to profile whatever the
+    planner concluded, and `required_tools` already named `get_identity`.
+
+    The skip has to leave the state downstream reads intact, which is why the
+    route is asserted alongside the call count — a cheaper turn that routes
+    somewhere else is not a cheaper turn, it is a broken one.
+    """
     planner_calls = {"n": 0}
 
     async def counted(state):
         planner_calls["n"] += 1
-        state["selected_agent"] = "job"
+        return state
+
+    async def _memory(**kwargs):
+        return {}, "some memory"
+
+    monkeypatch.setattr(workflow.planner_agent, "execute", counted)
+    monkeypatch.setattr(workflow.memory_manager, "build_memory_prompt", _memory)
+    monkeypatch.setattr(
+        workflow.memory_manager, "on_user_input", _noop_on_user_input
+    )
+
+    state = _workflow_state("what is my name")
+    await parallel_init_node(state)
+
+    assert planner_calls["n"] == 0
+    assert state["route"] == "profile"
+    assert state["required_tools"] == ["get_identity", "get_profile_summary"]
+    # Nothing downstream may find these missing just because nobody was asked.
+    assert state["needs_clarification"] is False
+    assert state["detected_intent"] == "what is my name"
+
+
+async def test_the_planner_still_runs_for_a_compound_request(monkeypatch):
+    """
+    The planner's one irreplaceable output is a multi-step plan, and a compound
+    sentence is where one comes from. Skipping here would not save a call, it
+    would silently drop half of what the user asked for.
+    """
+    planner_calls = {"n": 0}
+
+    async def counted(state):
+        planner_calls["n"] += 1
+        state["selected_agent"] = "academic"
         state["execution_plan"] = []
         return state
 
@@ -207,7 +299,9 @@ async def test_the_planner_still_runs_for_an_ordinary_question(monkeypatch):
         workflow.memory_manager, "on_user_input", _noop_on_user_input
     )
 
-    await parallel_init_node(_workflow_state("find me a machine learning job"))
+    await parallel_init_node(
+        _workflow_state("check my attendance and email my professor")
+    )
 
     assert planner_calls["n"] == 1
 

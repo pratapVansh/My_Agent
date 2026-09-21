@@ -222,6 +222,28 @@ async def resolve(state: Dict[str, Any]) -> ConfirmationResult:
         return ConfirmationResult(_AMBIGUOUS_REPLY, intent)
 
     if len(pending) > 1:
+        # One action the model asked for twice is not a choice. `content_hash`
+        # covers tool, arguments and owner, so identical hashes are the *same*
+        # send held twice — observed live, where the model emitted `send_email`
+        # twice in one turn and both holds were stored.
+        #
+        # Prompting for that was a dead end rather than a safeguard: the reply
+        # that resolves it is a token the user has no way to express, so "yes"
+        # re-listed the same two actions forever and neither could ever be sent
+        # or cancelled. Collapsing to one is what the user approved — the extras
+        # are cancelled, not left to expire, so nothing can be replayed later.
+        distinct = {action.content_hash for action in pending}
+        if len(distinct) == 1:
+            duplicates = pending[1:]
+            pending = pending[:1]
+            logger.info(
+                "Collapsing %d duplicate hold(s) of %s: identical content hash %s",
+                len(duplicates), pending[0].tool, pending[0].content_hash[:12],
+            )
+            for extra in duplicates:
+                await action_gateway.cancel(handle=extra.handle, owner_id=owner_id)
+
+    if len(pending) > 1:
         # Never guess which one. Approving the wrong irreversible action is
         # exactly as bad as approving one nobody asked for.
         lines = [

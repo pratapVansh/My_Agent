@@ -172,7 +172,12 @@ def test_every_registered_tool_in_the_repository_declares_an_effect():
     import pathlib
     import re
 
-    root = pathlib.Path(__file__).resolve().parent.parent / "app" / "agents"
+    # tests/tools/<this file> -> repo root. Anchored on the repo marker rather
+    # than a fixed number of parents, so moving this file cannot silently
+    # point the scan at a directory that does not exist.
+    here = pathlib.Path(__file__).resolve()
+    repo = next(p for p in here.parents if (p / "app" / "agents").is_dir())
+    root = repo / "app" / "agents"
     undeclared = []
     total = 0
     for name in ("profile_agent", "job_agent", "email_agent", "academic_agent"):

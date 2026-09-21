@@ -10,9 +10,10 @@ from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from app.config import settings
+from app.config import is_placeholder, settings
 
 logger = logging.getLogger(__name__)
+from app.services.email_sender_service import smtp_config_error
 from app.services.groq_service import groq_service
 from app.services.cohere_service import cohere_service
 from app.services.qdrant_service import qdrant_service
@@ -77,7 +78,15 @@ async def lifespan(app: FastAPI):
             settings.postgres_host, settings.postgres_port,
         )
     except Exception as e:
-        logger.warning("Memory initialization failed: %s", e)
+        # repr() plus the traceback, not str(e): the exceptions that land here
+        # are connection errors, and several of them (asyncpg's, httpx's)
+        # stringify to the empty string. "Memory initialization failed: " with
+        # nothing after it was the actual log line, which told nobody anything.
+        logger.warning(
+            "Memory initialization failed: %r — the app will run, but memory "
+            "reads and writes will not work until this is fixed.",
+            e, exc_info=True,
+        )
 
     # Verify API connections
     is_healthy = await groq_service.health_check()
@@ -87,7 +96,43 @@ async def lifespan(app: FastAPI):
     logger.info("Cohere API: %s", "OK" if cohere_healthy else "DEGRADED")
 
     qdrant_healthy = await qdrant_service.health_check()
-    logger.info("Qdrant: %s", "OK" if qdrant_healthy else "DEGRADED")
+    if qdrant_healthy:
+        logger.info("Qdrant: OK")
+    else:
+        # Not fatal — the app still answers timetable, schedule and temporal
+        # questions from Postgres, and refuses honestly for the rest. But every
+        # memory-backed answer degrades silently from here, and a one-word
+        # "DEGRADED" in a wall of startup lines is not something anyone sees.
+        logger.error(
+            "\n"
+            "  ┌──────────────────────────────────────────────────────────────┐\n"
+            "  │  QDRANT IS UNREACHABLE — vector memory is OFF                │\n"
+            "  └──────────────────────────────────────────────────────────────┘\n"
+            "  url: %s\n"
+            "  Résumé, skills, projects and conversational recall will return\n"
+            "  nothing. The assistant will say it has no record rather than\n"
+            "  guess, so answers stay honest — but they will be much worse.\n"
+            "  Check QDRANT_URL and QDRANT_API_KEY in .env, or that your local\n"
+            "  Qdrant is running.",
+            settings.qdrant_url,
+        )
+
+    # Optional capabilities — reported at startup so an unfilled .env is found
+    # here rather than halfway through the turn that needed it.
+    if is_placeholder(settings.tavily_api_key):
+        logger.warning(
+            "Job search disabled — TAVILY_API_KEY is not set in .env. "
+            "Job queries will refuse rather than return an empty list."
+        )
+    else:
+        logger.info("Job search enabled (Tavily)")
+
+    smtp_problem = smtp_config_error()
+    if smtp_problem:
+        logger.warning("Email sending disabled — %s", smtp_problem)
+    else:
+        logger.info("Email sending enabled (SMTP %s as %s)",
+                    settings.smtp_host, settings.smtp_email)
 
     if settings.is_streaming_stt_available:
         logger.info("Deepgram streaming STT enabled (linear16, 16000 Hz, WebSocket)")

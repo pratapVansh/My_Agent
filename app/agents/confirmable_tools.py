@@ -86,8 +86,13 @@ def build_send_email_tool(owner_id: str) -> Dict[str, Any]:
                 "error": "subject and body are required. Use email_draft first to compose the email.",
             }
 
+        # `owner_id` is what the send is charged against, not anything in
+        # `tool_input` — see the binding note above. The rate cap would be
+        # worthless otherwise: a model that could name its own user_id could
+        # reset its own budget.
         result = await email_sender_service.send_email(
             to_email=to_email, subject=subject, body=body, cc=cc,
+            user_id=owner_id,
         )
 
         if result.get("success") and draft_id:
@@ -110,6 +115,15 @@ def build_send_email_tool(owner_id: str) -> Dict[str, Any]:
         performs. They have to live here too: that function no longer runs
         before confirmation, so if this did not reject an address-less send the
         user would be asked to approve an email to nobody.
+
+        SMTP configuration is deliberately *not* checked here. It is a property
+        of the environment rather than of the action, and reading it would make
+        whether an action can be previewed depend on a .env file — which is
+        exactly what keeps the test suite offline, and what would make this
+        function's behaviour differ between a developer's machine and a
+        reviewer's. The check belongs where the credentials are used
+        (`email_sender_service.send_email`) and where the operator can act on it
+        early (the startup line in `app.main`).
         """
         to_email = str(args.get("to_email") or "").strip()
         subject = str(args.get("subject") or "").strip()

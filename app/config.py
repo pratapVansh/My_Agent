@@ -7,6 +7,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List, Optional
 
 
+# Every value in `.env.example` is a `your_<thing>_here` stub, and copying that
+# file is step one of setup — so an unfilled stub is the single most likely way
+# a credential is "set" and useless. Pydantic sees a non-empty string and is
+# satisfied, and the failure then surfaces at the provider as a 401 that reads
+# like an expired key, or (worse) as an empty result that reads like "nothing
+# found". Recognising the stub shape here is what lets a caller say "you never
+# filled this in" instead.
+_PLACEHOLDER_RE = re.compile(r"^(your[_\-].*|.*_here|changeme|xxx+|<.*>)$", re.IGNORECASE)
+
+
+def is_placeholder(value: Optional[str]) -> bool:
+    """True when `value` is absent, blank, or still an untouched .env.example stub."""
+    text = (value or "").strip()
+    return not text or bool(_PLACEHOLDER_RE.match(text))
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 

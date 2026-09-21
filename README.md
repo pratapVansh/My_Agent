@@ -63,11 +63,16 @@ Two properties are enforced structurally rather than by prompt instruction:
                             └───────────┬───────────────────┘
                                         │
                          deterministic router (query_intent)
-                              categorise → sources → agent
+                    categorise → sources → required tools → agent
+                     (the planner is skipped when nothing it produces
+                      can change the outcome of this turn)
                                         │
         ┌───────────────┬───────────────┼───────────────┬───────────────┐
      temporal      provenance       clarification    confirm_action   specialist
      (no model)    (no model)        (no model)      (gateway)     job│email│academic│profile
+                                                                        │
+                                                     required lookup runs first
+                                                          (no model call)
                                                                         │
                                                             reasoning loop ≤2 iterations
                                                                         │
@@ -79,9 +84,17 @@ Two properties are enforced structurally rather than by prompt instruction:
    └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Four categories terminate without any model call at all. Every Groq request
-passes through one shared limiter (bounded concurrency plus a token-per-minute
-budget) so a fan-out queues instead of arriving as a burst.
+Four categories terminate without any model call at all, and a question whose
+route and required lookup are both already settled — "what is my name", "what
+is my CGPA" — skips the planner and runs its lookup before the first
+completion. Those turns cost **one** model call rather than three.
+
+Every Groq request passes through one shared limiter (bounded concurrency plus
+a token-per-minute budget) so a fan-out queues instead of arriving as a burst.
+The limiter reserves each request's worst case up front and refunds the
+difference once the provider reports what it actually cost, and every wait
+underneath a turn — token budget, `Retry-After` — is capped by that turn's
+remaining deadline rather than by its own private ceiling.
 
 **External services:** Groq (LLM), Cohere (embeddings), Qdrant (vectors),
 PostgreSQL (records), Deepgram (STT), Cartesia (TTS), LiveKit (WebRTC),
@@ -114,6 +127,11 @@ source venv/bin/activate
 venv\Scripts\activate
 
 pip install -r requirements.txt -r requirements-dev.txt
+
+# Browser for the ERP attendance scraper. pip installs Playwright itself but
+# not the browser binary it drives, so the scraper fails at runtime without it.
+# Skip only if you will not use attendance scraping.
+playwright install chromium
 ```
 
 ### 1. Configure
@@ -124,6 +142,18 @@ cp .env.example .env          # Windows: copy .env.example .env
 
 Open `.env` and fill in at minimum: `GROQ_API_KEY`, `COHERE_API_KEY`,
 `QDRANT_URL`, `QDRANT_API_KEY`, and the `POSTGRES_*` block.
+
+Two optional capabilities are off until their keys are filled in, and each says
+so at startup rather than failing mid-turn:
+
+| Capability | Needs | Without it |
+|---|---|---|
+| Job search | `TAVILY_API_KEY` | Job queries refuse and name the variable |
+| Email sending | `SMTP_EMAIL`, `SMTP_PASSWORD` | Drafting still works; sending refuses |
+
+`SMTP_PASSWORD` must be a Gmail **App Password** (Google Account → Security →
+2-Step Verification → App passwords), not your account password — Google
+rejects account passwords over SMTP.
 
 `.env` is gitignored and must stay that way — it holds live credentials.
 
@@ -157,8 +187,18 @@ Groq console. The default is the measured free-tier limit.
 
 ```bash
 python scripts/upload_pdf.py path/to/resume.pdf --user-id you
-python scripts/upload_timetable_pdf.py path/to/timetable.pdf --user-id you
+python scripts/upload_new_timetable.py path/to/timetable.pdf --user you
 ```
+
+Both talk to the database directly, so neither needs the API running.
+`scripts/upload_timetable_pdf.py` does the same job *through* the HTTP API and
+therefore needs a server already up — and it defaults to `http://localhost:8000`,
+not the port under [Running it](#running-it). Use it only when you want the
+upload to go through the endpoint.
+
+The parser is deterministic and needs a text layer with one class per line. A
+scanned or grid-style timetable is refused rather than guessed at; see
+`scripts/load_timetable.py` for the transcription path.
 
 ---
 
@@ -207,7 +247,7 @@ docker run --env-file .env -p 10000:10000 my-agent
 
 ```bash
 pytest                              # full suite
-pytest tests/test_memory_scope.py -v  # one file
+pytest tests/memory/test_memory_scope.py -v  # one file
 
 # Postgres integration tests are opt-in and destructive against their own
 # test database. Set POSTGRES_INTEGRATION_TESTS=1 in the environment first:
@@ -216,7 +256,13 @@ pytest tests/test_memory_scope.py -v  # one file
 ```
 
 The suite runs fully offline — no API keys, no network, no database. Postgres
-integration tests are opt-in and skipped by default.
+integration tests are opt-in and skipped by default. 2,507 tests; 2,480 run by
+default and 27 skip.
+
+```bash
+pytest tests/memory -q            # one package
+pytest tests/agents/test_persona.py -v
+```
 
 ---
 
@@ -278,16 +324,31 @@ app/
   tools/         timetable, attendance, job search, email draft, typed contract
   routes/        agents, auth, livekit
   auth/          JWT, cookies, CSRF, scopes
+  domain/        repositories: jobs, email, schedule, audit, pending actions
+  db/            engine and session
   matching/      evidence-based job matching
+  candidate/     structured candidate profile built from the resume
+  middleware/    per-IP rate limiting
   mcp/           MCP host (stdio transport)
+  config.py           every setting, overridable from .env
   livekit_worker.py   voice turn loop
   main.py             FastAPI entry point
 frontend/        Next.js 14 client
+  components/    ChatShell (composition root), MessageList, MemoryPanel, modals
+  lib/           api client, auth, conversation helpers
 scripts/         setup, migrations, data loading, diagnostics
-tests/           2400+ tests, offline by default
+tests/           2,507 tests, offline by default — mirrors app/
+  agents/ memory/ services/ auth/ tools/ routes/ matching/
+  candidate/ domain/ mcp/ middleware/ voice/ evals/
+  support/       fakes and harnesses shared across the suite
 evals/           scenario-based agent evaluation
 docs/            architecture and memory design notes
 ```
+
+`tests/` mirrors `app/`, one package per subpackage, so the tests for a module
+are where you would look for them. `tests/voice/` is the one grouping that has
+no `app/` counterpart: the voice path spans `livekit_worker.py`, `agents/` and
+`services/`, and splitting it across three packages would hide it.
 
 ---
 

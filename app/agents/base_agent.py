@@ -13,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.agents import grounding as _grounding
 from app.agents import persona as _persona
+from app.agents import prefetch as _prefetch
 from app.agents.actions import action_gateway
 from app.services.call_metrics import (
     record_llm_failure,
@@ -21,6 +22,7 @@ from app.services.call_metrics import (
     record_llm_retry,
     record_llm_timeout,
 )
+from app.services import deadline as _deadline
 from app.services.groq_limiter import estimate_tokens
 from app.services.groq_service import groq_service
 from app.services.llm_errors import (
@@ -109,6 +111,33 @@ _RATE_LIMIT_DEFAULT_WAIT = 5.0
 # would expire mid-sleep anyway, and failing visibly beats holding a turn open
 # to produce nothing.
 _RATE_LIMIT_MAX_WAIT = 15.0
+
+
+# Appended to the system prompt when the turn's required lookup has already
+# been performed by `app.agents.prefetch`, before the first model call.
+#
+# It has to be emphatic, and it has to arrive last, because it contradicts an
+# earlier instruction on purpose. The loop tells the model it must emit a
+# `tool_call` before its first `final` whenever a listed tool could answer the
+# question — the rule that stops it inventing a CGPA. On a pre-grounded turn
+# that rule is satisfied *and* actively harmful: obeying it buys a second
+# completion that re-reads an observation already sitting in the prompt, which
+# is exactly the call this whole mechanism exists to remove.
+_PREGROUNDED_NOTE = """
+
+ALREADY DONE FOR YOU — READ THIS BEFORE ANYTHING ABOVE:
+The lookup this question required has already been performed. Its result is in
+the "Tool observations so far" section below.
+
+- Do NOT call {tool} again. It has run.
+- Answer NOW, in one message, using the shape:
+  {{"type":"final","content":"...","is_complete":true}}
+- The rule about emitting a tool_call before your first final answer does not
+  apply to this turn. The tool call has been made on your behalf.
+- If the observation shows nothing was found, say plainly that you do not have
+  it. Do not guess it, and do not go looking for it in a tool that does not
+  hold it.
+"""
 
 
 def _transient_backoff(attempt: int) -> float:
@@ -366,6 +395,23 @@ class BaseAgent(ABC):
         )
 
         for attempt in range(1, attempts + 1):
+            # The attempt may not outlive the turn that wants its answer. A
+            # 30 s HTTP budget inside a 35 s spoken turn that has already spent
+            # 20 s is not a 30 s budget; running it as one guarantees the
+            # caller's deadline fires mid-request and the work is discarded.
+            attempt_timeout = _deadline.clamp(_LLM_CALL_TIMEOUT)
+            if attempt_timeout <= 0:
+                logger.warning(
+                    "call_groq for agent '%s' not attempted: the turn's deadline "
+                    "has passed, so the answer would arrive after the caller "
+                    "stopped waiting.",
+                    self.name,
+                )
+                record_llm_timeout()
+                raise asyncio.TimeoutError(
+                    "turn deadline exhausted before the request was sent"
+                )
+
             try:
                 response = await asyncio.wait_for(
                     self.groq_service.chat_completion(
@@ -374,7 +420,7 @@ class BaseAgent(ABC):
                         max_tokens=max_tokens,
                         **kwargs,
                     ),
-                    timeout=_LLM_CALL_TIMEOUT,
+                    timeout=attempt_timeout,
                 )
                 return response["content"]
 
@@ -447,8 +493,22 @@ class BaseAgent(ABC):
                         attempt, attempts, self.name, exc, wait,
                     )
 
+            # Never sleep past the point where the answer stops being wanted.
+            # `_RATE_LIMIT_MAX_WAIT` bounds this against the *typed* ceiling; a
+            # spoken turn has 35 s in total, and a 15 s sleep plus a 20 s wait
+            # for token budget consumed all of it without issuing a request.
+            sleepable = _deadline.clamp(wait)
+            if sleepable < wait:
+                logger.error(
+                    "call_groq for agent '%s' would have waited %.1fs but the "
+                    "turn has %.1fs left; failing now rather than sleeping "
+                    "through the caller's deadline.",
+                    self.name, wait, max(0.0, _deadline.remaining() or 0.0),
+                )
+                break
+
             record_llm_retry()
-            await asyncio.sleep(wait)
+            await asyncio.sleep(sleepable)
 
         logger.error(
             "call_groq exhausted %d attempt(s) for agent '%s': %s",
@@ -594,9 +654,24 @@ class BaseAgent(ABC):
         detected_intent = state.get("detected_intent", "")
         user_id = state.get("user_id", "")
 
+        # Which tool this turn is already obliged to call, decided before the
+        # prompt is built rather than after. Pure — it reads the requirement
+        # settled at the routing edge and the registry in hand, and touches no
+        # store — so it is cheap to know this early, and knowing it early is
+        # what lets the two blocks below be skipped rather than assembled and
+        # ignored. Re-used by the prefetch further down.
+        prefetch_plan = _prefetch.plan(state, tools.keys()) if tools else None
+
         # ── Fix 3: Load past successful tool strategies from memory ──────────
+        #
+        # Skipped when the turn is about to be pre-grounded. These hints exist
+        # to help the model *choose* a tool and pick its arguments; on a turn
+        # whose tool has already been chosen, run, and whose result will be in
+        # the prompt, they are prompt tokens spent on a decision nobody is
+        # making — and they cost a memory round trip to fetch, on the latency
+        # path of the fastest kind of turn there is.
         tool_hints_block = ""
-        if user_id and tools:
+        if user_id and tools and prefetch_plan is None:
             try:
                 from app.memory.memory_manager import memory_manager as _mm
                 past_insights = await _mm.get_tool_insights(
@@ -726,6 +801,232 @@ Rules:
         # prompt by the iteration count for no added information.
         followup_system_prompt = _without_memory_block(system_prompt)
 
+        async def _invoke_tool(
+            label: str, tool_name: str, tool_input: Dict[str, Any]
+        ) -> None:
+            """
+            Run one tool and record everything this loop keeps about it.
+
+            Lifted verbatim out of the loop body so that a call the model asked
+            for and the deterministic prefetch below run the *same* code. A
+            prefetch that recorded its result even slightly differently would be
+            a second, quieter definition of what `grounding` and
+            `answerability` mean — and both of those read these lists directly.
+
+            `label` prefixes the trace entry: `step_2` for a call the model
+            chose, `prefetch` for the one it did not have to.
+            """
+            tool_info = tools.get(tool_name)
+            if not tool_info:
+                # Recorded as a typed failure as well as an observation: an
+                # out-of-scope tool is withheld from the registry entirely,
+                # so "unknown" here can mean "not permitted", and that must
+                # not read downstream as a lookup that found nothing.
+                unknown = ToolResult.failed(
+                    f"unknown or unavailable tool '{tool_name}'",
+                    kind=ErrorKind.UNKNOWN_TOOL,
+                    tool=tool_name,
+                )
+                tool_results.append(unknown)
+                observations.append(f"Tool error: Unknown tool '{tool_name}'.")
+                trace.append(f"{label}: unknown_tool:{tool_name}")
+                return
+
+            tool_callable: Callable[..., Awaitable[Any]] = tool_info["callable"]
+            declared_effect = effect_for_spec(tool_info, tool_name)
+
+            # ── The gate ──────────────────────────────────────────────────
+            # Placed before the try block that calls the tool, because that
+            # is the whole point: a confirmable action must not be reachable
+            # from this loop at all. `intercept` builds a preview and holds
+            # the action; it never awaits `tool_callable`. The only code
+            # that does is ActionGateway.confirm_and_execute, and that runs
+            # after a valid token is presented.
+            if action_gateway.requires_confirmation(declared_effect):
+                gated = await action_gateway.intercept(
+                    tool=tool_name,
+                    spec=tool_info,
+                    arguments=tool_input,
+                    owner_id=user_id,
+                    conversation_id=state.get("session_id") or "",
+                    effect=declared_effect,
+                )
+                tool_results.append(gated)
+                if gated.is_pending:
+                    pending_actions.append(gated)
+                observations.append(
+                    f"Tool {tool_name} observation: {gated.observation()}"
+                )
+                trace.append(f"{label}: gated:{tool_name}:{gated.status.value}")
+                if gated.is_error:
+                    tools_errored.append(tool_name)
+                elif gated.ok:
+                    # The already-executed notice. The action genuinely
+                    # happened, earlier — so it counts as a call that ran.
+                    tools_used.append(tool_name)
+                    tools_with_evidence.append(tool_name)
+                # Deliberately not counted as used when pending: nothing ran.
+                return
+
+            try:
+                result = await asyncio.wait_for(
+                    tool_callable(tool_input),
+                    timeout=_TOOL_CALL_TIMEOUT,
+                )
+
+                # The single place a raw return value becomes typed. An
+                # unrecognisable result from a consequential tool becomes an
+                # error here rather than an optimistic success — see
+                # app/tools/contract.py.
+                tool_result = coerce(
+                    result,
+                    tool=tool_name,
+                    declared_effect=declared_effect,
+                    tool_input=tool_input,
+                )
+                tool_results.append(tool_result)
+
+                # Legacy dict results keep their exact previous observation
+                # text, so migrating a tool to the contract is what changes
+                # what the model sees — never this change on its own.
+                summarized = (
+                    self._summarize_tool_result(result)
+                    if tool_result.adapted
+                    else tool_result.observation()
+                )
+                observations.append(f"Tool {tool_name} observation: {summarized}")
+                tools_used.append(tool_name)
+                if tool_result.is_error:
+                    tools_errored.append(tool_name)
+                elif tool_result.yielded_evidence:
+                    tools_with_evidence.append(tool_name)
+                trace.append(f"{label}: tool_call:{tool_name}")
+
+                # ── Fix 3: Save successful tool outcome to memory ─────────
+                # Gated on an actual success. This block records the call as
+                # `outcome_quality="good"` and replays it to later turns as
+                # a strategy worth reusing — which, for a call that errored
+                # or found nothing, teaches the agent to repeat a approach
+                # that did not work. Before the contract there was no
+                # reliable way to tell here; now there is.
+                if user_id and tool_result.ok:
+                    try:
+                        from app.memory.memory_manager import memory_manager as _mm
+                        inputs_summary = json.dumps(tool_input, default=str)[:300]
+                        key_insight = summarized[:300]
+                        _spawn_background(
+                            _mm.save_tool_outcome(
+                                user_id=user_id,
+                                agent_name=self.name,
+                                tool_name=tool_name,
+                                inputs_summary=inputs_summary,
+                                outcome_quality="good",
+                                key_insight=key_insight,
+                            ),
+                            f"save-tool-outcome-{self.name}-{tool_name}",
+                        )
+                    except Exception as _e:
+                        logger.debug("Tool memory save skipped: %s", _e)
+
+            except asyncio.TimeoutError:
+                # Retryable, and deliberately so: a timeout says nothing
+                # about whether the call will succeed next time. It also
+                # says nothing about whether the effect already happened,
+                # which is why the key is carried on the result.
+                tool_results.append(ToolResult.failed(
+                    f"timed out after {_TOOL_CALL_TIMEOUT:.0f}s",
+                    kind=ErrorKind.TIMEOUT,
+                    effect=declared_effect,
+                    retryable=True,
+                    tool=tool_name,
+                ))
+                observations.append(f"Tool {tool_name} timed out after {_TOOL_CALL_TIMEOUT:.0f}s.")
+                tools_errored.append(tool_name)
+                trace.append(f"{label}: tool_timeout:{tool_name}")
+                logger.warning(
+                    "Tool '%s' timed out after %.0fs in agent '%s'",
+                    tool_name, _TOOL_CALL_TIMEOUT, self.name,
+                )
+            except Exception as e:
+                tool_results.append(ToolResult.failed(
+                    str(e),
+                    kind=ErrorKind.EXCEPTION,
+                    effect=declared_effect,
+                    tool=tool_name,
+                ))
+                observations.append(f"Tool {tool_name} failed: {str(e)}")
+                tools_errored.append(tool_name)
+                trace.append(f"{label}: tool_error:{tool_name}")
+                logger.warning(
+                    "Tool '%s' raised an exception in agent '%s': %s",
+                    tool_name, self.name, e,
+                )
+
+        # ── The lookup this turn was already required to make ────────────────
+        #
+        # `required_tools` was decided deterministically at the routing edge and
+        # is checked deterministically afterwards by `grounding.enforce`. What
+        # sat between those two points was a completion asking the model a
+        # question whose only acceptable answer was already known — and paying
+        # ~4,000 tokens on an 8,000 TPM account to be told it.
+        #
+        # So the lookup runs here and the model receives the observation
+        # instead of the choice. The saving is not one call in three, it is one
+        # call *and* the failure mode that was most expensive to recover from:
+        # a model that skipped the required tool produced `grounding=skipped`,
+        # which `reflect_node` answers by re-running the entire specialist.
+        #
+        # Narrow by construction — see `app.agents.prefetch` for why a tool
+        # whose arguments come out of the sentence is never prefetched.
+        prefetched_tool: Optional[str] = None
+        if tools and not _deadline.exhausted():
+            # At most two candidates, and the second only when the first
+            # *errored*. A lookup that ran and found nothing has answered the
+            # question — asking the next store for a fact that does not live
+            # there is how "I have no résumé on file" gets invented.
+            for attempt in range(2):
+                planned = prefetch_plan if attempt == 0 else _prefetch.plan(
+                    state, tools.keys(), already_used=tools_used + tools_errored,
+                )
+                if planned is None:
+                    break
+
+                candidate, candidate_input = planned
+                spec = tools.get(candidate) or {}
+                declared = effect_for_spec(spec, candidate)
+
+                # Read-only and never gated. Both conditions are already true of
+                # everything in `ZERO_ARGUMENT_LOOKUPS`; they are asserted here
+                # rather than assumed so that adding a tool to that set can
+                # never become a way to execute a consequential action without
+                # the model, the gateway, or the user being involved.
+                if declared is not Effect.READ or action_gateway.requires_confirmation(declared):
+                    logger.warning(
+                        "Not prefetching '%s' for agent '%s': declared effect is "
+                        "%s, and only read-only lookups may run before the model.",
+                        candidate, self.name, getattr(declared, "value", declared),
+                    )
+                    break
+
+                await _invoke_tool("prefetch", candidate, candidate_input)
+                prefetched_tool = candidate
+                if candidate not in tools_errored:
+                    break
+
+        if prefetched_tool and prefetched_tool not in tools_errored:
+            # Only when it actually ran. A prefetch that errored leaves the
+            # requirement outstanding, and telling the model the lookup is done
+            # would strand the turn with neither a tool result nor permission
+            # to go and get one.
+            grounded_note = _PREGROUNDED_NOTE.format(tool=prefetched_tool)
+            system_prompt += grounded_note
+            followup_system_prompt += grounded_note
+            logger.info(
+                "Agent '%s': ran the required lookup '%s' before the first model "
+                "call; the turn needs one completion rather than two.",
+                self.name, prefetched_tool,
+            )
+
         for step in range(1, max_iterations + 1):
             observation_block = "\n".join(observations[-6:]) if observations else "(none)"
 
@@ -795,151 +1096,7 @@ Rules:
                 tool_name = decision.get("tool", "")
                 tool_input = decision.get("tool_input", {})
 
-                tool_info = tools.get(tool_name)
-                if not tool_info:
-                    # Recorded as a typed failure as well as an observation: an
-                    # out-of-scope tool is withheld from the registry entirely,
-                    # so "unknown" here can mean "not permitted", and that must
-                    # not read downstream as a lookup that found nothing.
-                    unknown = ToolResult.failed(
-                        f"unknown or unavailable tool '{tool_name}'",
-                        kind=ErrorKind.UNKNOWN_TOOL,
-                        tool=tool_name,
-                    )
-                    tool_results.append(unknown)
-                    observations.append(f"Tool error: Unknown tool '{tool_name}'.")
-                    trace.append(f"step_{step}: unknown_tool:{tool_name}")
-                    continue
-
-                tool_callable: Callable[..., Awaitable[Any]] = tool_info["callable"]
-                declared_effect = effect_for_spec(tool_info, tool_name)
-
-                # ── The gate ──────────────────────────────────────────────────
-                # Placed before the try block that calls the tool, because that
-                # is the whole point: a confirmable action must not be reachable
-                # from this loop at all. `intercept` builds a preview and holds
-                # the action; it never awaits `tool_callable`. The only code
-                # that does is ActionGateway.confirm_and_execute, and that runs
-                # after a valid token is presented.
-                if action_gateway.requires_confirmation(declared_effect):
-                    gated = await action_gateway.intercept(
-                        tool=tool_name,
-                        spec=tool_info,
-                        arguments=tool_input,
-                        owner_id=user_id,
-                        conversation_id=state.get("session_id") or "",
-                        effect=declared_effect,
-                    )
-                    tool_results.append(gated)
-                    if gated.is_pending:
-                        pending_actions.append(gated)
-                    observations.append(
-                        f"Tool {tool_name} observation: {gated.observation()}"
-                    )
-                    trace.append(f"step_{step}: gated:{tool_name}:{gated.status.value}")
-                    if gated.is_error:
-                        tools_errored.append(tool_name)
-                    elif gated.ok:
-                        # The already-executed notice. The action genuinely
-                        # happened, earlier — so it counts as a call that ran.
-                        tools_used.append(tool_name)
-                        tools_with_evidence.append(tool_name)
-                    # Deliberately not counted as used when pending: nothing ran.
-                    continue
-
-                try:
-                    result = await asyncio.wait_for(
-                        tool_callable(tool_input),
-                        timeout=_TOOL_CALL_TIMEOUT,
-                    )
-
-                    # The single place a raw return value becomes typed. An
-                    # unrecognisable result from a consequential tool becomes an
-                    # error here rather than an optimistic success — see
-                    # app/tools/contract.py.
-                    tool_result = coerce(
-                        result,
-                        tool=tool_name,
-                        declared_effect=declared_effect,
-                        tool_input=tool_input,
-                    )
-                    tool_results.append(tool_result)
-
-                    # Legacy dict results keep their exact previous observation
-                    # text, so migrating a tool to the contract is what changes
-                    # what the model sees — never this change on its own.
-                    summarized = (
-                        self._summarize_tool_result(result)
-                        if tool_result.adapted
-                        else tool_result.observation()
-                    )
-                    observations.append(f"Tool {tool_name} observation: {summarized}")
-                    tools_used.append(tool_name)
-                    if tool_result.is_error:
-                        tools_errored.append(tool_name)
-                    elif tool_result.yielded_evidence:
-                        tools_with_evidence.append(tool_name)
-                    trace.append(f"step_{step}: tool_call:{tool_name}")
-
-                    # ── Fix 3: Save successful tool outcome to memory ─────────
-                    # Gated on an actual success. This block records the call as
-                    # `outcome_quality="good"` and replays it to later turns as
-                    # a strategy worth reusing — which, for a call that errored
-                    # or found nothing, teaches the agent to repeat a approach
-                    # that did not work. Before the contract there was no
-                    # reliable way to tell here; now there is.
-                    if user_id and tool_result.ok:
-                        try:
-                            from app.memory.memory_manager import memory_manager as _mm
-                            inputs_summary = json.dumps(tool_input, default=str)[:300]
-                            key_insight = summarized[:300]
-                            _spawn_background(
-                                _mm.save_tool_outcome(
-                                    user_id=user_id,
-                                    agent_name=self.name,
-                                    tool_name=tool_name,
-                                    inputs_summary=inputs_summary,
-                                    outcome_quality="good",
-                                    key_insight=key_insight,
-                                ),
-                                f"save-tool-outcome-{self.name}-{tool_name}",
-                            )
-                        except Exception as _e:
-                            logger.debug("Tool memory save skipped: %s", _e)
-
-                except asyncio.TimeoutError:
-                    # Retryable, and deliberately so: a timeout says nothing
-                    # about whether the call will succeed next time. It also
-                    # says nothing about whether the effect already happened,
-                    # which is why the key is carried on the result.
-                    tool_results.append(ToolResult.failed(
-                        f"timed out after {_TOOL_CALL_TIMEOUT:.0f}s",
-                        kind=ErrorKind.TIMEOUT,
-                        effect=declared_effect,
-                        retryable=True,
-                        tool=tool_name,
-                    ))
-                    observations.append(f"Tool {tool_name} timed out after {_TOOL_CALL_TIMEOUT:.0f}s.")
-                    tools_errored.append(tool_name)
-                    trace.append(f"step_{step}: tool_timeout:{tool_name}")
-                    logger.warning(
-                        "Tool '%s' timed out after %.0fs in agent '%s'",
-                        tool_name, _TOOL_CALL_TIMEOUT, self.name,
-                    )
-                except Exception as e:
-                    tool_results.append(ToolResult.failed(
-                        str(e),
-                        kind=ErrorKind.EXCEPTION,
-                        effect=declared_effect,
-                        tool=tool_name,
-                    ))
-                    observations.append(f"Tool {tool_name} failed: {str(e)}")
-                    tools_errored.append(tool_name)
-                    trace.append(f"step_{step}: tool_error:{tool_name}")
-                    logger.warning(
-                        "Tool '%s' raised an exception in agent '%s': %s",
-                        tool_name, self.name, e,
-                    )
+                await _invoke_tool(f"step_{step}", tool_name, tool_input)
 
                 continue
 

@@ -1140,6 +1140,43 @@ async def test_the_model_cannot_alter_approved_arguments_by_re_asking(monkeypatc
     assert recorded.emails_sent == 0
 
 
+async def test_the_same_send_held_twice_collapses_instead_of_deadlocking(
+    monkeypatch, pending_store
+):
+    """
+    The model emitting `send_email` twice with *identical* arguments is not a
+    choice for the user to make — it is one request held twice. Observed live:
+    two holds, same content hash, and the disambiguation prompt that followed
+    could never be answered, because the reply that resolves it is a token the
+    user has no way to express. "yes" re-listed the same two actions forever.
+
+    So identical holds collapse to one and the extras are cancelled outright.
+    Contrast the test above: two *different* recipients still refuse to guess.
+    """
+    recorded = stub_services(monkeypatch)
+    tools = await _real_email_registry()
+
+    agent = ScriptedAgent([
+        '{"type":"tool_call","tool":"send_email","tool_input":' + _SEND_ARGS + '}',
+        '{"type":"tool_call","tool":"send_email","tool_input":' + _SEND_ARGS + '}',
+        final("All set."),
+    ])
+    result = await agent.execute_reasoning_loop(
+        state=_state(SEND), base_system_prompt="p", tools=tools, max_iterations=4,
+    )
+    assert len(result["pending_actions"]) == 2
+    first, second = result["pending_actions"]
+    assert first.data["content_hash"] == second.data["content_hash"]
+
+    outcome = await resolve(_state("yes"))
+
+    assert outcome.executed is True
+    assert recorded.emails_sent == 1
+    assert "Which one do you mean?" not in outcome.text
+    # Nothing left behind that a later "yes" could replay.
+    assert await pending_store.list_for(CONVO, OWNER) == []
+
+
 async def test_concurrent_confirmations_execute_exactly_once(monkeypatch):
     """
     ACCEPTANCE H. Eight callers approve the same action at once — the shape two
@@ -1445,3 +1482,40 @@ async def test_end_to_end_voice_send_preview_then_yes(monkeypatch):
     ))
     assert recorded.emails_sent == 1, "a repeated spoken yes must add no sends"
     assert repeated[-1].get("agent") != "confirm_action"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# A dictated email is not a question about the user
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("utterance", [
+    "Send an email to a@b.com. Subject: My project update. Body: build is green.",
+    "Send an email to a@b.com saying my build is green",
+    "forward my resume to recruiter@corp.com",
+    "email a@b.com the report",
+])
+def test_mail_to_a_named_address_routes_as_an_action(utterance):
+    """
+    `profile_intent` reads the whole utterance, so a possessive anywhere in it
+    claimed the turn — including one inside the *content being dictated*.
+
+    Observed live: "send an email to <addr>. Subject: My_Agent live
+    verification. Body: ..." classified PROFILE_GENERAL and was answered "I
+    don't have the ability to send emails." Phrased without "my" it routed
+    correctly, so the failure got worse the more precisely the user dictated
+    the message.
+    """
+    assert query_intent.classify(utterance).category is QueryCategory.ACTION_REQUEST
+
+
+@pytest.mark.parametrize("utterance,expected", [
+    # No address: who the supervisor is *is* a profile lookup.
+    ("email my supervisor", QueryCategory.PROFILE_GENERAL),
+    # The address is the subject of a statement, not a destination.
+    ("my email address is a@b.com", QueryCategory.PROFILE_GENERAL),
+    # Still missing the one parameter no store holds.
+    ("send this to him", QueryCategory.AMBIGUOUS_ACTION),
+])
+def test_an_address_alone_does_not_make_a_turn_an_action(utterance, expected):
+    """The claim is narrow on purpose: verb plus a *destination* address."""
+    assert query_intent.classify(utterance).category is expected

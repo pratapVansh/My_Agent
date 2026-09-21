@@ -52,7 +52,7 @@ from app.agents.hybrid_router import (
 from app.memory.sources import QueryCategory
 from tests.support.fake_llm import final, tool_call
 from tests.support.harness import OWNER, drive, state, stub_services
-from tests.test_candidate_profile import FakeMemory
+from tests.candidate.test_candidate_profile import FakeMemory
 
 JOB_CONTEXT = [
     {"role": "user", "content": "find me AI engineer jobs"},

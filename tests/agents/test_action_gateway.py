@@ -316,9 +316,18 @@ def test_a_token_is_consumed_even_when_execution_fails(gateway):
     """
     A failed send must not leave a live token. Otherwise whoever holds it gets
     a second attempt at an external action the user approved exactly once.
+
+    The failing double is registered, not merely passed in the spec. Execution
+    resolves the callable from the tool *name*, so a spec-only double is
+    ignored and the **real** SMTP sender runs — which is how this test used to
+    pass: with SMTP unconfigured the real send returned an error, so the
+    assertion held for the wrong reason. Configure SMTP and the same test sends
+    live mail and then fails. See `register_confirmable`.
     """
     async def failing_send(args):
         raise RuntimeError("smtp refused")
+
+    register_confirmable("send_email", failing_send, effect=Effect.EXTERNAL_WRITE)
 
     held = _run(gateway.intercept(
         tool="send_email",

@@ -14,7 +14,7 @@ from email.mime.text import MIMEText
 from email.utils import parseaddr
 from typing import Dict, List, Optional, Tuple
 
-from app.config import settings
+from app.config import is_placeholder, settings
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,41 @@ _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 # and a send that succeeded before the failure would otherwise be repeated —
 # delivering the same email to a real person twice.
 _DEDUPE_WINDOW_SECONDS = 300.0
+
+# Audit item C4: a per-user ceiling on how much mail one account can send.
+#
+# The dedupe above stops the *same* message going twice; it does nothing about
+# a loop that sends twenty different ones. Confirmation is the larger half of
+# this — every send is approved by a human — but a cap is what bounds the
+# damage when the thing being approved is itself wrong, and it is what keeps a
+# personal Gmail account from tripping Google's own sending limits.
+#
+# Deliberately small. This is one person's assistant, not a mailing list: a
+# normal day is a handful of emails, so a cap an order of magnitude above that
+# is invisible in use and still catches a runaway.
+_RATE_LIMIT_MAX_SENDS = 10
+_RATE_LIMIT_WINDOW_SECONDS = 3600.0
+
+
+def smtp_config_error() -> Optional[str]:
+    """
+    Why SMTP cannot be used yet, or None when it is configured.
+
+    Checked at first use rather than at startup, because email is optional: an
+    assistant with no mail credentials should still boot and answer questions.
+    The placeholder case is called out separately from the missing one — a
+    freshly copied .env has `SMTP_PASSWORD=your_app_password_here`, which is
+    "set" as far as pydantic is concerned and fails at Gmail as an auth error
+    that reads like a wrong password.
+    """
+    if is_placeholder(settings.smtp_email) or is_placeholder(settings.smtp_password):
+        return (
+            "Email sending is not configured. Set SMTP_EMAIL and SMTP_PASSWORD "
+            "in .env. SMTP_PASSWORD must be a Gmail App Password (16 characters, "
+            "from Google Account -> Security -> App passwords), not your normal "
+            "Gmail password."
+        )
+    return None
 
 
 def _validate_address(address: str, field: str) -> Optional[str]:
@@ -50,6 +85,33 @@ class EmailSenderService:
     def __init__(self) -> None:
         # (fingerprint -> monotonic timestamp) of recently delivered messages.
         self._recent_sends: Dict[str, float] = {}
+        # (user_id -> monotonic timestamps of their sends inside the window).
+        # Process-local, like the dedupe above: both are lost on restart, which
+        # is the honest limitation to record rather than paper over. Making
+        # either durable means a table and a migration, and the durable half of
+        # this guarantee already exists — the gateway's idempotency index.
+        self._sends_by_user: Dict[str, List[float]] = {}
+
+    def _check_rate_limit(self, user_id: str) -> Optional[str]:
+        """Return an error string when `user_id` has used up its send budget."""
+        now = time.monotonic()
+        recent = [
+            sent_at for sent_at in self._sends_by_user.get(user_id, [])
+            if now - sent_at < _RATE_LIMIT_WINDOW_SECONDS
+        ]
+        self._sends_by_user[user_id] = recent
+
+        if len(recent) >= _RATE_LIMIT_MAX_SENDS:
+            retry_in = _RATE_LIMIT_WINDOW_SECONDS - (now - min(recent))
+            return (
+                f"Send limit reached: {_RATE_LIMIT_MAX_SENDS} emails in the last "
+                f"hour. Nothing was sent. Try again in about "
+                f"{max(1, int(retry_in // 60))} minute(s)."
+            )
+        return None
+
+    def _record_send(self, user_id: str) -> None:
+        self._sends_by_user.setdefault(user_id, []).append(time.monotonic())
 
     def _fingerprint(self, to_email: str, subject: str, body: str) -> str:
         digest = hashlib.sha256(
@@ -100,22 +162,24 @@ class EmailSenderService:
         subject: str,
         body: str,
         cc: Optional[List[str]] = None,
+        user_id: str = "",
     ) -> Dict:
         """
         Send an email asynchronously via SMTP.
+
+        `user_id` is the account the send counts against for the rate cap. It
+        comes from the confirmed action's owner — never from tool arguments,
+        which are model output and would let a caller spend someone else's
+        budget or evade its own by naming a different one.
 
         Returns:
             {"success": True,  "to": to_email, "subject": subject}
             {"success": False, "error": "<reason>"}
         """
-        if not settings.smtp_email or not settings.smtp_password:
-            return {
-                "success": False,
-                "error": (
-                    "SMTP credentials not configured. "
-                    "Add SMTP_EMAIL and SMTP_PASSWORD to your .env file."
-                ),
-            }
+        config_error = smtp_config_error()
+        if config_error:
+            logger.error("Email send refused: SMTP is not configured")
+            return {"success": False, "error": config_error}
 
         # Validate every address before contacting the SMTP server. The
         # recipient originates from LLM output, so it is untrusted input.
@@ -154,11 +218,22 @@ class EmailSenderService:
                 "message": "This exact email was already sent moments ago; not sending again.",
             }
 
+        # Checked after the dedupe on purpose: a suppressed duplicate delivered
+        # nothing, so charging it against the budget would let a retry storm
+        # exhaust a cap without a single message leaving the building.
+        rate_error = self._check_rate_limit(user_id)
+        if rate_error:
+            logger.warning(
+                "Email send blocked by rate cap: user=%s to=%s", user_id or "?", to_email
+            )
+            return {"success": False, "error": rate_error}
+
         try:
             await asyncio.to_thread(
                 self._send_sync, to_email, subject, body, cc
             )
             self._recent_sends[fingerprint] = time.monotonic()
+            self._record_send(user_id)
             logger.info("Email sent to=%s subject=%s", to_email, subject)
             return {"success": True, "to": to_email, "subject": subject}
 

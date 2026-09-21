@@ -281,3 +281,205 @@ async def test_an_agent_level_failure_produces_a_failed_envelope(agent, monkeypa
     assert result["task_result"]["status"] == "failed"
     assert result["task_result"]["confidence"] == 0.0
     assert "Job agent error" in result["error"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The Tavily boundary
+#
+# Everything above stubs `search_jobs` wholesale, which is right for testing
+# the agent but means the provider call itself has never been exercised. These
+# drive the real `job_search_tool` against a faked Tavily client, because the
+# distinction that matters most here — an empty board versus an unreachable one
+# — is decided inside that method and nowhere else.
+# ═══════════════════════════════════════════════════════════════════════════
+
+import asyncio  # noqa: E402
+
+from tavily.errors import InvalidAPIKeyError, UsageLimitExceededError  # noqa: E402
+
+from app.config import settings  # noqa: E402
+from app.domain.jobs import jobs_repository  # noqa: E402
+from app.tools.job_search_tool import JobSearchTool  # noqa: E402
+
+
+class _FakeTavilyClient:
+    """Stands in for `tavily.AsyncTavilyClient`. Returns, or raises."""
+
+    payload: object = {"results": []}
+
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+
+    async def search(self, **kwargs):
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        return self.payload
+
+
+@pytest.fixture
+def tavily(monkeypatch):
+    """A configured key plus a fake client; set `tavily.payload` per test."""
+    monkeypatch.setattr(settings, "tavily_api_key", "tvly-real-key-123")
+    import tavily as tavily_pkg
+    monkeypatch.setattr(tavily_pkg, "AsyncTavilyClient", _FakeTavilyClient)
+    return _FakeTavilyClient
+
+
+@pytest.fixture
+def tool(monkeypatch):
+    """The real search tool with its memory and Postgres reads stubbed out."""
+    instance = JobSearchTool()
+
+    async def _no_skills(*a, **kw):
+        return []
+
+    async def _no_seen(*a, **kw):
+        return set()
+
+    monkeypatch.setattr(instance, "_fetch_user_skills", _no_skills)
+    monkeypatch.setattr(jobs_repository, "get_bookmarked_urls", _no_seen)
+    return instance
+
+
+async def test_a_mocked_tavily_response_becomes_ranked_results(tool, tavily):
+    tavily.payload = {
+        "results": [
+            {
+                "title": "Backend Engineer at Acme - LinkedIn",
+                "url": "https://linkedin.com/jobs/1",
+                "content": "Python and FastAPI experience required.",
+                "score": 0.9,
+            },
+            {
+                "title": "Junior Developer | Globex - Indeed",
+                "url": "https://indeed.com/jobs/2",
+                "content": "Entry level role.",
+                "score": 0.6,
+            },
+        ]
+    }
+
+    result = await tool.search_jobs(user_id="owner", query="backend", max_results=5)
+
+    assert result["success"] is True
+    assert [job["title"] for job in result["results"]] == [
+        "Backend Engineer at Acme", "Junior Developer | Globex",
+    ]
+    assert result["results"][0]["company"] == "Acme"
+    # Ranked, not merely passed through.
+    assert result["results"][0]["rank_score"] >= result["results"][1]["rank_score"]
+
+
+async def test_a_placeholder_api_key_refuses_instead_of_searching(tool, monkeypatch):
+    """
+    The failure this test exists for: an unfilled .env used to produce an empty
+    result list, which the agent then reported as "no jobs found" — a claim
+    about the job market derived from a missing credential.
+    """
+    monkeypatch.setattr(settings, "tavily_api_key", "your_tavily_api_key_here")
+    called = False
+
+    async def _must_not_run(*a, **kw):
+        nonlocal called
+        called = True
+        return [], None
+
+    monkeypatch.setattr(tool, "_search_with_tavily", _must_not_run)
+
+    result = await tool.search_jobs(user_id="owner", query="backend")
+
+    assert result["success"] is False
+    assert "TAVILY_API_KEY" in result["error"]
+    assert not called, "no search should be attempted without a usable key"
+
+
+async def test_an_empty_board_is_not_an_error(tool, tavily):
+    """Tavily answering with nothing is a fact about the board, not a failure."""
+    tavily.payload = {"results": []}
+
+    result = await tool.search_jobs(user_id="owner", query="underwater basket weaving")
+
+    assert result["success"] is True
+    assert result["results"] == []
+    assert "error" not in result
+
+
+@pytest.mark.parametrize("raised, expected", [
+    (UsageLimitExceededError("quota"), "rate limited"),
+    (InvalidAPIKeyError(), "rejected TAVILY_API_KEY"),
+    (asyncio.TimeoutError(), "timed out"),
+])
+async def test_a_provider_failure_is_reported_as_a_failure(tool, tavily, raised, expected):
+    """Never an empty list: each of these would otherwise read as 'no jobs'."""
+    tavily.payload = raised
+
+    result = await tool.search_jobs(user_id="owner", query="backend")
+
+    assert result["success"] is False
+    assert expected in result["error"]
+
+
+async def test_a_skipped_search_reports_the_missing_key_not_a_generic_refusal(
+    agent, services, monkeypatch
+):
+    """
+    The gap found by running this live: the model answered a JOB_SEARCH turn
+    without calling anything, grounding replaced its answer with the generic
+    "let me check job listings again", and the user was never told the reason
+    was an unset key sitting in their own .env.
+
+    Grounding cannot know that — it only sees that no tool ran. The agent can.
+    """
+    monkeypatch.setattr(settings, "tavily_api_key", "your_tavily_api_key_here")
+
+    result, _ = await drive(
+        agent,
+        [final("Here are some roles you might like!")],
+        state("find me backend jobs", query_category="JOB_SEARCH"),
+    )
+
+    answer = result["task_result"]["result"]["content"]
+    assert "TAVILY_API_KEY" in answer
+    assert "check" not in answer.lower() or "TAVILY_API_KEY" in answer
+
+
+async def test_a_configured_key_leaves_the_grounding_refusal_alone(
+    agent, services, monkeypatch
+):
+    """The substitution is about configuration, not about covering for a skip."""
+    monkeypatch.setattr(settings, "tavily_api_key", "tvly-real-key-123")
+
+    result, _ = await drive(
+        agent,
+        [final("Here are some roles you might like!")],
+        state("find me backend jobs", query_category="JOB_SEARCH"),
+    )
+
+    answer = result["task_result"]["result"]["content"]
+    assert "TAVILY_API_KEY" not in answer
+
+
+async def test_a_search_that_errored_on_the_missing_key_reports_it(
+    agent, monkeypatch
+):
+    """
+    The case seen live, and the more common of the two: the model *did* call
+    job_search, the tool refused for want of a key, and grounding replaced the
+    answer with "try me again in a second" — advice that can never work.
+    """
+    monkeypatch.setattr(settings, "tavily_api_key", "your_tavily_api_key_here")
+    stub_services(monkeypatch)
+    # The real tool, so its own refusal is what reaches the agent.
+    monkeypatch.setattr(
+        "app.agents.job_agent.job_search_tool", JobSearchTool(), raising=False
+    )
+
+    result, _ = await drive(
+        agent,
+        [tool_call("job_search", query="backend"), final("Here are some roles!")],
+        state("find me backend jobs", query_category="JOB_SEARCH"),
+    )
+
+    answer = result["task_result"]["result"]["content"]
+    assert "TAVILY_API_KEY" in answer
+    assert "again in a second" not in answer

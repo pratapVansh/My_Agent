@@ -190,6 +190,20 @@ _ACTION_VERBS: Set[str] = {
     "draft", "compose", "register", "enroll", "sign",
 }
 
+# An instruction to send mail to a recipient the sentence itself names. The
+# address is what makes it unambiguous: "send an email to a@b.com ..." cannot
+# be a question about the user, however the rest of the sentence reads.
+#
+# The address has to be the *destination*, which is why "to" is required unless
+# it follows the verb directly. Without that, "my email address is a@b.com"
+# matches on the word "email" and a statement about the user becomes a request
+# to send them something.
+_SEND_TO_ADDRESS_RE = re.compile(
+    r"\b(?:send|email|mail|forward|write)\b\s+(?:[^@]{0,40}?\bto\s+)?"
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+    re.IGNORECASE,
+)
+
 # Pronouns with no antecedent inside the sentence. An action carrying one of
 # these is missing a parameter no store holds.
 _DANGLING_REFERENTS: Set[str] = {
@@ -452,16 +466,82 @@ def is_single_step(category: Optional[str]) -> bool:
 # reach the clarification branch, because a clock question and a "how did you
 # know that" question have no missing parameter to ask about.
 #
-# Everything else keeps the planner, including the categories that own their
-# agent (JOB_SEARCH, SCHEDULE_TEMPORAL): those still run a specialist, and its
-# `execution_plan` can still carry a genuine second step.
+# This set is only the *first* of the two rules in `planner_is_load_bearing`,
+# and it is the one that needs nothing but a category. The second rule reaches
+# further — it also skips the planner for a category that owns its agent, names
+# its required lookup, and was asked for in a single clause — but it needs the
+# utterance to establish that last condition, which is why it cannot be
+# expressed as a set here. A category that owns its agent (JOB_SEARCH,
+# SCHEDULE_TEMPORAL) still keeps the planner whenever the sentence is compound,
+# because that is where a genuine second step comes from.
 _PLANNER_FREE_CATEGORIES: FrozenSet[QueryCategory] = frozenset({
     QueryCategory.TEMPORAL_CURRENT,
     QueryCategory.PROVENANCE_QUERY,
 })
 
 
-def planner_is_load_bearing(category: Optional[str]) -> bool:
+# Markers that a single utterance contains more than one request. Their whole
+# job is to keep the second rule in `planner_is_load_bearing` away from the one
+# turn that genuinely needs a plan: "what is my CGPA and email it to my
+# professor" classifies as PROFILE_EDUCATION and would otherwise lose its
+# second step along with the planner call that produced it.
+#
+# Deliberately over-eager. A false positive costs one planner call on a turn
+# that did not need it — the status quo. A false negative silently drops half
+# of what the user asked for.
+_COMPOUND_MARKERS = re.compile(
+    r"(?:\band\b|\bthen\b|\balso\b|\bafter that\b|\bplus\b|;)",
+    re.IGNORECASE,
+)
+
+# Verbs that make a clause a second *task* rather than a second noun. "my
+# skills and projects" is one lookup; "my skills and draft an email" is two.
+_SECOND_TASK_VERBS = re.compile(
+    r"\b(email|mail|send|draft|write|compose|search|find|apply|schedule|remind|"
+    r"add|save|delete|remove|book|match|compare|summari[sz]e|generate|create)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_compound(text: Optional[str]) -> bool:
+    """
+    Whether one utterance is asking for more than one thing.
+
+    Both halves are required: a conjunction *and* a verb that starts a task.
+    Testing for the conjunction alone read "what are my skills and projects" as
+    a two-step plan, which is a list, not a plan.
+    """
+    if not text:
+        return False
+    stripped = str(text).strip()
+    if not _COMPOUND_MARKERS.search(stripped):
+        return False
+    return bool(_SECOND_TASK_VERBS.search(stripped))
+
+
+def _route_is_planner_proof(decision: "QueryDecision") -> bool:
+    """
+    Whether `agent_for` returns the same specialist whatever the planner says.
+
+    Asked by evaluating the real function against every answer the planner
+    could give, rather than by maintaining a second list of categories that
+    would drift out of step with the first. If all four choices land on the
+    same agent, the planner's `agent` field is not an input to this turn — it
+    is computed, transmitted, billed and discarded.
+    """
+    routes = {
+        agent_for(decision, choice, plan_steps=1)
+        for choice in (None, "job", "email", "academic", "profile")
+    }
+    return len(routes) == 1
+
+
+def planner_is_load_bearing(
+    category: Optional[str],
+    *,
+    text: Optional[str] = None,
+    history: Optional[Sequence[Dict[str, Any]]] = None,
+) -> bool:
     """
     Whether the planner's output can affect this turn at all.
 
@@ -469,13 +549,66 @@ def planner_is_load_bearing(category: Optional[str]) -> bool:
     classifier and the planner call can be skipped. Unknown or missing
     categories return True — the safe answer, since an unrecognised category
     falls through to planner-driven routing.
+
+    Two rules, and the second is the one that pays for itself.
+
+    **The category is answered by a node that runs no model** —
+    `_PLANNER_FREE_CATEGORIES`. Nothing the planner produces is read.
+
+    **Or: the route is already fixed, the answer is one named lookup, and the
+    sentence asks for one thing.** All three are required, and each removes a
+    different way the planner could still matter:
+
+    * *Route fixed* — `agent_for` gives the same specialist for every opinion
+      the planner could hold, so its `agent` is decorative. Checked by calling
+      the function, not by listing categories.
+    * *One named lookup* — `grounding.required_tools` names what must be
+      called. The specialist is handed that list directly and is now made to
+      run it (`app.agents.prefetch`), so `detected_intent` adds nothing the
+      turn does not already have, and there is no missing parameter for
+      `needs_clarification` to ask about: "what is my name" is a retrieval
+      task, never an ambiguous one.
+    * *Not compound* — the one thing the planner uniquely provides is a
+      multi-step `execution_plan`, and a single-clause request has no second
+      step to lose.
+
+    Without `text` only the first rule applies, so an existing caller passing a
+    category alone keeps exactly its previous behaviour.
+
+    What this is worth: a planner call on this account is roughly 3,500 tokens
+    of an 8,000 TPM budget — measured, from the 429 quoted in
+    `settings.groq_tokens_per_minute`. Skipping it on a simple personal
+    question is the difference between a turn that fits inside the tier and one
+    that does not.
     """
     if not category:
         return True
     try:
-        return QueryCategory(category) not in _PLANNER_FREE_CATEGORIES
+        resolved = QueryCategory(category)
     except ValueError:
         return True
+
+    if resolved in _PLANNER_FREE_CATEGORIES:
+        return False
+
+    if not text or looks_compound(text):
+        return True
+
+    # Imported here rather than at module scope: `grounding` is a consumer of
+    # this module's categories, and importing it at the top would make the two
+    # mutually dependent at import time for one lookup.
+    from app.agents import grounding
+
+    if not grounding.required_tools(resolved):
+        return True
+
+    decision = classify(text, has_context=bool(history), history=history)
+    if decision.category is not resolved:
+        # The caller categorised this differently from what the text says now.
+        # Not a situation to economise in.
+        return True
+
+    return not _route_is_planner_proof(decision)
 
 
 # ── Where an answer is allowed to come from ──────────────────────────────────
@@ -1200,6 +1333,28 @@ def classify(
             "asks who the user is",
             0.9,
             legacy=profile_intent.PROFILE_NAME,
+        )
+
+    # ── 7f. Mail addressed to someone the sentence names ─────────────────────
+    # Ahead of the profile checks, for the same reason as 7b-bis: both claim it
+    # and only one can act on it.
+    #
+    # `profile_intent` reads the whole utterance, so a possessive anywhere in it
+    # wins — including inside the *content of the email being dictated*. Observed
+    # live: "send an email to <addr>. Subject: My_Agent live verification. Body:
+    # ..." classified PROFILE_GENERAL, routed to the profile agent, and answered
+    # "I don't have the ability to send emails." The same request phrased without
+    # "my" routed correctly, so the failure got worse the more precisely the user
+    # dictated the message.
+    #
+    # An explicit verb plus a literal address is not a question about the user.
+    # Narrow on purpose: no address, no claim — "email my supervisor" still falls
+    # through to the checks below, because who that is *is* a profile lookup.
+    if _SEND_TO_ADDRESS_RE.search(query):
+        return _decide(
+            QueryCategory.ACTION_REQUEST,
+            "instruction to send mail to an address named in the sentence",
+            0.9,
         )
 
     # ── 8. Questions about the user ──────────────────────────────────────────

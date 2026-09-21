@@ -52,7 +52,7 @@ from app.matching.models import Requirement, RequirementMatch
 from app.matching.scoring import compute_score
 from tests.support.fake_llm import final, tool_call
 from tests.support.harness import OWNER, drive, state, stub_services
-from tests.test_candidate_profile import FakeMemory, _item
+from tests.candidate.test_candidate_profile import FakeMemory, _item
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 

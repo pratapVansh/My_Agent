@@ -28,12 +28,14 @@ the candidate knows, which it has no way to know.
 This mirrors what `provenance_node` and `temporal_node` already do in the
 workflow: a question with exactly one true answer is not asked of a model.
 """
+import logging
 from typing import Any, Dict, List, Optional
 
 from app.agents.base_agent import BaseAgent
 from app.agents.state import make_envelope
 from app.auth.models import Scope
 from app.candidate import build_candidate_profile
+from app.config import is_placeholder, settings
 from app.matching import (
     extract_requirements,
     match_requirements,
@@ -41,7 +43,7 @@ from app.matching import (
     render_summary,
 )
 from app.tools.contract import Effect, ToolResult
-from app.tools.job_search_tool import job_search_tool
+from app.tools.job_search_tool import NO_KEY_MESSAGE, job_search_tool
 from app.tools.email_draft_tool import email_draft_tool
 from app.memory.short_term_memory import short_term_memory
 from app.memory.memory_manager import memory_manager
@@ -53,6 +55,8 @@ from app.domain.jobs import jobs_repository
 # non-ASCII to six-character sequences, so the report is fitted well below that
 # — a cut there could land mid-source-id and emit an identifier that looks real.
 _MATCH_OBSERVATION_CHARS = 800
+
+logger = logging.getLogger(__name__)
 
 
 def _job_from_results(
@@ -136,7 +140,9 @@ For career advice (no tool needed): give practical guidance based on the user's 
         # ── Tool definitions ──────────────────────────────────────────────
         # Use a dict so the nested closure can update the reference without
         # needing nonlocal or in-place mutation of a bare list.
-        ctx: Dict[str, Any] = {"job_results": [], "match_report": None}
+        ctx: Dict[str, Any] = {
+            "job_results": [], "match_report": None, "search_unconfigured": False,
+        }
 
         async def tool_job_search(tool_input: Dict[str, Any]):
             query = str(tool_input.get("query") or user_input)
@@ -153,6 +159,12 @@ For career advice (no tool needed): give practical guidance based on the user's 
             # Capture raw results for rich frontend cards
             if result.get("results"):
                 ctx["job_results"] = result["results"][:5]
+            # The tool is the only thing that knows *why* it refused. Recorded
+            # here because by the time the answer is assembled, an unset key
+            # and an unreachable provider look identical — both are simply a
+            # tool that errored — and only one of them is the user's to fix.
+            if result.get("error") == NO_KEY_MESSAGE:
+                ctx["search_unconfigured"] = True
             return result
 
         async def tool_save_bookmark(tool_input: Dict[str, Any]):
@@ -359,6 +371,46 @@ For career advice (no tool needed): give practical guidance based on the user's 
             match_report = ctx.get("match_report")
             if match_report is not None:
                 final_answer = render(match_report)
+
+            # ── An unconfigured job board has one true answer ────────────────
+            # Same principle as the report above, for the opposite reason.
+            #
+            # `job_search` already returns a message naming `TAVILY_API_KEY`.
+            # The user never saw it, because grounding replaces the answer on
+            # any JOB_SEARCH turn whose required tool did not produce evidence
+            # — and its replacements are generic by design, since it knows only
+            # *that* nothing was retrieved, never *why*. Both of its wordings
+            # are actively wrong here:
+            #
+            #   the tool errored   → "Couldn't get to job listings just now.
+            #                         Try me again in a second."
+            #   nothing ran        → "Let me check job listings again — I don't
+            #                         want to guess at it."
+            #
+            # Neither will ever come true, because no amount of retrying
+            # supplies a key. Both were observed live before this was added.
+            #
+            # Two triggers, and both are needed. `search_unconfigured` is the
+            # tool reporting its own reason, which covers the ordinary case
+            # where the model called it. The second covers the turn where the
+            # model called nothing at all — roughly 1 in 5 against
+            # gpt-oss-120b (FINAL_AUDIT B1) — where there is no tool result to
+            # carry a reason.
+            #
+            # Deliberately not gated on the category. "show my saved jobs" is
+            # also JOB_SEARCH but is answered from Postgres by
+            # `get_bookmarked_jobs`; it runs a tool, so neither trigger fires
+            # and it is left alone.
+            elif ctx["search_unconfigured"] or (
+                not tools_used
+                and loop_result.get("grounding") == "skipped"
+                and is_placeholder(settings.tavily_api_key)
+            ):
+                logger.warning(
+                    "Job turn could not search and TAVILY_API_KEY is unset — "
+                    "reporting the configuration instead of a generic refusal."
+                )
+                final_answer = NO_KEY_MESSAGE
 
             confidence = self._compute_confidence(
                 final_answer=final_answer,

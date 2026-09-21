@@ -125,11 +125,30 @@ class GroqService:
             # The gate, not a retry. Bounds how many requests are open at once
             # and how many tokens per minute are admitted, so a fan-out queues
             # instead of arriving as the burst that produces a 429.
-            async with groq_limiter.reserve(messages, params.get("max_tokens")):
+            async with groq_limiter.reserve(
+                messages, params.get("max_tokens")
+            ) as reservation:
                 response = await self.client.chat.completions.create(stream=stream, **params)
 
-            if stream:
-                return response
+                if stream:
+                    return response
+
+                # What it actually cost, handed back to the gate.
+                #
+                # The reservation had to assume `max_tokens` in full — before
+                # the call there is no other honest estimate — but a reasoning
+                # step allowed 700 typically spends 120, and the other 580 were
+                # being held against the minute's budget for a reply that was
+                # never generated. Across the three calls a turn used to make,
+                # that alone drew several thousand phantom tokens against an
+                # 8,000 TPM account.
+                #
+                # Inside the `async with` deliberately: the refund belongs to
+                # the request that made it, and settling after the slot was
+                # released would credit a bucket the next caller has already
+                # started spending from.
+                usage = getattr(response, "usage", None)
+                await reservation.settle(getattr(usage, "total_tokens", None))
 
             record_groq_call(params.get("model"), stream=False)
             return {

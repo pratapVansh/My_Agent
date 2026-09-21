@@ -37,6 +37,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
+from app.services import deadline as _deadline
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,12 @@ _MAX_SHARE_OF_BUDGET = 0.5
 # through anyway. Blocking indefinitely would convert a budget overrun into a
 # hang, and a hang is worse than a 429: the 429 is visible and retryable, the
 # hang consumes the caller's own deadline in silence.
+#
+# It is a ceiling and no longer the only bound. A spoken turn is given 35 s in
+# total, and 20 s of it spent here left the retry layer below with a budget it
+# could not honour — the turn expired while sleeping, having sent nothing. The
+# wait is now also clamped to whatever `app.services.deadline` says is left, so
+# a caller with 4 s to live waits 4 s and then proceeds or fails, visibly.
 _MAX_WAIT_SECONDS = 20.0
 
 
@@ -85,6 +92,50 @@ def estimate_tokens(
     return max(1, prompt_tokens + completion_tokens)
 
 
+class Reservation:
+    """
+    What one admitted request holds, and how it gives back what it did not use.
+
+    The estimate made *before* a call has to reserve `max_tokens` in full,
+    because the reply's real length is not knowable yet and a budget that
+    under-reserves is not a budget. But the reply is almost never `max_tokens`
+    long — a reasoning step allowed 700 typically spends 120 — and until now the
+    difference was never returned. Every request therefore drew its worst case
+    against a minute's budget permanently, and the bucket ran empty against
+    spending that had not happened.
+
+    Groq reports the truth in `usage.total_tokens`. `settle` puts the
+    difference back, so the budget tracks the account rather than the ceiling.
+    Reserving high and settling low is the only ordering that is safe in both
+    directions: the account is never oversubscribed while a call is in flight,
+    and it is never under-used once the call has landed.
+
+    Settling is optional. A stream, or a call that raised, simply never settles
+    and keeps its full reservation — the conservative outcome, and the one the
+    limiter had before.
+    """
+
+    __slots__ = ("_limiter", "_reserved", "_settled")
+
+    def __init__(self, limiter: "GroqLimiter", reserved: float) -> None:
+        self._limiter = limiter
+        self._reserved = float(reserved)
+        self._settled = False
+
+    @property
+    def reserved(self) -> float:
+        return self._reserved
+
+    async def settle(self, actual_tokens: Optional[int]) -> None:
+        """Return the reserved-but-unspent difference to the bucket. Once."""
+        if self._settled or not actual_tokens or actual_tokens <= 0:
+            return
+        self._settled = True
+        refund = self._reserved - float(actual_tokens)
+        if refund > 0:
+            await self._limiter._refund(refund)
+
+
 class GroqLimiter:
     """One shared gate: bounded concurrency plus a token-per-minute budget."""
 
@@ -112,6 +163,14 @@ class GroqLimiter:
         self.admitted: int = 0
         self.delayed: int = 0
         self.total_wait_seconds: float = 0.0
+        # Requests let through with the budget still short — the ones the
+        # provider is entitled to answer with a 429. A non-zero count is the
+        # signal that the turn is asking for more than the tier grants, and it
+        # is the number to look at before touching any timeout.
+        self.admitted_over_budget: int = 0
+        # Reserved-minus-actual, returned to the bucket after the fact. See
+        # `settle`.
+        self.refunded_tokens: float = 0.0
 
     # ── Configuration ────────────────────────────────────────────────────
 
@@ -156,15 +215,26 @@ class GroqLimiter:
             capacity, self._available_tokens + elapsed * (capacity / 60.0)
         )
 
-    async def _spend(self, tokens: int) -> None:
-        """Wait until `tokens` of budget are available, then spend them."""
+    async def _spend(self, tokens: int) -> float:
+        """
+        Wait until `tokens` of budget are available, then spend them.
+
+        Returns the amount actually reserved, which is what `settle` needs in
+        order to give the unused part back — it is not always `tokens`, because
+        an oversized request is clamped below.
+        """
         _, token_lock = self._primitives()
         capacity = float(self.tokens_per_minute)
         # Clamp before waiting. A request larger than the whole bucket would
         # otherwise wait for capacity that can never exist.
         want = min(float(tokens), capacity * _MAX_SHARE_OF_BUDGET)
 
-        deadline = time.monotonic() + _MAX_WAIT_SECONDS
+        # Two bounds, and the shorter wins. The first is this module's own
+        # patience; the second is how long the turn will still be listening.
+        # Waiting past the caller's deadline is not back-pressure, it is a
+        # stall that produces neither an answer nor an error in time to matter.
+        budget_seconds = _deadline.clamp(_MAX_WAIT_SECONDS)
+        deadline = time.monotonic() + budget_seconds
         waited = 0.0
 
         while True:
@@ -175,7 +245,7 @@ class GroqLimiter:
                     if waited > 0:
                         self.delayed += 1
                         self.total_wait_seconds += waited
-                    return
+                    return want
                 shortfall = want - self._available_tokens
                 sleep_for = shortfall / (capacity / 60.0)
 
@@ -187,18 +257,40 @@ class GroqLimiter:
                     self._available_tokens = max(0.0, self._available_tokens - want)
                 logger.warning(
                     "Groq token budget still short after %.1fs (want ~%d tokens, "
-                    "budget %d/min) — admitting anyway to avoid stalling the caller.",
-                    _MAX_WAIT_SECONDS, int(want), self.tokens_per_minute,
+                    "budget %d/min) — admitting anyway to avoid stalling the "
+                    "caller. This is the 429 the limiter could not prevent: the "
+                    "turn is asking for more than the tier grants, and the fix "
+                    "is fewer or smaller calls, not a longer wait.",
+                    budget_seconds, int(want), self.tokens_per_minute,
                 )
                 self.delayed += 1
-                self.total_wait_seconds += _MAX_WAIT_SECONDS
-                return
+                self.admitted_over_budget += 1
+                self.total_wait_seconds += budget_seconds
+                return want
 
             # Cap each nap so a raised budget or a released reservation is
             # noticed promptly rather than slept through.
             nap = max(0.01, min(sleep_for, remaining, 1.0))
             waited += nap
             await asyncio.sleep(nap)
+
+    async def _refund(self, tokens: float) -> None:
+        """
+        Give unspent budget back, never exceeding the bucket's capacity.
+
+        Capped for the same reason `_refill_locked` caps: a bucket holding more
+        than a minute's worth would let the next burst spend a minute it has
+        not lived through yet.
+        """
+        if tokens <= 0:
+            return
+        _, token_lock = self._primitives()
+        capacity = float(self.tokens_per_minute)
+        async with token_lock:
+            self._refill_locked()
+            before = self._available_tokens
+            self._available_tokens = min(capacity, before + tokens)
+            self.refunded_tokens += self._available_tokens - before
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -214,19 +306,24 @@ class GroqLimiter:
         Streaming and non-streaming both pass through here. For a stream the
         slot is held for the lifetime of the *iteration*, not just the initial
         response, because that is how long the connection is actually open.
+
+        Yields a `Reservation`. A caller that learns the request's real cost —
+        a non-streaming completion does, from `usage.total_tokens` — should
+        `await` its `settle`, which returns the over-reserved difference to the
+        budget. Ignoring the handle is safe and keeps the full reservation.
         """
         if not settings.groq_limiter_enabled:
-            yield
+            yield Reservation(self, 0.0)
             return
 
         semaphore, _ = self._primitives()
         tokens = estimate_tokens(messages, max_tokens)
 
-        await self._spend(tokens)
+        reserved = await self._spend(tokens)
         await semaphore.acquire()
         self.admitted += 1
         try:
-            yield
+            yield Reservation(self, reserved)
         finally:
             semaphore.release()
 
@@ -236,6 +333,9 @@ class GroqLimiter:
             "admitted": self.admitted,
             "delayed": self.delayed,
             "total_wait_seconds": round(self.total_wait_seconds, 3),
+            "admitted_over_budget": self.admitted_over_budget,
+            "refunded_tokens": round(self.refunded_tokens, 1),
+            "available_tokens": round(self._available_tokens, 1),
             "max_concurrency": self.max_concurrency,
             "tokens_per_minute": self.tokens_per_minute,
         }
@@ -250,6 +350,8 @@ class GroqLimiter:
         self.admitted = 0
         self.delayed = 0
         self.total_wait_seconds = 0.0
+        self.admitted_over_budget = 0
+        self.refunded_tokens = 0.0
 
 
 # The shared gate. Every Groq entry point uses this one instance — a limiter

@@ -18,6 +18,7 @@ from app.agents.job_agent import job_agent
 from app.agents.email_agent import email_agent
 from app.agents.academic_agent import academic_agent
 from app.agents.profile_agent import profile_agent
+from app.config import settings
 from app.services.groq_service import groq_service
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,16 @@ async def _escalate_to_tools(
             memory_owner_id=memory_owner_id,
             memory_visibilities=memory_visibilities,
             skip_user_ingest=skip_user_ingest,
+            # This path's callers are all waiting on a live stream — the LiveKit
+            # worker, the caption pump, the `/agents/stream` socket — and every
+            # one of them has given up long before the typed 120 s ceiling. The
+            # escalation used to omit this and inherit that ceiling, so an
+            # escalated spoken turn kept working server-side for up to two
+            # minutes after the stall watchdog had already given the user an
+            # apology. The deadline is now also published to the layers below
+            # it, which is what stops the Groq limiter and the retry loop from
+            # sleeping past it — see `app.services.deadline`.
+            timeout_seconds=settings.voice_workflow_timeout_seconds,
             # Initialization this path has already paid for, handed over rather
             # than repeated. `skip_user_ingest` suppressed the duplicate *write*
             # but not the duplicate planner call or the duplicate retrieval
